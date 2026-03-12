@@ -200,18 +200,22 @@ elif x_input > x_max:
   - `"high"`：全部窗口
 - 对筛选出的窗口，将逐笔 BUY/SELL 配对为**完整交易（round-trip）**：
 
+**注意**：rqalpha 的 trades DataFrame 使用 `datetime`（DatetimeIndex）作为索引，不是普通列。遍历时需用 `row.name` 获取时间戳。
+
 ```python
 def pair_trades(trades_df):
     """将逐笔 BUY/SELL 按 FIFO 配对为 round-trip 交易"""
     round_trips = []
-    # 按 order_book_id 分组
+    # trades_df 的 index 是 DatetimeIndex（即 datetime），列包含:
+    #   order_book_id, symbol, side("BUY"/"SELL"), last_price, last_quantity 等
     for ob_id, group in trades_df.groupby("order_book_id"):
         symbol = group.iloc[0]["symbol"]  # 股票名称，如"平安银行"
-        buy_queue = []  # FIFO 队列: [(datetime, price, quantity), ...]
+        buy_queue = []  # FIFO 队列
         for _, row in group.iterrows():
+            trade_dt = row.name  # datetime 是索引，通过 row.name 获取
             if row["side"] == "BUY":
                 buy_queue.append({
-                    "datetime": row["datetime"],
+                    "datetime": trade_dt,
                     "price": row["last_price"],
                     "quantity": row["last_quantity"],
                 })
@@ -229,7 +233,7 @@ def pair_trades(trades_df):
                         "symbol": symbol,
                         "buy_datetime": buy["datetime"],
                         "buy_price": buy["price"],
-                        "sell_datetime": row["datetime"],
+                        "sell_datetime": trade_dt,
                         "sell_price": row["last_price"],
                         "quantity": matched_qty,
                         "pnl_amount": pnl_amount,      # 盈亏金额
@@ -240,10 +244,25 @@ def pair_trades(trades_df):
                     sell_qty -= matched_qty
                     if buy["quantity"] <= 0:
                         buy_queue.pop(0)
+        # 窗口结束时 buy_queue 中可能有未卖出的持仓，标记为"持仓中"
+        for remaining in buy_queue:
+            if remaining["quantity"] > 0:
+                round_trips.append({
+                    "order_book_id": ob_id,
+                    "symbol": symbol,
+                    "buy_datetime": remaining["datetime"],
+                    "buy_price": remaining["price"],
+                    "sell_datetime": None,              # 未卖出
+                    "sell_price": None,
+                    "quantity": remaining["quantity"],
+                    "pnl_amount": None,                 # 未实现盈亏不计入
+                    "pnl_pct": None,
+                    "label": "持仓中",
+                })
     return round_trips
 ```
 
-- 配对后按 sell_datetime 排序，计算累计盈亏（cumulative_pnl）
+- 配对后按 sell_datetime 排序（"持仓中"记录排在最后），计算累计盈亏（cumulative_pnl，仅统计已完成交易）
 - 每个 round-trip 记录包含：
 
 | 字段 | 说明 | 示例 |
@@ -253,35 +272,70 @@ def pair_trades(trades_df):
 | `symbol` | 股票名称 | `平安银行` |
 | `buy_datetime` | 买入时间 | `2025-03-15` |
 | `buy_price` | 买入价格 | `12.50` |
-| `sell_datetime` | 卖出时间 | `2025-04-20` |
-| `sell_price` | 卖出价格 | `13.80` |
+| `sell_datetime` | 卖出时间（持仓中为 `—`） | `2025-04-20` |
+| `sell_price` | 卖出价格（持仓中为 `—`） | `13.80` |
 | `quantity` | 交易数量 | `1000` |
-| `pnl_amount` | 盈亏金额 | `+1300.00` |
-| `pnl_pct` | 盈亏比例 | `+10.4%` |
-| `label` | 盈亏标签 | `盈利` / `亏损` |
-| `cumulative_pnl` | 累计盈亏 | `+5200.00` |
+| `pnl_amount` | 盈亏金额（持仓中为 `—`） | `+1300.00` |
+| `pnl_pct` | 盈亏比例（持仓中为 `—`） | `+10.4%` |
+| `label` | 盈亏标签 | `盈利` / `亏损` / `持仓中` |
+| `cumulative_pnl` | 累计盈亏（持仓中不计入） | `+5200.00` |
 
 #### 输出格式
 
-打印为表格，示例：
+打印为表格，标题行包含汇总统计：
 ```
-【交易日志】(最近1个窗口, 共12笔交易, 胜率 58.3%)
+【交易日志】(最近1个窗口, 共12笔交易, 胜率 58.3%, 持仓中 2笔)
 
  #   证券代码       股票名称   买入日期     买入价   卖出日期     卖出价    数量   盈亏金额    盈亏比例  标签   累计盈亏
  1   000001.XSHE  平安银行   2025-02-03   12.50   2025-03-15   13.80   1000   +1300.00   +10.4%  盈利   +1300.00
  2   000001.XSHE  平安银行   2025-03-20   14.00   2025-04-10   13.20   1000   -800.00    -5.7%   亏损   +500.00
  ...
+12   600519.XSHG  贵州茅台   2025-12-10   1850.00   —          —       100    —          —      持仓中  +5200.00
 ```
+
+**汇总统计计算**：
+- "共N笔交易"：仅统计已完成交易（排除"持仓中"）
+- "胜率"：已完成交易中 pnl_amount > 0 的笔数 / 已完成交易总笔数
+- "持仓中 N笔"：仅当有未配对买入时显示
 
 ### 6. 季度网格投影 `project_to_quarters(windows)` → tuple[dict, dict]
 
 - 建立季度网格（从最早窗口的起始季度到最晚窗口的结束季度）
+
+#### 季度定义与覆盖判定
+
+使用自然季度：Q1(1-3月)、Q2(4-6月)、Q3(7-9月)、Q4(10-12月)。
+每个季度用 `(year, quarter)` 元组标识，如 `(2016, 1)` 表示 2016年Q1。
+
+窗口 W 覆盖季度 Q 的条件：窗口的时间范围与该季度有**任意重叠**。
+
+```python
+def get_covered_quarters(start_date, end_date):
+    """返回窗口 [start_date, end_date] 覆盖的所有季度列表"""
+    quarters = []
+    # 起始季度
+    q_start = (start_date.year, (start_date.month - 1) // 3 + 1)
+    # 结束季度
+    q_end = (end_date.year, (end_date.month - 1) // 3 + 1)
+    # 遍历 q_start 到 q_end 的所有季度
+    year, q = q_start
+    while (year, q) <= q_end:
+        quarters.append((year, q))
+        q += 1
+        if q > 4:
+            q = 1
+            year += 1
+    return quarters
+
+# 示例：窗口 2016-02-01 ~ 2017-01-31 覆盖 (2016,1), (2016,2), (2016,3), (2016,4), (2017,1)
+```
+
 - 对每个季度，找出所有覆盖它的窗口：
   - **分数投影**：取覆盖窗口的综合分数平均值
   - **原始指标投影**：对每个原始指标（annualized_returns, max_drawdown, sharpe, win_rate），取覆盖窗口的原始值平均值
 - 返回两个有序字典：
-  - `quarterly_scores`: `{("2016", "Q1"): score, ...}`
-  - `quarterly_raw_indicators`: `{("2016", "Q1"): {"annualized_returns": x, "max_drawdown": x, "sharpe": x, "win_rate": x}, ...}`
+  - `quarterly_scores`: `{(2016, 1): score, ...}`
+  - `quarterly_raw_indicators`: `{(2016, 1): {"annualized_returns": x, "max_drawdown": x, "sharpe": x, "win_rate": x}, ...}`
 
 ### 7. 综合得分与核心指标 `compute_composite_score(quarterly_scores, quarterly_raw_indicators)` → tuple[float, dict]
 
@@ -350,6 +404,8 @@ stability_score = 0.5 * cv_score + 0.3 * worst_score + 0.2 * consec_score
 - 某环境无季度时输出 "N/A"
 - 返回 `{"牛市": score|"N/A", "震荡": score|"N/A", "熊市": score|"N/A"}`
 
+**注意**：`benchmark_quarterly_returns` 的季度标识 `(year, quarter)` 必须与 `quarterly_scores` 使用相同的自然季度定义，以便正确关联。两者都使用 `(year, quarter)` 元组作为 key。
+
 #### 沪深300季度涨跌幅的获取
 
 ```python
@@ -370,8 +426,12 @@ df = df.set_index("date").sort_index()
 quarterly_close = df["close"].resample("QE").last()
 
 # 季度涨跌幅 = 本季末 close / 上季末 close - 1
-benchmark_quarterly_returns = quarterly_close.pct_change().dropna()
-# 结果: pd.Series, index=季度末日期, values=季度涨跌幅
+quarterly_returns = quarterly_close.pct_change().dropna()
+
+# 转为 {(year, quarter): return_value} 字典，与 quarterly_scores 对齐
+benchmark_quarterly_returns = {}
+for date, ret in quarterly_returns.items():
+    benchmark_quarterly_returns[(date.year, (date.month - 1) // 3 + 1)] = ret
 
 # 打标签
 # > 0.08 → "牛市", < -0.08 → "熊市", 其他 → "震荡"
@@ -412,30 +472,62 @@ config = {
     },
     "extra": {"log_level": "error"},
     "mod": {
-        "sys_analyser": {"benchmark": "000300.XSHG", "record": True, "plot": False},
+        "sys_analyser": {"benchmark": "000300.XSHG", "plot": False},
         "sys_progress": {"enabled": False},
     },
 }
 # 读取策略文件源码，用 run() + source_code 方式执行
+# 注意：使用 source_code 参数时无需设置 config.base.strategy_file
 with open(strategy_file) as f:
     source_code = f.read()
 result = run(config, source_code=source_code)
+
+# run() 在回测异常时可能返回 None，必须检查
+if result is None:
+    # 该窗口回测失败，跳过
+    print(f"警告: 窗口 {start_date}~{end_date} 回测失败，跳过")
+    continue
+
 summary = result["sys_analyser"]["summary"]
-trades = result["sys_analyser"]["trades"]  # DataFrame，包含所有交易记录
+trades = result["sys_analyser"]["trades"]  # DataFrame，index 为 DatetimeIndex
 ```
 
+**配置说明**：
+- `benchmark` 设置在 `sys_analyser` mod 下，不是 `base` 下（`base.benchmark` 已废弃）
+- 设置了 `benchmark` 后，`record` 会自动启用，无需显式设置 `"record": True`
+- `plot=False` 防止弹出图表窗口
+
 ### 13个指标的 summary key 映射
-全部与 rqalpha 输出一致，直接用 `summary["total_returns"]` 等取值。
-注意：`monthly_excess_win_rate` 来自 rqalpha 的 `monthly_risk.excess_win_rate`，含义是月度频率下跑赢基准的月份占比（如12个月中8个月跑赢 → 0.667），与设计文档"月度超额胜率"语义一致。
+全部为 summary dict 的顶层 key，直接用 `summary["total_returns"]` 等取值，无嵌套。
+
+完整 key 对照：
+| 指标 | summary key | 说明 |
+|---|---|---|
+| total_returns | `total_returns` | 累计收益率 |
+| annualized_returns | `annualized_returns` | 年化收益率 |
+| excess_annual_returns | `excess_annual_returns` | 几何超额年化收益率 |
+| max_drawdown | `max_drawdown` | 最大回撤，**正数**（如 0.15 表示 15% 回撤） |
+| max_drawdown_duration_days | `max_drawdown_duration_days` | 最大回撤持续天数，整数 |
+| excess_max_drawdown | `excess_max_drawdown` | 超额最大回撤，正数 |
+| tracking_error | `tracking_error` | 跟踪误差，正数 |
+| sharpe | `sharpe` | 夏普率 |
+| sortino | `sortino` | 索提诺比率 |
+| information_ratio | `information_ratio` | 信息比率 |
+| win_rate | `win_rate` | 日胜率（正收益天数/总天数） |
+| profit_loss_rate | `profit_loss_rate` | 盈亏比，mean(盈利日PnL)/abs(mean(亏损日PnL))；无亏损天时为 NaN |
+| monthly_excess_win_rate | `monthly_excess_win_rate` | 月度超额胜率，月度频率下跑赢基准的月份占比（如12个月中8个月跑赢 → 0.667） |
+
+**符号约定**：`max_drawdown`、`excess_max_drawdown`、`tracking_error` 在 rqalpha 中均为**正数**。评分时 `negate=True` 的指标先取反 `x_input = -x_raw`，使其落入多项式定义域（负半轴）。例如 max_drawdown=0.15 → x_input=-0.15 → 落入 [-0.35, -0.05] 范围内。
 
 ### 沪深300季度涨跌幅
 从 `~/.rqalpha/bundle/indexes.h5` 读取 000300.XSHG 的日线数据，resample 到季度，计算涨跌幅。
 
 ### 错误处理
-- 窗口回测失败：跳过，打印警告，最终报告中注明失败窗口数
+- 窗口回测失败：`rqalpha.run()` 可能返回 `None`（异常中断）或抛出异常，均视为该窗口失败。用 `try/except` 包裹，跳过并打印警告，最终报告中注明失败窗口数
 - 成功窗口不足：若成功窗口 < 5 个，直接报错退出，不输出评分（数据量不足以做出可靠评估）
 - 某指标为 NaN：`profit_loss_rate` 无亏损天时为 NaN，视为满分（100分）；其他 NaN 给 0 分
 - 季度无窗口覆盖：不纳入计算
+- 策略无交易：某窗口策略完全未交易时，`trades` DataFrame 为空，交易日志中该窗口无记录，但评分指标仍正常计算（回测结果仍包含 total_returns=0 等）
 
 ## 验证
 
