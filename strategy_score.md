@@ -126,8 +126,9 @@ slope_left = 218.3333,  slope_right = 1023.3333
 ### max_drawdown_duration_days (reverse=True, x_input = -x_raw)
 ```python
 x_min, x_max = -350, -90
-c4 = 0.000000,  c3 = 0.000195,  c2 = 0.064470,  c1 = 9.365381,  c0 = 549.245524
+c4 = 2.1194468125416533e-07,  c3 = 0.00019543904518330954,  c2 = 0.06447013829687052,  c1 = 9.365380789997912,  c0 = 549.2455242967089
 slope_left = 0.2500,  slope_right = 1.8919
+# 注意：该指标 x 值在数百量级，x^4 可达 ~10^10，系数必须保留足够精度
 ```
 
 ### excess_max_drawdown (reverse=True, x_input = -x_raw)

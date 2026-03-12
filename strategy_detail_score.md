@@ -60,7 +60,7 @@ INDICATORS = {
         "negate": True,
     },
     "max_drawdown_duration_days": {
-        "coeffs": [549.245524, 9.365381, 0.06447, 0.000195, 0.0],
+        "coeffs": [549.2455242967089, 9.365380789997912, 0.06447013829687052, 0.00019543904518330954, 2.1194468125416533e-07],
         "x_min": -350, "x_max": -90,
         "slope_left": 0.25, "slope_right": 1.8919,
         "negate": True,
@@ -419,7 +419,7 @@ with h5py.File(os.path.join(bundle_path, "indexes.h5"), "r") as h5:
 
 # 转为 DataFrame
 df = pd.DataFrame(bars)
-df["date"] = pd.to_datetime(df["datetime"].astype(str), format="%Y%m%d")
+df["date"] = pd.to_datetime(df["datetime"].astype(str), format="%Y%m%d%H%M%S")
 df = df.set_index("date").sort_index()
 
 # 按季度 resample，取每季度最后一个交易日的 close
