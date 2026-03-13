@@ -873,7 +873,12 @@ def plot_trades(window_results):
 def get_benchmark_quarterly_returns():
     """从 bundle 读取沪深300季度涨跌幅"""
     bundle_path = os.path.expanduser("~/.rqalpha/bundle")
-    with h5py.File(os.path.join(bundle_path, "indexes.h5"), "r") as h5:
+    filepath = os.path.join(bundle_path, "indexes.h5")
+    if not os.path.exists(filepath):
+        return {}
+    with h5py.File(filepath, "r") as h5:
+        if "000300.XSHG" not in h5:
+            return {}
         bars = h5["000300.XSHG"][:]
 
     df = pd.DataFrame(bars)
