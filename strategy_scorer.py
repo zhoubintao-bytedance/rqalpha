@@ -580,8 +580,8 @@ def build_trade_log(window_results, level, cash):
         total_pnl = total_asset - cash
         total_ret_pct = engine_total_returns * 100
 
-        # 该窗口的已实现盈亏（最后一条记录的累计）
-        realized_pnl = w_records[-1]["realized_pnl"]
+        # 该窗口的已实现盈亏（最后一条记录的组合级别累计）
+        realized_pnl = w_records[-1]["total_realized_pnl"]
 
         # 该窗口的期末持仓
         w_holdings = {}
