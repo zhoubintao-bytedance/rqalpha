@@ -1108,7 +1108,7 @@ def main():
             print(f"窗口 {w['start']} ~ {w['end']}  得分: {sc}{w['score']:.1f}{RST} [{rl}]")
             s = w["summary"]
             ann_ret = s.get("annualized_returns", 0) * 100
-            max_dd = s.get("max_drawdown", 0) * 100
+            max_dd = abs(s.get("max_drawdown", 0)) * 100
             sharpe_val = s.get("sharpe", 0)
             win_rate_val = s.get("win_rate", 0) * 100
             ac = indicator_color("annualized_returns", ann_ret / 100, use_color)
@@ -1145,7 +1145,7 @@ def main():
     print()
     print("=" * 50)
     ann_ret = core_indicators["annualized_returns"] * 100
-    max_dd = core_indicators["max_drawdown"] * 100
+    max_dd = abs(core_indicators["max_drawdown"]) * 100
     sharpe_val = core_indicators["sharpe"]
     win_rate_val = core_indicators["win_rate"] * 100
 
