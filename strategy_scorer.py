@@ -522,14 +522,15 @@ def build_trade_log(window_results, level, cash):
             total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
         return total
 
-    def pad_cell(value, width, align):
+    def pad_cell(value, width, align, colored_value=None):
         text = str(value)
         pad_len = width - display_width(text)
+        out = text if colored_value is None else str(colored_value)
         if pad_len <= 0:
-            return text
+            return out
         if align == "left":
-            return text + " " * pad_len
-        return " " * pad_len + text
+            return out + " " * pad_len
+        return " " * pad_len + out
 
     alignments = [
         "right", "left", "left", "left", "left",
@@ -562,9 +563,8 @@ def build_trade_log(window_results, level, cash):
     for plain_row, colored_row in zip(rows, row_colors):
         parts = []
         for i in range(len(headers)):
-            padded = pad_cell(plain_row[i], widths[i], alignments[i])
-            if colored_row[i] != plain_row[i]:
-                padded = padded.replace(plain_row[i], colored_row[i], 1)
+            cv = colored_row[i] if colored_row[i] != plain_row[i] else None
+            padded = pad_cell(plain_row[i], widths[i], alignments[i], colored_value=cv)
             parts.append(f" {padded} ")
         print(SEP + SEP.join(parts) + SEP)
     print(bottom_line)
