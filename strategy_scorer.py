@@ -363,6 +363,7 @@ def flatten_trades(trades_df):
     records = []
     # 按股票分组，维护每只股票的持仓成本
     holdings = {}  # {order_book_id: {"quantity": int, "cost": float(总成本)}}
+    total_realized_pnl = 0.0  # 组合级别累计盈亏（所有股票）
 
     for _, row in trades_df.iterrows():
         trade_dt = row.name
@@ -391,11 +392,13 @@ def flatten_trades(trades_df):
                 "holding_qty": h["quantity"],
                 "holding_cost": h["cost"],
                 "realized_pnl": h["realized_pnl"],
+                "total_realized_pnl": total_realized_pnl,
             })
         elif side == "SELL":
             avg_cost = h["cost"] / h["quantity"] if h["quantity"] > 0 else 0
             pnl = (price - avg_cost) * qty
             h["realized_pnl"] += pnl
+            total_realized_pnl += pnl
             h["cost"] -= avg_cost * qty
             h["quantity"] -= qty
             records.append({
@@ -410,6 +413,7 @@ def flatten_trades(trades_df):
                 "holding_qty": h["quantity"],
                 "holding_cost": h["cost"],
                 "realized_pnl": h["realized_pnl"],
+                "total_realized_pnl": total_realized_pnl,
             })
 
     return records
