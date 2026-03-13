@@ -229,7 +229,7 @@ def score_window(summary):
     total = 0.0
     for name, weight in WEIGHTS.items():
         raw = summary.get(name)
-        if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        if pd.isna(raw):
             if name == "profit_loss_rate":
                 s = 100.0
             else:
