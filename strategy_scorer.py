@@ -335,6 +335,7 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None):
             print(f"得分 {sc}{window_score:.1f}{rst}")
 
             results.append({
+                "idx": idx,
                 "start": start,
                 "end": end,
                 "summary": summary,
