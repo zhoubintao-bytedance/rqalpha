@@ -426,7 +426,7 @@ def build_trade_log(window_results, level, cash):
 
     all_records = []
     for w in selected:
-        idx = window_results.index(w) + 1
+        idx = w["idx"]
         records = flatten_trades(w["trades"])
         for r in records:
             r["window"] = f"#{idx}"
@@ -565,7 +565,7 @@ def build_trade_log(window_results, level, cash):
 
     # 汇总: 按窗口分别输出（每个窗口是独立的100万回测）
     for w in selected:
-        idx = window_results.index(w) + 1
+        idx = w["idx"]
         w_records = [r for r in all_records if r["window"] == f"#{idx}"]
         if not w_records:
             continue
