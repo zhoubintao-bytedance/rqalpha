@@ -140,21 +140,63 @@ CORE_INDICATORS = ["annualized_returns", "max_drawdown", "sharpe", "win_rate"]
 
 # 评级体系（E/M+/M/M-/I），灵感来自字节跳动绩效评级
 # 颜色: E=亮绿, M+=绿, M=黄, M-=红, I=亮红
+def rating_color(score, use_color=True):
+    """根据分数返回 ANSI 颜色码（不含标签文本）"""
+    if not use_color:
+        return ""
+    if score >= 60:
+        return "\033[92m"       # 亮绿 — 卓越
+    elif score >= 30:
+        return "\033[96m"       # 亮青 — 稳健
+    elif score >= 0:
+        return "\033[93m"       # 亮黄 — 警示
+    elif score >= -20:
+        return "\033[91m"       # 亮红 — 危险
+    else:
+        return "\033[41;97m"    # 红底白字 — 淘汰
+
+
 def rating_label(score, use_color=True):
     """根据分数返回带颜色的评级标签"""
     if score >= 60:
-        grade, color = "E", "\033[92m"      # 亮绿
+        grade = "E"
     elif score >= 30:
-        grade, color = "M+", "\033[32m"     # 绿
+        grade = "M+"
     elif score >= 0:
-        grade, color = "M", "\033[33m"      # 黄
+        grade = "M"
     elif score >= -20:
-        grade, color = "M-", "\033[31m"     # 红
+        grade = "M-"
     else:
-        grade, color = "I", "\033[91m"      # 亮红
+        grade = "I"
     if use_color:
+        color = rating_color(score, True)
         return f"{color}{grade}\033[0m"
     return grade
+
+
+def indicator_color(indicator_name, raw_value, use_color=True):
+    """将指标原始值通过评分函数映射到颜色码"""
+    score = score_indicator(indicator_name, raw_value)
+    return rating_color(score, use_color)
+
+
+def rating_legend(use_color=True):
+    """生成带颜色的评级图例"""
+    RST = "\033[0m" if use_color else ""
+    items = [
+        ("\033[92m", "E",  ">=60 优秀"),
+        ("\033[96m", "M+", ">=30 良好"),
+        ("\033[93m", "M",  ">=0 一般"),
+        ("\033[91m", "M-", ">=-20 较差"),
+        ("\033[41;97m", "I",  "<-20 很差"),
+    ]
+    parts = []
+    for color, grade, desc in items:
+        if use_color:
+            parts.append(f"{color}{grade}{RST}({desc})")
+        else:
+            parts.append(f"{grade}({desc})")
+    return "  评级: " + "  ".join(parts)
 
 # ============================================================
 # 2. 评分函数
@@ -287,7 +329,10 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None):
             summary = result["sys_analyser"]["summary"]
             trades = result["sys_analyser"]["trades"]
             window_score = score_window(summary)
-            print(f"得分 {window_score:.1f}")
+            use_color = sys.stdout.isatty()
+            sc = rating_color(window_score, use_color)
+            rst = "\033[0m" if use_color else ""
+            print(f"得分 {sc}{window_score:.1f}{rst}")
 
             results.append({
                 "start": start,
@@ -343,6 +388,7 @@ def flatten_trades(trades_df):
                 "amount": price * qty,
                 "pnl": None,
                 "holding_qty": h["quantity"],
+                "holding_cost": h["cost"],
                 "realized_pnl": h["realized_pnl"],
             })
         elif side == "SELL":
@@ -361,6 +407,7 @@ def flatten_trades(trades_df):
                 "amount": price * qty,
                 "pnl": pnl,
                 "holding_qty": h["quantity"],
+                "holding_cost": h["cost"],
                 "realized_pnl": h["realized_pnl"],
             })
 
@@ -396,7 +443,14 @@ def build_trade_log(window_results, level, cash):
     win_pct = n_win / n_sell * 100 if n_sell > 0 else 0
 
     level_desc = {"low": "最近1个窗口", "mid": "最近4个窗口", "high": "全部窗口"}
-    header = f"【交易日志】({level_desc[level]}, 买入{len(buys)}笔 卖出{n_sell}笔, 卖出胜率 {win_pct:.1f}%)"
+    use_color_hdr = sys.stdout.isatty()
+    if use_color_hdr and n_sell > 0:
+        wp_color = "\033[32m" if win_pct >= 50 else "\033[31m"
+        wp_rst = "\033[0m"
+        wp_str = f"{wp_color}{win_pct:.1f}%{wp_rst}"
+    else:
+        wp_str = f"{win_pct:.1f}%"
+    header = f"【交易日志】({level_desc[level]}, 买入{len(buys)}笔 卖出{n_sell}笔, 卖出胜率 {wp_str})"
     print(f"\n{header}")
 
     headers = [
@@ -421,15 +475,27 @@ def build_trade_log(window_results, level, cash):
 
     rows = []
     row_colors = []  # 每行的着色版本，用于输出
+    def fmt_num(n):
+        """数字格式化：大数用万，加千分位"""
+        if abs(n) >= 10000:
+            return f"{n/10000:,.1f}万"
+        return f"{n:,.0f}"
+
+    def fmt_pnl(n):
+        """盈亏格式化：带正负号，大数用万"""
+        if abs(n) >= 10000:
+            return f"{n/10000:+,.1f}万"
+        return f"{n:+,.0f}"
+
     for i, r in enumerate(all_records, 1):
         dt = r["datetime"].strftime("%Y-%m-%d") if hasattr(r["datetime"], "strftime") else str(r["datetime"])[:10]
-        pnl_str = f"{r['pnl']:+.2f}" if r["pnl"] is not None else ""
-        cum_str = f"{r['realized_pnl']:+.2f}"
+        pnl_str = fmt_pnl(r['pnl']) if r["pnl"] is not None else ""
+        cum_str = fmt_pnl(r['realized_pnl'])
         side_str = r["side"]
         plain_row = [
             str(i), r["window"], side_str, r["order_book_id"], r["symbol"],
-            dt, f"{r['price']:.2f}", str(int(r["quantity"])), f"{r['amount']:.0f}",
-            pnl_str, str(int(r["holding_qty"])), cum_str
+            dt, f"{r['price']:.2f}", fmt_num(r["quantity"]), fmt_num(r["amount"]),
+            pnl_str, fmt_num(r["holding_qty"]), cum_str
         ]
         colored_row = list(plain_row)
         # 方向列着色
@@ -467,45 +533,114 @@ def build_trade_log(window_results, level, cash):
     columns = list(zip(headers, *rows)) if rows else [(h,) for h in headers]
     widths = [max(display_width(cell) for cell in col) for col in columns]
 
-    print("  ".join(pad_cell(h, widths[i], alignments[i]) for i, h in enumerate(headers)))
+    # 边框字符
+    SEP = "│"
+    def make_line(left, mid, right, fill="─"):
+        return left + mid.join(fill * (w + 2) for w in widths) + right
+
+    top_line = make_line("┌", "┬", "┐")
+    header_sep = make_line("├", "┼", "┤")
+    bottom_line = make_line("└", "┴", "┘")
+
+    def render_row(cells_list):
+        parts = []
+        for i, cell in enumerate(cells_list):
+            padded = pad_cell(cell, widths[i], alignments[i])
+            parts.append(f" {padded} ")
+        return SEP + SEP.join(parts) + SEP
+
+    print(top_line)
+    print(render_row(headers))
+    print(header_sep)
     for plain_row, colored_row in zip(rows, row_colors):
-        cells = []
+        parts = []
         for i in range(len(headers)):
             padded = pad_cell(plain_row[i], widths[i], alignments[i])
             if colored_row[i] != plain_row[i]:
-                # 用着色文本替换纯文本，保留 padding 空格
                 padded = padded.replace(plain_row[i], colored_row[i], 1)
-            cells.append(padded)
-        print("  ".join(cells))
+            parts.append(f" {padded} ")
+        print(SEP + SEP.join(parts) + SEP)
+    print(bottom_line)
 
-    # 汇总: 期末持仓、总盈亏、收益率
-    # 最后一条记录的 realized_pnl 就是已实现总盈亏
-    realized_pnl = all_records[-1]["realized_pnl"] if all_records else 0
-    # 期末持仓（按股票汇总）
-    end_holdings = {}
-    for r in all_records:
-        ob_id = r["order_book_id"]
-        end_holdings[ob_id] = {"qty": r["holding_qty"], "symbol": r["symbol"], "price": r["price"]}
-    holding_stocks = {k: v for k, v in end_holdings.items() if v["qty"] > 0}
+    # 汇总: 按窗口分别输出（每个窗口是独立的100万回测）
+    for w in selected:
+        idx = window_results.index(w) + 1
+        w_records = [r for r in all_records if r["window"] == f"#{idx}"]
+        if not w_records:
+            continue
 
-    # 期末持仓市值（用最后一次交易价格估算）
-    holding_value = sum(v["qty"] * v["price"] for v in holding_stocks.values())
+        summary = w["summary"]
+        engine_total_returns = summary.get("total_returns", 0)
+        total_asset = cash * (1 + engine_total_returns)
+        total_pnl = total_asset - cash
+        total_ret_pct = engine_total_returns * 100
 
-    # 总盈亏 = 已实现盈亏 + 未实现盈亏（持仓市值 - 持仓成本）
-    # 收益率基于初始资金
-    ret_pct = realized_pnl / cash * 100 if cash > 0 else 0
+        # 该窗口的已实现盈亏（最后一条记录的累计）
+        realized_pnl = w_records[-1]["realized_pnl"]
 
-    print()
-    pnl_text = f"{realized_pnl:+,.0f}"
-    pnl_colored = colorize(pnl_text, realized_pnl)
-    ret_text = f"{ret_pct:+.1f}%"
-    ret_colored = colorize(ret_text, ret_pct)
-    print(f"  已实现盈亏: {pnl_colored}  收益率(基于本金): {ret_colored}")
-    if holding_stocks:
-        parts = [f"{v['symbol']}({k}) {int(v['qty'])}股" for k, v in holding_stocks.items()]
-        print(f"  期末持仓: {', '.join(parts)}")
-    else:
-        print(f"  期末持仓: 无（已清仓）")
+        # 该窗口的期末持仓
+        w_holdings = {}
+        for r in w_records:
+            ob_id = r["order_book_id"]
+            w_holdings[ob_id] = {"qty": r["holding_qty"], "symbol": r["symbol"], "price": r["price"]}
+        w_holding_stocks = {k: v for k, v in w_holdings.items() if v["qty"] > 0}
+
+        # 持仓成本（按股票分别获取）
+        w_holding_costs = {}
+        for ob_id in w_holding_stocks:
+            for r in reversed(w_records):
+                if r["order_book_id"] == ob_id:
+                    w_holding_costs[ob_id] = r.get("holding_cost", 0)
+                    break
+
+        # 窗口标题（多窗口时才显示）
+        if len(selected) > 1:
+            print(f"\n  --- 窗口 #{idx} ({w['start']} ~ {w['end']}) ---")
+        else:
+            print()
+
+        # 总资产
+        asset_text = f"{total_asset:,.0f}"
+        total_pnl_text = f"{total_pnl:+,.0f}"
+        total_pnl_colored = colorize(total_pnl_text, total_pnl)
+        total_ret_text = f"{total_ret_pct:+.1f}%"
+        total_ret_colored = colorize(total_ret_text, total_ret_pct)
+        print(f"  总资产: {asset_text}  总盈亏: {total_pnl_colored}  总收益率: {total_ret_colored}")
+
+        # 落袋/浮盈
+        realized_text = f"{realized_pnl:+,.0f}"
+        realized_colored = colorize(realized_text, realized_pnl)
+        if w_holding_stocks:
+            unrealized_pnl = total_pnl - realized_pnl
+            unrealized_text = f"{unrealized_pnl:+,.0f}"
+            unrealized_colored = colorize(unrealized_text, unrealized_pnl)
+            unrealized_label = "浮盈" if unrealized_pnl >= 0 else "浮亏"
+            realized_label = "落袋为安" if realized_pnl >= 0 else "落袋亏损"
+            realized_label_colored = colorize(realized_label, realized_pnl)
+            unrealized_label_colored = colorize(unrealized_label, unrealized_pnl)
+            print(f"  {realized_label_colored}: {realized_colored}  {unrealized_label_colored}: {unrealized_colored}")
+        else:
+            realized_label = "落袋为安" if realized_pnl >= 0 else "落袋亏损"
+            realized_label_colored = colorize(realized_label, realized_pnl)
+            print(f"  {realized_label_colored}: {realized_colored}")
+
+        # 期末持仓
+        if w_holding_stocks:
+            # 市值 = 总资产 - 剩余现金，剩余现金 = 初始资金 + 已实现盈亏 - 持仓成本
+            total_holding_cost = sum(w_holding_costs.get(k, 0) for k in w_holding_stocks)
+            holding_market_value = total_asset - (cash + realized_pnl - total_holding_cost)
+            parts = []
+            for k, v in w_holding_stocks.items():
+                qty = int(v['qty'])
+                cost = w_holding_costs.get(k, 0)
+                avg_price = cost / qty if qty > 0 else 0
+                # 按持仓比例分配市值
+                share = cost / total_holding_cost if total_holding_cost > 0 else 1
+                mv = holding_market_value * share
+                parts.append(f"{v['symbol']}({k}) {qty}股 均价{avg_price:.2f} 成本{cost:,.0f} 市值{mv:,.0f}")
+            print(f"  期末持仓: {', '.join(parts)}")
+        else:
+            print(f"  期末持仓: 无（已清仓）")
 
 # ============================================================
 # 6. 季度网格投影
@@ -640,6 +775,94 @@ def compute_stability_score(quarterly_scores):
 # 9. 市场环境适应性
 # ============================================================
 
+def read_daily_bars(order_book_id, start_date, end_date):
+    """从 bundle 读取指定股票的日线数据"""
+    bundle_path = os.path.expanduser("~/.rqalpha/bundle")
+    for filename in ["stocks.h5", "indexes.h5", "funds.h5"]:
+        filepath = os.path.join(bundle_path, filename)
+        if not os.path.exists(filepath):
+            continue
+        with h5py.File(filepath, "r") as h5:
+            if order_book_id in h5:
+                bars = h5[order_book_id][:]
+                df = pd.DataFrame(bars)
+                df["date"] = pd.to_datetime(df["datetime"].astype(str).str[:8], format="%Y%m%d")
+                df = df.set_index("date").sort_index()
+                return df.loc[str(start_date):str(end_date)]
+    return None
+
+
+def plot_trades(window_results):
+    """为每个窗口绘制价格走势 + 买卖标注图，保存为 PNG"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    for w in window_results:
+        records = flatten_trades(w["trades"])
+        if not records:
+            continue
+
+        # 获取该窗口交易的所有股票
+        ob_ids = list(dict.fromkeys(r["order_book_id"] for r in records))
+
+        for ob_id in ob_ids:
+            # 读取日线数据
+            df = read_daily_bars(ob_id, w["start"], w["end"])
+            if df is None or df.empty:
+                print(f"  警告: 无法读取 {ob_id} 的日线数据，跳过绘图")
+                continue
+
+            # 筛选该股票的交易记录
+            stock_records = [r for r in records if r["order_book_id"] == ob_id]
+            buys = [r for r in stock_records if r["side"] == "买入"]
+            sells = [r for r in stock_records if r["side"] == "卖出"]
+            symbol = stock_records[0]["symbol"]
+
+            # 绘图
+            fig, ax = plt.subplots(figsize=(14, 6))
+            ax.plot(df.index, df["close"], color="#555555", linewidth=1, label="收盘价")
+
+            # 买入标注
+            if buys:
+                buy_dates = [r["datetime"] for r in buys]
+                buy_prices = [r["price"] for r in buys]
+                ax.scatter(buy_dates, buy_prices, marker="^", color="#2ca02c",
+                           s=120, zorder=5, label=f"买入({len(buys)}笔)")
+                for r in buys:
+                    ax.annotate(f"{r['price']:.2f}", (r["datetime"], r["price"]),
+                                textcoords="offset points", xytext=(0, 10), ha="center",
+                                fontsize=8, color="#2ca02c")
+
+            # 卖出标注
+            if sells:
+                sell_dates = [r["datetime"] for r in sells]
+                sell_prices = [r["price"] for r in sells]
+                ax.scatter(sell_dates, sell_prices, marker="v", color="#d62728",
+                           s=120, zorder=5, label=f"卖出({len(sells)}笔)")
+                for r in sells:
+                    ax.annotate(f"{r['price']:.2f}", (r["datetime"], r["price"]),
+                                textcoords="offset points", xytext=(0, -14), ha="center",
+                                fontsize=8, color="#d62728")
+
+            # 格式化
+            idx = window_results.index(w) + 1
+            ax.set_title(f"窗口 #{idx}  {symbol}({ob_id})  得分 {w['score']:.1f}", fontsize=14)
+            ax.set_ylabel("价格")
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+            ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+            fig.autofmt_xdate(rotation=30)
+            ax.legend(loc="upper left")
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+
+            filename = f"trade_w{idx}_{ob_id.replace('.', '_')}.png"
+            fig.savefig(filename, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            print(f"  图表已保存: {os.path.basename(filename)}")
+
+
 def get_benchmark_quarterly_returns():
     """从 bundle 读取沪深300季度涨跌幅"""
     bundle_path = os.path.expanduser("~/.rqalpha/bundle")
@@ -703,6 +926,7 @@ HELP_TEXT = """\
                           low  = 最近 1 个窗口
                           mid  = 最近 4 个窗口（约1年）
                           high = 全部 37 个窗口
+    --plot              绘制价格走势图，在收盘价曲线上标注买卖点（弹窗显示）
     --help              显示此帮助信息
     --eg                显示完整使用示例
 
@@ -743,12 +967,17 @@ EXAMPLE_TEXT = """\
     python strategy_scorer.py my_strategy.py --log mid    # 最近4个窗口
     python strategy_scorer.py my_strategy.py --log high   # 全部37个窗口
 
-5. 用自带的示例策略测试:
+5. 绘制价格走势 + 买卖点图表:
+
+    python strategy_scorer.py my_strategy.py -w 37 --plot        # 单窗口图表
+    python strategy_scorer.py my_strategy.py -w 35-37 --plot     # 多窗口各一张图
+
+6. 用自带的示例策略测试:
 
     python strategy_scorer.py rqalpha/examples/demo_strategy.py
     python strategy_scorer.py rqalpha/examples/demo_strategy.py --cash 500000 --log mid
 
-6. 策略文件格式要求:
+7. 策略文件格式要求:
 
     策略文件需包含 rqalpha 标准接口函数，最小示例：
 
@@ -770,7 +999,7 @@ EXAMPLE_TEXT = """\
             order_target_percent(context.stock, 0)
     ```
 
-7. 输出示例:
+8. 输出示例:
 
     ==================================================
     【策略综合得分】 32.5 分 | 收益 + 风险 + 指标加权总分
@@ -785,12 +1014,13 @@ EXAMPLE_TEXT = """\
      2   #37   卖出  000001.XSHE  平安银行  2025-03-03  11.51   500    5755    +40.00       500  +40.00
      3   #37   卖出  000001.XSHE  平安银行  2025-03-10  11.60   500    5800    +85.00         0  +125.00
 
-8. 评分参考:
+9. 评分参考:
 
-    > 60分    优秀策略，各维度表现均衡
-    30~60分   良好策略，有一定优势
-    0~30分    一般策略，需要优化
-    < 0分     较差策略，存在明显缺陷
+    E  (>=60分)  优秀策略，各维度表现均衡
+    M+ (>=30分)  良好策略，有一定优势
+    M  (>=0分)   一般策略，需要优化
+    M- (>=-20分) 较差策略，存在明显缺陷
+    I  (<-20分)  淘汰策略，需要重新设计
 """
 
 
@@ -804,6 +1034,7 @@ def main():
                         help="交易日志详细程度（默认 low）")
     parser.add_argument("--help", "-h", action="store_true", help="显示帮助信息")
     parser.add_argument("--eg", action="store_true", help="显示完整使用示例")
+    parser.add_argument("--plot", action="store_true", help="绘制价格走势+买卖点图表")
     args = parser.parse_args()
 
     if args.eg:
@@ -824,20 +1055,23 @@ def main():
 
     all_windows = generate_windows()
     if selected_indices:
-        desc_parts = [f"#{i}({all_windows[i-1][0].strftime('%Y-%m')})" for i in selected_indices]
-        window_desc = f"{len(selected_indices)} 个: {', '.join(desc_parts)}"
+        starts = [all_windows[i - 1][0] for i in selected_indices]
+        ends = [all_windows[i - 1][1] for i in selected_indices]
+        start_dt = min(starts).strftime("%Y-%m")
+        end_dt = max(ends).strftime("%Y-%m")
+        window_desc = f"{start_dt} ~ {end_dt}"
     else:
-        window_desc = f"37 个 (2016-02 ~ 2026-01)"
+        window_desc = f"{all_windows[0][0].strftime('%Y-%m')} ~ {all_windows[-1][1].strftime('%Y-%m')}"
 
-    print(f"策略文件: {args.strategy_file}")
+    print(f"策略文件: {os.path.basename(args.strategy_file)}")
     print(f"初始资金: {args.cash:,}")
     print(f"基准指数: {BENCHMARK}")
-    print(f"回测窗口: {window_desc}")
+    print(f"回测时间段: {window_desc}")
     print()
 
     # 滚动回测
     print("=" * 50)
-    print("开始滚动窗口回测")
+    print("开始滑动窗口回测")
     print("=" * 50)
     window_results = run_rolling_backtests(args.strategy_file, args.cash, selected_indices)
 
@@ -851,33 +1085,31 @@ def main():
     # 窗口数少于5个时，跳过综合评分，只输出单窗口得分和交易日志
     if len(window_results) < 5:
         use_color = sys.stdout.isatty()
-        G = "\033[32m" if use_color else ""
-        R = "\033[31m" if use_color else ""
         RST = "\033[0m" if use_color else ""
-        def c(val, fmt_str):
-            text = fmt_str.format(val)
-            if val > 0:
-                return f"{G}{text}{RST}"
-            elif val < 0:
-                return f"{R}{text}{RST}"
-            return text
 
         print()
         print("=" * 50)
         for w in window_results:
+            sc = rating_color(w['score'], use_color)
             rl = rating_label(w['score'], use_color)
-            print(f"窗口 {w['start']} ~ {w['end']}  得分: {c(w['score'], '{:.1f}')} [{rl}]")
+            print(f"窗口 {w['start']} ~ {w['end']}  得分: {sc}{w['score']:.1f}{RST} [{rl}]")
             s = w["summary"]
             ann_ret = s.get("annualized_returns", 0) * 100
             max_dd = s.get("max_drawdown", 0) * 100
             sharpe_val = s.get("sharpe", 0)
             win_rate_val = s.get("win_rate", 0) * 100
-            print(f"  年化 {c(ann_ret, '{:.1f}')}% | 回撤 {R}{max_dd:.1f}%{RST} | 夏普 {c(sharpe_val, '{:.2f}')} | 胜率 {win_rate_val:.1f}%")
+            ac = indicator_color("annualized_returns", ann_ret / 100, use_color)
+            dc = indicator_color("max_drawdown", max_dd / 100, use_color)
+            shc = indicator_color("sharpe", sharpe_val, use_color)
+            wc = indicator_color("win_rate", win_rate_val / 100, use_color)
+            print(f"  年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
         print()
-        print("  评级: E(>=60 优秀)  M+(>=30 良好)  M(>=0 一般)  M-(>=-20 较差)  I(<-20 很差)")
+        print(rating_legend(use_color))
         print("=" * 50)
         # 少量窗口时，交易日志默认显示全部
         build_trade_log(window_results, "high", args.cash)
+        if args.plot:
+            plot_trades(window_results)
         return
 
     # 季度网格投影
@@ -895,18 +1127,7 @@ def main():
 
     # 输出报告
     use_color = sys.stdout.isatty()
-    G = "\033[32m" if use_color else ""
-    R = "\033[31m" if use_color else ""
     RST = "\033[0m" if use_color else ""
-
-    def c(val, fmt_str):
-        """给数值着色：正绿负红"""
-        text = fmt_str.format(val)
-        if val > 0:
-            return f"{G}{text}{RST}"
-        elif val < 0:
-            return f"{R}{text}{RST}"
-        return text
 
     print()
     print("=" * 50)
@@ -915,27 +1136,38 @@ def main():
     sharpe_val = core_indicators["sharpe"]
     win_rate_val = core_indicators["win_rate"] * 100
 
+    comp_c = rating_color(composite, use_color)
     comp_rl = rating_label(composite, use_color)
+    stab_c = rating_color(stability, use_color)
     stab_rl = rating_label(stability, use_color)
-    print(f"【策略综合得分】 {c(composite, '{:.1f}')} 分 [{comp_rl}]")
-    print(f"【策略稳定得分】  {stability:.0f} 分 [{stab_rl}]")
-    print(f"【核心指标】年化 {c(ann_ret, '{:.1f}')}% | 回撤 {R}{max_dd:.1f}%{RST} | 夏普 {c(sharpe_val, '{:.2f}')} | 胜率 {win_rate_val:.1f}%")
+    print(f"【策略综合得分】 {comp_c}{composite:.1f}{RST} 分 [{comp_rl}]")
+    print(f"【策略稳定得分】  {stab_c}{stability:.0f}{RST} 分 [{stab_rl}]")
+    ac = indicator_color("annualized_returns", ann_ret / 100, use_color)
+    dc = indicator_color("max_drawdown", max_dd / 100, use_color)
+    shc = indicator_color("sharpe", sharpe_val, use_color)
+    wc = indicator_color("win_rate", win_rate_val / 100, use_color)
+    print(f"【核心指标】年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
 
     env_parts = []
     for env_name in ["牛市", "震荡", "熊市"]:
         v = market_env[env_name]
         if isinstance(v, (int, float)):
             rl = rating_label(v, use_color)
-            env_parts.append(f"{env_name} {c(v, '{:.1f}')}[{rl}]")
+            vc = rating_color(v, use_color)
+            env_parts.append(f"{env_name} {vc}{v:.1f}{RST}[{rl}]")
         else:
             env_parts.append(f"{env_name} {v}")
     print(f"【市场环境】{' | '.join(env_parts)}")
     print()
-    print("  评级: E(>=60 优秀)  M+(>=30 良好)  M(>=0 一般)  M-(>=-20 较差)  I(<-20 很差)")
+    print(rating_legend(use_color))
     print("=" * 50)
 
     # 交易日志
     build_trade_log(window_results, args.log, args.cash)
+
+    # 图表
+    if args.plot:
+        plot_trades(window_results)
 
 
 if __name__ == "__main__":
