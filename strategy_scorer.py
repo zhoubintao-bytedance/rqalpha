@@ -397,20 +397,21 @@ def flatten_trades(trades_df):
                 "total_realized_pnl": total_realized_pnl,
             })
         elif side == "SELL":
+            sell_qty = min(qty, h["quantity"])
             avg_cost = h["cost"] / h["quantity"] if h["quantity"] > 0 else 0
-            pnl = (price - avg_cost) * qty
+            pnl = (price - avg_cost) * sell_qty
             h["realized_pnl"] += pnl
             total_realized_pnl += pnl
-            h["cost"] -= avg_cost * qty
-            h["quantity"] -= qty
+            h["cost"] -= avg_cost * sell_qty
+            h["quantity"] -= sell_qty
             records.append({
                 "order_book_id": ob_id,
                 "symbol": symbol,
                 "side": "卖出",
                 "datetime": trade_dt,
                 "price": price,
-                "quantity": qty,
-                "amount": price * qty,
+                "quantity": sell_qty,
+                "amount": price * sell_qty,
                 "pnl": pnl,
                 "holding_qty": h["quantity"],
                 "holding_cost": h["cost"],
