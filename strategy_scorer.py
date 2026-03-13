@@ -495,7 +495,7 @@ def build_trade_log(window_results, level, cash):
     for i, r in enumerate(all_records, 1):
         dt = r["datetime"].strftime("%Y-%m-%d") if hasattr(r["datetime"], "strftime") else str(r["datetime"])[:10]
         pnl_str = fmt_pnl(r['pnl']) if r["pnl"] is not None else ""
-        cum_str = fmt_pnl(r['realized_pnl'])
+        cum_str = fmt_pnl(r['total_realized_pnl'])
         side_str = r["side"]
         plain_row = [
             str(i), r["window"], side_str, r["order_book_id"], r["symbol"],
@@ -509,7 +509,7 @@ def build_trade_log(window_results, level, cash):
         # 盈亏列着色
         colored_row[9] = colorize(pnl_str, r["pnl"])
         # 累计盈亏列着色
-        colored_row[11] = colorize(cum_str, r["realized_pnl"])
+        colored_row[11] = colorize(cum_str, r["total_realized_pnl"])
         rows.append(plain_row)
         row_colors.append(colored_row)
 
