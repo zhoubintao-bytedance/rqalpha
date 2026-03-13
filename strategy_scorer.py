@@ -365,6 +365,8 @@ def flatten_trades(trades_df):
     holdings = {}  # {order_book_id: {"quantity": int, "cost": float(总成本)}}
     total_realized_pnl = 0.0  # 组合级别累计盈亏（所有股票）
 
+    trades_df = trades_df.sort_index()
+
     for _, row in trades_df.iterrows():
         trade_dt = row.name
         ob_id = row["order_book_id"]
