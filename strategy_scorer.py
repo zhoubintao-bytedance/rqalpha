@@ -848,7 +848,7 @@ def plot_trades(window_results):
                                 fontsize=8, color="#d62728")
 
             # 格式化
-            idx = window_results.index(w) + 1
+            idx = w["idx"]
             ax.set_title(f"窗口 #{idx}  {symbol}({ob_id})  得分 {w['score']:.1f}", fontsize=14)
             ax.set_ylabel("价格")
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
