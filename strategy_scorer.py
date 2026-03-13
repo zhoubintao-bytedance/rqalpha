@@ -674,7 +674,7 @@ def project_to_quarters(window_results):
             quarter_raw.setdefault(qk, {ind: [] for ind in CORE_INDICATORS})
             for ind in CORE_INDICATORS:
                 val = w["summary"].get(ind)
-                if val is not None and not (isinstance(val, float) and math.isnan(val)):
+                if not pd.isna(val):
                     quarter_raw[qk][ind].append(val)
 
     # 计算季度平均值
