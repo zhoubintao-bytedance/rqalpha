@@ -14,6 +14,7 @@ import os
 import pickle
 import re
 import sys
+import time
 import warnings
 import unicodedata
 from collections import OrderedDict
@@ -199,7 +200,7 @@ def rating_legend(use_color=True):
             parts.append(f"{color}{grade}{RST}({desc})")
         else:
             parts.append(f"{grade}({desc})")
-    return "  评级: " + "  ".join(parts)
+    return "  评级说明: " + "  ".join(parts)
 
 # ============================================================
 # 2. 评分函数
@@ -1212,6 +1213,7 @@ def main():
     print("=" * 50)
     print("开始滑动窗口回测")
     print("=" * 50)
+    t_start = time.time()
     window_results = run_rolling_backtests(args.strategy_file, args.cash, selected_indices)
 
     if not window_results:
@@ -1249,6 +1251,8 @@ def main():
         build_trade_log(window_results, "high", args.cash)
         if args.plot:
             plot_trades(window_results)
+        elapsed = time.time() - t_start
+        print(f"\n回测总耗时: {elapsed:.1f} 秒")
         return
 
     # 季度网格投影
@@ -1269,7 +1273,6 @@ def main():
     RST = "\033[0m" if use_color else ""
 
     print()
-    print("=" * 50)
     ann_ret = core_indicators["annualized_returns"] * 100
     max_dd = abs(core_indicators["max_drawdown"]) * 100
     sharpe_val = core_indicators["sharpe"]
@@ -1279,18 +1282,20 @@ def main():
     comp_rl = rating_label(composite, use_color)
     stab_c = rating_color(stability, use_color)
     stab_rl = rating_label(stability, use_color)
-    print(f"【策略综合得分】 {comp_c}{composite:.1f}{RST} 分 [{comp_rl}]")
-    print(f"【策略稳定得分】  {stab_c}{stability:.0f}{RST} 分 [{stab_rl}]")
+    summary_lines = []
+    summary_lines.append(f"【策略综合得分】 {comp_c}{composite:.1f}{RST} 分 [{comp_rl}]")
+    summary_lines.append(f"【策略稳定得分】  {stab_c}{stability:.0f}{RST} 分 [{stab_rl}]")
     ac = indicator_color("annualized_returns", ann_ret / 100, use_color)
     dc = indicator_color("max_drawdown", max_dd / 100, use_color)
     shc = indicator_color("sharpe", sharpe_val, use_color)
     wc = indicator_color("win_rate", win_rate_val / 100, use_color)
-    print(f"【核心指标】年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
+    summary_lines.append(f"【核心指标】年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
     overfit_flags = detect_overfit_flags(quarterly_scores)
     if overfit_flags:
-        print(f"提示: ⚑过拟合风险")
+        warn_color = "\033[41;97m" if use_color else ""
+        summary_lines.append(f"{warn_color}提示: ⚑过拟合风险{RST}")
         for f in overfit_flags:
-            print(f"  - {f}")
+            summary_lines.append(f"  - {f}")
 
     env_parts = []
     for env_name in ["牛市", "震荡", "熊市"]:
@@ -1301,10 +1306,42 @@ def main():
             env_parts.append(f"{env_name} {vc}{v:.1f}{RST}[{rl}]")
         else:
             env_parts.append(f"{env_name} {v}")
-    print(f"【市场环境】{' | '.join(env_parts)}")
-    print()
-    print(rating_legend(use_color))
-    print("=" * 50)
+    summary_lines.append(f"【市场环境】{' | '.join(env_parts)}")
+    summary_lines.append("")
+    summary_lines.append(rating_legend(use_color))
+
+    def strip_ansi(text):
+        return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+    def line_display_width(text):
+        """计算一行文本的终端显示宽度（去除 ANSI 转义后，考虑中文双宽度）"""
+        return display_width(strip_ansi(text))
+
+    def print_box(lines, title=None):
+        width = max(line_display_width(line) for line in lines)
+        if title:
+            title_w = display_width(title)
+            width = max(width, title_w + 4)  # 标题两侧各留 " ─" 共2格
+        top_bar = "─" * (width + 2)
+        if title:
+            # 标题居中嵌入顶边框
+            # 总显示宽度需等于 width+4: ┌─ + ─*left + " "+title+" " + ─*right + ─┐
+            # 即 6 + left + title_w + right = width + 4 → left + right = width - title_w - 2
+            pad_total = width - title_w - 2
+            pad_left = pad_total // 2
+            pad_right = pad_total - pad_left
+            print("┌─" + "─" * pad_left + " " + title + " " + "─" * pad_right + "─┐")
+        else:
+            print("┌" + top_bar + "┐")
+        for line in lines:
+            pad = width - line_display_width(line)
+            print("│ " + line + " " * pad + " │")
+        print("└" + "─" * (width + 2) + "┘")
+
+    print_box(summary_lines, title="回测结论")
+
+    elapsed = time.time() - t_start
+    print(f"\n回测总耗时: {elapsed:.1f} 秒")
 
     # 交易日志
     build_trade_log(window_results, args.log, args.cash)
