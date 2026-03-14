@@ -5,11 +5,14 @@
     python strategy_scorer.py strategy.py
     python strategy_scorer.py strategy.py --cash 200000
     python strategy_scorer.py strategy.py --log mid
+    python strategy_scorer.py --search "平安"
 """
 import argparse
 import datetime
 import math
 import os
+import pickle
+import re
 import sys
 import warnings
 import unicodedata
@@ -230,10 +233,7 @@ def score_window(summary):
     for name, weight in WEIGHTS.items():
         raw = summary.get(name)
         if pd.isna(raw):
-            if name == "profit_loss_rate":
-                s = 100.0
-            else:
-                s = 0.0
+            s = 0.0  # 无交易时无信号贡献，与 total_returns(0)=0、sharpe(0)=0 保持一致
         else:
             s = score_indicator(name, raw)
         total += s * weight
@@ -422,6 +422,25 @@ def flatten_trades(trades_df):
     return records
 
 
+def display_width(value):
+    text = str(value)
+    total = 0
+    for ch in text:
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
+def pad_cell(value, width, align, colored_value=None):
+    text = str(value)
+    pad_len = width - display_width(text)
+    out = text if colored_value is None else str(colored_value)
+    if pad_len <= 0:
+        return out
+    if align == "left":
+        return out + " " * pad_len
+    return " " * pad_len + out
+
+
 def build_trade_log(window_results, level, cash):
     """根据日志级别筛选窗口，逐笔输出交易流水"""
     if level == "low":
@@ -515,23 +534,6 @@ def build_trade_log(window_results, level, cash):
         colored_row[11] = colorize(cum_str, r["total_realized_pnl"])
         rows.append(plain_row)
         row_colors.append(colored_row)
-
-    def display_width(value):
-        text = str(value)
-        total = 0
-        for ch in text:
-            total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-        return total
-
-    def pad_cell(value, width, align, colored_value=None):
-        text = str(value)
-        pad_len = width - display_width(text)
-        out = text if colored_value is None else str(colored_value)
-        if pad_len <= 0:
-            return out
-        if align == "left":
-            return out + " " * pad_len
-        return " " * pad_len + out
 
     alignments = [
         "right", "left", "left", "left", "left",
@@ -634,17 +636,19 @@ def build_trade_log(window_results, level, cash):
 
         # 期末持仓
         if w_holding_stocks:
-            # 市值 = 总资产 - 剩余现金，剩余现金 = 初始资金 + 已实现盈亏 - 持仓成本
-            total_holding_cost = sum(w_holding_costs.get(k, 0) for k in w_holding_stocks)
-            holding_market_value = total_asset - (cash + realized_pnl - total_holding_cost)
+            end_date = w["end"]
             parts = []
             for k, v in w_holding_stocks.items():
                 qty = int(v['qty'])
                 cost = w_holding_costs.get(k, 0)
                 avg_price = cost / qty if qty > 0 else 0
-                # 按持仓比例分配市值
-                share = cost / total_holding_cost if total_holding_cost > 0 else 1
-                mv = holding_market_value * share
+                # 从日线数据获取期末收盘价计算市值（向前查10天，防止end_date是非交易日）
+                bars = read_daily_bars(k, end_date - datetime.timedelta(days=10), end_date)
+                if bars is not None and not bars.empty:
+                    last_price = bars["close"].iloc[-1]
+                else:
+                    last_price = v["price"]  # 回退到最后成交价
+                mv = qty * last_price
                 parts.append(f"{v['symbol']}({k}) {qty}股 均价{avg_price:.2f} 成本{cost:,.0f} 市值{mv:,.0f}")
             print(f"  期末持仓: {', '.join(parts)}")
         else:
@@ -915,8 +919,114 @@ def compute_market_env_scores(quarterly_scores, benchmark_quarterly_returns):
         result[env] = np.mean(scores) if scores else "N/A"
     return result
 
+def detect_overfit_flags(quarterly_scores):
+    """检测过拟合迹象，返回警告列表
+
+    基于滚动窗口的时间序列特征判断，而非简单的绝对值阈值。
+    检测维度:
+      1. 前后半段衰减: 前半段季度得分均值显著高于后半段（≥15分），说明策略在近期失效
+      2. 最佳-中位差距: 最佳季度远超中位数（≥30分），说明收益集中在少数时段，可能是偶然
+    """
+    scores = list(quarterly_scores.values())
+    if len(scores) < 4:
+        return []
+
+    flags = []
+
+    # 1. 前后半段衰减
+    mid = len(scores) // 2
+    first_half = np.mean(scores[:mid])
+    second_half = np.mean(scores[mid:])
+    decay = first_half - second_half
+    if decay >= 15:
+        flags.append(f"前半段均分 {first_half:.0f} → 后半段 {second_half:.0f}，近期表现衰退")
+
+    # 2. 最佳-中位差距
+    best = max(scores)
+    median = float(np.median(scores))
+    gap = best - median
+    if gap >= 30:
+        flags.append(f"最佳季度 {best:.0f} 远超中位数 {median:.0f}，收益集中在少数时段")
+
+    return flags
+
+
 # ============================================================
-# 10. 主函数
+# 10. 股票搜索
+# ============================================================
+
+SEARCH_TYPES = {"CS", "ETF", "LOF", "INDX"}
+TYPE_LABELS = {"CS": "股票", "ETF": "ETF", "LOF": "LOF", "INDX": "指数"}
+EXCHANGE_LABELS = {"XSHE": "深交所", "XSHG": "上交所"}
+
+def search_instruments(pattern):
+    """从 bundle 的 instruments.pk 中搜索匹配的证券"""
+    pkl_path = os.path.join(os.path.expanduser("~/.rqalpha/bundle"), "instruments.pk")
+    if not os.path.exists(pkl_path):
+        print("错误: instruments.pk 不存在，请先运行 rqalpha download-bundle")
+        sys.exit(1)
+
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        print(f"错误: 无效的正则表达式 '{pattern}': {e}")
+        sys.exit(1)
+
+    with open(pkl_path, "rb") as f:
+        instruments = pickle.load(f)
+
+    matches = []
+    for ins in instruments:
+        if ins.get("type") not in SEARCH_TYPES:
+            continue
+        if ins.get("status") != "Active":
+            continue
+        ob_id = ins.get("order_book_id", "")
+        symbol = ins.get("symbol", "")
+        if regex.search(ob_id) or regex.search(symbol):
+            matches.append(ins)
+
+    matches.sort(key=lambda x: x.get("order_book_id", ""))
+
+    if not matches:
+        print(f'搜索: "{pattern}" — 未找到匹配项')
+        return
+
+    print(f'搜索: "{pattern}" (共 {len(matches)} 条结果)\n')
+
+    headers = ["代码", "名称", "类型", "交易所", "行业", "上市日期"]
+    rows = []
+    for ins in matches:
+        rows.append([
+            ins.get("order_book_id", ""),
+            ins.get("symbol", ""),
+            TYPE_LABELS.get(ins.get("type", ""), ins.get("type", "")),
+            EXCHANGE_LABELS.get(ins.get("exchange", ""), ins.get("exchange", "")),
+            ins.get("industry_name", "") or "",
+            ins.get("listed_date", "") or "",
+        ])
+
+    columns = list(zip(headers, *rows))
+    widths = [max(display_width(cell) for cell in col) for col in columns]
+    alignments = ["left"] * len(headers)
+
+    # 表头
+    header_parts = []
+    for i, h in enumerate(headers):
+        header_parts.append(pad_cell(h, widths[i], alignments[i]))
+    print("  " + "  ".join(header_parts))
+    print("  " + "  ".join("─" * w for w in widths))
+
+    # 数据行
+    for row in rows:
+        parts = []
+        for i, cell in enumerate(row):
+            parts.append(pad_cell(cell, widths[i], alignments[i]))
+        print("  " + "  ".join(parts))
+
+
+# ============================================================
+# 11. 主函数
 # ============================================================
 
 HELP_TEXT = """\
@@ -940,6 +1050,8 @@ HELP_TEXT = """\
                           mid  = 最近 4 个窗口（约1年）
                           high = 全部 37 个窗口
     --plot              绘制价格走势图，在收盘价曲线上标注买卖点（保存为 PNG 文件）
+    --search, -s PATTERN  搜索股票代码或名称（正则匹配，不跑回测）
+                          匹配 order_book_id 或 symbol，仅显示 Active 的股票/ETF/指数
     --help              显示此帮助信息
     --eg                显示完整使用示例
 
@@ -1027,7 +1139,15 @@ EXAMPLE_TEXT = """\
      2   #37   卖出  000001.XSHE  平安银行  2025-03-03  11.51   500    5755    +40.00       500  +40.00
      3   #37   卖出  000001.XSHE  平安银行  2025-03-10  11.60   500    5800    +85.00         0  +125.00
 
-9. 评分参考:
+9. 搜索股票代码:
+
+    python strategy_scorer.py --search "平安"           # 搜索名称包含"平安"的股票
+    python strategy_scorer.py -s "000001"               # 搜索代码包含 000001 的证券
+    python strategy_scorer.py -s "510300"               # 搜索 ETF
+    python strategy_scorer.py -s "^600[0-9]{3}"         # 正则：搜索60开头的上交所股票
+    python strategy_scorer.py -s "银行"                 # 搜索名称包含"银行"的所有股票
+
+10. 评分参考:
 
     E  (>=60分)  优秀策略，各维度表现均衡
     M+ (>=30分)  良好策略，有一定优势
@@ -1048,10 +1168,16 @@ def main():
     parser.add_argument("--help", "-h", action="store_true", help="显示帮助信息")
     parser.add_argument("--eg", action="store_true", help="显示完整使用示例")
     parser.add_argument("--plot", action="store_true", help="绘制价格走势+买卖点图表")
+    parser.add_argument("--search", "-s", type=str, default=None,
+                        help="搜索股票代码或名称（正则匹配）")
     args = parser.parse_args()
 
     if args.eg:
         print(EXAMPLE_TEXT)
+        sys.exit(0)
+
+    if args.search:
+        search_instruments(args.search)
         sys.exit(0)
 
     if args.help or args.strategy_file is None:
@@ -1160,6 +1286,11 @@ def main():
     shc = indicator_color("sharpe", sharpe_val, use_color)
     wc = indicator_color("win_rate", win_rate_val / 100, use_color)
     print(f"【核心指标】年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
+    overfit_flags = detect_overfit_flags(quarterly_scores)
+    if overfit_flags:
+        print(f"提示: ⚑过拟合风险")
+        for f in overfit_flags:
+            print(f"  - {f}")
 
     env_parts = []
     for env_name in ["牛市", "震荡", "熊市"]:

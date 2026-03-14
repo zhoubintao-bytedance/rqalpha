@@ -12,7 +12,7 @@ from rqalpha.apis import *
 
 def init(context):
     """策略初始化"""
-    context.stock = "510300.XSHG"  # 沪深300ETF
+    context.stock = "600218.XSHG"  # 沪深300ETF
 
     # 均线参数
     context.short_window = 10      # 短期均线
