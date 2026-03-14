@@ -1158,7 +1158,48 @@ EXAMPLE_TEXT = """\
 """
 
 
+def print_logo():
+    """打印 Sky eye logo，使用蓝色到青色的渐变"""
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.txt")
+    if not os.path.isfile(logo_path):
+        return
+    with open(logo_path, "r") as f:
+        lines = f.readlines()
+    # 蓝→青渐变色 (RGB)，灵感来自字节跳动 Sky eye 配色
+    colors = [
+        (17, 95, 179),   # #115fb3
+        (27, 113, 179),  # #1b71b3
+        (37, 130, 178),  # #2582b2
+        (47, 148, 178),  # #2f94b2
+        (56, 166, 178),  # #38a6b2
+        (66, 183, 177),  # #42b7b1
+        (76, 201, 177),  # #4cc9b1
+    ]
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line:
+            print()
+            continue
+        n = len(line)
+        colored = []
+        for i, ch in enumerate(line):
+            if ch == ' ':
+                colored.append(ch)
+            else:
+                t = i / max(n - 1, 1)
+                idx = t * (len(colors) - 1)
+                ci = min(int(idx), len(colors) - 2)
+                frac = idx - ci
+                r = int(colors[ci][0] + (colors[ci + 1][0] - colors[ci][0]) * frac)
+                g = int(colors[ci][1] + (colors[ci + 1][1] - colors[ci][1]) * frac)
+                b = int(colors[ci][2] + (colors[ci + 1][2] - colors[ci][2]) * frac)
+                colored.append(f"\033[38;2;{r};{g};{b}m{ch}\033[0m")
+        print("".join(colored))
+    print()
+
+
 def main():
+    print_logo()
     parser = argparse.ArgumentParser(description="策略打分器", add_help=False)
     parser.add_argument("strategy_file", nargs="?", default=None, help="策略文件路径")
     parser.add_argument("--cash", type=int, default=1000000, help="初始资金（默认100万）")
