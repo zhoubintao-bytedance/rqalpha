@@ -18,3 +18,6 @@ mod:
     enabled: true
   sys_transaction_cost:
     enabled: true
+  dividend_scorer:
+    enabled: false
+    lib: rqalpha.mod.rqalpha_mod_dividend_scorer

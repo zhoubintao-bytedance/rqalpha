@@ -280,10 +280,11 @@ def parse_window_arg(window_str):
     return sorted(nums)
 
 
-def run_rolling_backtests(strategy_file, cash, selected_indices=None):
+def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods=None):
     """对策略文件执行滚动窗口回测，返回结果列表
 
     selected_indices: 要执行的窗口编号列表（1-based），None 表示全部37个
+    extra_mods: 额外启用的 mod 名称列表
     """
     with open(strategy_file) as f:
         source_code = f.read()
@@ -316,6 +317,9 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None):
                 "sys_progress": {"enabled": False},
             },
         }
+        if extra_mods:
+            for mod_name in extra_mods:
+                config["mod"][mod_name] = {"enabled": True}
 
         try:
             with warnings.catch_warnings():
@@ -1210,6 +1214,8 @@ def main():
     parser.add_argument("--help", "-h", action="store_true", help="显示帮助信息")
     parser.add_argument("--eg", action="store_true", help="显示完整使用示例")
     parser.add_argument("--plot", action="store_true", help="绘制价格走势+买卖点图表")
+    parser.add_argument("--mod", type=str, nargs="*", default=None,
+                        help="启用额外的 mod，如 --mod dividend_scorer")
     parser.add_argument("--search", "-s", type=str, default=None,
                         help="搜索股票代码或名称（正则匹配）")
     args = parser.parse_args()
@@ -1255,7 +1261,7 @@ def main():
     print("开始滑动窗口回测")
     print("=" * 50)
     t_start = time.time()
-    window_results = run_rolling_backtests(args.strategy_file, args.cash, selected_indices)
+    window_results = run_rolling_backtests(args.strategy_file, args.cash, selected_indices, extra_mods=args.mod)
 
     if not window_results:
         print("\n错误: 没有成功的回测窗口")

@@ -9,7 +9,6 @@ authors = [
 classifiers = [
     'Programming Language :: Python',
     'Operating System :: OS Independent',
-    'Programming Language :: Python :: 3.6',
     'Programming Language :: Python :: 3.7',
     'Programming Language :: Python :: 3.8',
     'Programming Language :: Python :: 3.9',
@@ -19,7 +18,7 @@ classifiers = [
     'Programming Language :: Python :: 3.13',
     'Programming Language :: Python :: 3.14',
 ]
-requires-python = ">=3.6"
+requires-python = ">=3.7"
 dependencies = [
     'requests',
     'numpy < 2.0.0 ; python_version <= "3.11"',
@@ -39,7 +38,8 @@ dependencies = [
     "openpyxl",
     "methodtools",
     "filelock",
-    "typing-extensions >=4.5.0"
+    "typing-extensions ; python_version < '3.7'",
+    "typing-extensions >=4.5.0 ; python_version >= '3.7'"
 ]
 dynamic = ["version"]
 
@@ -51,6 +51,7 @@ rqalpha = "rqalpha.__main__:entry_point"
 
 [project.optional-dependencies]
 profiler = ["line_profiler"]
+dividend-scorer = ["akshare==1.18.38; python_version >= '3.10'"]
 
 [build-system]
 requires = [

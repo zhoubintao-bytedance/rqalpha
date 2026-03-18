@@ -26,3 +26,4 @@ rqalpha_test_coverage_report/
 rqalpha/_version.py
 
 .claude/settings.local.json
+uv.lock

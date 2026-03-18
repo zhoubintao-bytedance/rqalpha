@@ -465,7 +465,10 @@ class AnalyserMod(AbstractMod):
             if len(self._benchmark) == 1:
                 benchmark_obid, _ = self._benchmark[0]
                 summary["benchmark"] = benchmark_obid
-                summary["benchmark_symbol"] = self._env.data_proxy.instrument_not_none(benchmark_obid).symbol
+                if benchmark_obid in self.NULL_OID:
+                    summary["benchmark_symbol"] = "null"
+                else:
+                    summary["benchmark_symbol"] = self._env.data_proxy.instrument_not_none(benchmark_obid).symbol
             else:
                 summary["benchmark"] = ",".join(f"{o}:{w}" for o, w in self._benchmark)
                 summary["benchmark_symbol"] = ",".join(f"{self._env.data_proxy.instrument_not_none(o).symbol if o not in self.NULL_OID else 'null'}:{w}" for o, w in self._benchmark)
