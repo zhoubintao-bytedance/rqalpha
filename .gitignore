@@ -8,6 +8,7 @@ rqalpha.system.log
 *.bcolz
 *.pk
 *.h5
+.venv/
 .vscode
 *.c
 *.so
