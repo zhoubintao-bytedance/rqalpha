@@ -59,7 +59,7 @@
 ```sql
 -- 指数日线数据（PE_TTM + 行情）
 CREATE TABLE index_daily (
-    date TEXT NOT NULL,           -- YYYY-MM-DD
+    date TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     index_code TEXT NOT NULL,     -- H30269
     close REAL,
     pe_ttm REAL,                  -- 滚动市盈率
@@ -71,7 +71,7 @@ CREATE TABLE index_daily (
 
 -- ETF 日线数据（行情 + 复权价）
 CREATE TABLE etf_daily (
-    date TEXT NOT NULL,
+    date TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     etf_code TEXT NOT NULL,       -- 512890
     open REAL, high REAL, low REAL, close REAL,
     close_hfq REAL,              -- 后复权收盘价
@@ -84,7 +84,7 @@ CREATE TABLE etf_daily (
 
 -- ETF 净值数据（用于计算溢折价）
 CREATE TABLE etf_nav (
-    date TEXT NOT NULL,
+    date TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     etf_code TEXT NOT NULL,
     nav REAL,                     -- 单位净值
     acc_nav REAL,                 -- 累计净值
@@ -94,7 +94,7 @@ CREATE TABLE etf_nav (
 
 -- 国债收益率
 CREATE TABLE bond_yield (
-    date TEXT NOT NULL,
+    date TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     china_10y REAL,               -- 中国 10 年期国债收益率 (%)
     updated_at TEXT NOT NULL,
     PRIMARY KEY (date)
@@ -102,8 +102,8 @@ CREATE TABLE bond_yield (
 
 -- 成分股股息率
 CREATE TABLE stock_indicator (
-    date TEXT NOT NULL,
-    stock_code TEXT NOT NULL,     -- 000001 (不含交易所后缀)
+    date TEXT NOT NULL CHECK (date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    stock_code TEXT NOT NULL CHECK (stock_code GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
     dv_ttm REAL,                 -- 滚动股息率 (%)
     pe_ttm REAL,
     pb REAL,
@@ -115,7 +115,7 @@ CREATE TABLE stock_indicator (
 -- 成分股权重（仅最新快照）
 CREATE TABLE index_weight (
     index_code TEXT NOT NULL,
-    stock_code TEXT NOT NULL,
+    stock_code TEXT NOT NULL CHECK (stock_code GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
     stock_name TEXT,
     weight REAL,                  -- 权重 (%)
     snapshot_date TEXT NOT NULL,  -- 快照日期
@@ -132,10 +132,59 @@ CREATE TABLE data_source_meta (
 );
 ```
 
+> **SQLite 连接初始化**：每次打开连接时必须执行 `PRAGMA foreign_keys = ON` 和 `PRAGMA journal_mode = WAL`（WAL 模式支持读写并发，避免 sync_all 与 load_history 互斥）。
+
 **更新策略**：
 - `data_fetcher.py` 提供 `sync_all(start_date, end_date)` 方法，首次运行拉取全量，后续增量追加
-- 使用 `INSERT OR REPLACE` 实现幂等写入
+- **使用 UPSERT（而非 INSERT OR REPLACE）实现幂等写入**。`INSERT OR REPLACE` 会先删除整行再插入，导致未指定的列被置为 NULL（例如后续新增列会被清空）。应使用 SQLite 3.24+ 的 `ON CONFLICT ... DO UPDATE SET` 语法，仅更新指定列，保留未涉及的列：
+
+```sql
+-- 示例：stock_indicator 的 UPSERT 写入
+INSERT INTO stock_indicator (date, stock_code, dv_ttm, pe_ttm, pb, total_mv, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(date, stock_code) DO UPDATE SET
+    dv_ttm     = excluded.dv_ttm,
+    pe_ttm     = excluded.pe_ttm,
+    pb         = excluded.pb,
+    total_mv   = excluded.total_mv,
+    updated_at = excluded.updated_at;
+```
+
 - 成分股数据需调用 50 次 `stock_a_indicator_lg`（每只成分股一次），建议加 0.5s 间隔避免触发频率限制
+- **50 只成分股批量拉取必须包裹在 SQLite 事务中**，确保原子性。中断后不会出现"30 只已写入、20 只缺失"的不一致状态：
+
+```python
+# 成分股批量拉取的事务边界示例
+def _sync_stock_indicators(self, conn, stock_codes, start_date, end_date):
+    """在单个事务中拉取并写入所有成分股数据"""
+    conn.execute("BEGIN")
+    try:
+        for stock_code in stock_codes:
+            df = self._fetch_stock_indicator(stock_code, start_date, end_date)
+            if df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    conn.execute(UPSERT_STOCK_INDICATOR_SQL, (
+                        row['date'], stock_code, row['dv_ttm'],
+                        row['pe_ttm'], row['pb'], row['total_mv'],
+                        datetime.now().isoformat()
+                    ))
+            time.sleep(API_CALL_INTERVAL)
+        # 全部成功后更新 meta 并提交
+        conn.execute(
+            "INSERT INTO data_source_meta (source_name, last_update_date, last_fetch_time, record_count) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(source_name) DO UPDATE SET "
+            "last_update_date=excluded.last_update_date, last_fetch_time=excluded.last_fetch_time, "
+            "record_count=excluded.record_count",
+            ('stock_indicator', end_date, datetime.now().isoformat(),
+             conn.execute("SELECT COUNT(*) FROM stock_indicator").fetchone()[0])
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+```
+
+> **注意**：其他数据源（index_daily、etf_daily、etf_nav、bond_yield）的写入同样应使用 UPSERT 语法和事务边界，此处仅以 stock_indicator 为例。
 
 ---
 
@@ -175,12 +224,12 @@ CREATE TABLE data_source_meta (
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| 数据获取 | `dividend_scorer/data_fetcher.py` | 从 AKShare/Bundle/RQData 获取数据，带本地缓存 |
-| 特征引擎 | `dividend_scorer/feature_engine.py` | 计算 8 个估值特征 + 2 个置信度修正因子，统一标准化为百分位 |
-| 权重计算 | `dividend_scorer/weight_calculator.py` | IC_IR 权重计算（正式） + Elastic Net 实验性对照 |
-| 分数合成 | `dividend_scorer/score_synthesizer.py` | 线性映射 → 加权合成 → 总分输出 |
-| 滚动验证 | `dividend_scorer/validator.py` | 时间序列滚动验证 + 策略打分器闭环 |
-| 主入口 | `dividend_scorer/main.py` | 独立运行 + RQAlpha 嵌入两种模式的入口 |
+| 数据获取 | `rqalpha/dividend_scorer/data_fetcher.py` | 从 AKShare/Bundle/RQData 获取数据，带本地缓存 |
+| 特征引擎 | `rqalpha/dividend_scorer/feature_engine.py` | 计算 8 个估值特征 + 2 个置信度修正因子，统一标准化为百分位 |
+| 权重计算 | `rqalpha/dividend_scorer/weight_calculator.py` | IC_IR 权重计算（正式） + Elastic Net 实验性对照 |
+| 分数合成 | `rqalpha/dividend_scorer/score_synthesizer.py` | 线性映射 → 加权合成 → 总分输出 |
+| 滚动验证 | `rqalpha/dividend_scorer/validator.py` | 时间序列滚动验证 + 策略打分器闭环 |
+| 主入口 | `rqalpha/dividend_scorer/main.py` | 独立运行 + RQAlpha 嵌入两种模式的入口 |
 
 ### 3.2 模块依赖关系
 
@@ -210,6 +259,12 @@ class DataFetcher:
         columns: date, etf_close, etf_close_hfq, etf_volume, etf_nav,
                  pe_ttm, dividend_yield, bond_10y, premium_rate
         index: DatetimeIndex
+
+        **时间序列完整性校验**：
+        返回前会对 DataFrame 的 DatetimeIndex 与 A 股交易日历做比对。
+        若缺失交易日占比 > 5%，抛出 DataGapError 并附带缺失日期列表，
+        防止缺口数据静默传递到 feature_engine 导致 rolling() 窗口偏移。
+        缺失率 ≤ 5% 时在返回的 DataFrame.attrs 中标记 warnings。
         """
 
     def load_latest(self, date: str) -> dict:
@@ -217,6 +272,25 @@ class DataFetcher:
 
     def get_data_freshness(self) -> dict:
         """返回各数据源的最后更新时间，用于新鲜度检查"""
+
+    @staticmethod
+    def validate_trading_day_coverage(
+        df: pd.DataFrame, start_date: str, end_date: str,
+        gap_threshold: float = 0.05
+    ) -> None:
+        """
+        校验 DataFrame 的时间序列完整性。
+
+        使用 RQAlpha 交易日历（或内嵌的 A 股交易日历）获取
+        [start_date, end_date] 内的预期交易日集合，与 df.index 比对。
+
+        - 缺失率 > gap_threshold (5%) → 抛出 DataGapError
+        - 缺失率 > 0 但 ≤ gap_threshold → 记录 warning 到 df.attrs['warnings']
+        - 缺失率 = 0 → 通过
+
+        这确保 feature_engine 的 rolling() 计算基于连续的交易日序列，
+        避免因缺口导致百分位窗口实际覆盖的时间跨度与预期不符。
+        """
 ```
 
 #### feature_engine → score_synthesizer
@@ -655,30 +729,41 @@ strategy_scorer.py 对回测结果评分
 
 ```
 rqalpha/
-├── dividend_scorer/
-│   ├── __init__.py
-│   ├── main.py                # 主入口（独立运行 CLI）
-│   ├── data_fetcher.py        # 数据获取层（AKShare + 本地 SQLite 缓存）
-│   ├── feature_engine.py      # 特征引擎（8 估值指标 + 2 置信度修正因子 + 标准化 + 方向统一）
-│   ├── weight_calculator.py   # IC_IR 权重计算（正式） + Elastic Net 实验性对照
-│   ├── score_synthesizer.py   # 线性映射 + 加权合成
-│   ├── validator.py           # IC 稳定性验证 + 策略打分器闭环
-│   └── config.py              # 打分器配置常量
 ├── rqalpha/
+│   ├── dividend_scorer/              # 打分器核心逻辑（作为 rqalpha 子包，确保可被 pip install -e . 正确导入）
+│   │   ├── __init__.py
+│   │   ├── main.py                   # 主入口（独立运行 CLI）
+│   │   ├── data_fetcher.py           # 数据获取层（AKShare + 本地 SQLite 缓存）
+│   │   ├── feature_engine.py         # 特征引擎（8 估值指标 + 2 置信度修正因子 + 标准化 + 方向统一）
+│   │   ├── weight_calculator.py      # IC_IR 权重计算（正式） + Elastic Net 实验性对照
+│   │   ├── score_synthesizer.py      # 线性映射 + 加权合成
+│   │   ├── validator.py              # IC 稳定性验证 + 策略打分器闭环
+│   │   └── config.py                 # 打分器配置常量
 │   └── mod/
 │       └── rqalpha_mod_dividend_scorer/
-│           ├── __init__.py    # load_mod() 入口
-│           └── mod.py         # AbstractMod 实现（start_up / tear_down）
-├── strategy_scorer.py         # 已有的策略打分器（外层验证用）
-└── dividend_scorer_design.md  # 本设计文档
+│           ├── __init__.py           # load_mod() 入口
+│           └── mod.py                # AbstractMod 实现（start_up / tear_down）
+├── strategy_scorer.py                # 已有的策略打分器（外层验证用）
+└── dividend_scorer_design.md         # 本设计文档
 ```
+
+> **为什么放在 `rqalpha/dividend_scorer/` 而非 repo 根目录？**
+>
+> 原设计将 `dividend_scorer/` 放在 repo 根目录（与 `rqalpha/` 平级），导致 mod 中 `from dividend_scorer.xxx import ...` 依赖 `PYTHONPATH` 或 `CWD` 设置正确才能导入。这在 CI、生产部署、`pip install -e .` 等场景下极其脆弱。将其移入 `rqalpha/` 包内后，mod 可通过 `from rqalpha.dividend_scorer.xxx import ...` 稳定导入，无需额外路径配置。
 
 ### 11.1 RQAlpha Mod 嵌入方式
 
-打分器作为 RQAlpha Mod 嵌入，遵循标准 Mod 生命周期：
+打分器作为 RQAlpha Mod 嵌入，遵循标准 Mod 生命周期。
+
+> **注意**：不得在 `Environment` 对象上动态注入属性（猴子补丁）。RQAlpha 的 `Environment` 类有明确定义的属性集和 setter 方法，动态注入违反其约定，且无类型安全保障。应通过 `global_vars` 暴露数据，并通过 `export_as_api` 注册策略可调用的 API 函数。
 
 ```python
 # rqalpha/mod/rqalpha_mod_dividend_scorer/mod.py
+
+from rqalpha.apis.api_base import export_as_api
+from rqalpha.environment import Environment
+from rqalpha.core.events import EVENT
+
 
 class DividendScorerMod(AbstractMod):
     def start_up(self, env, mod_config):
@@ -687,18 +772,28 @@ class DividendScorerMod(AbstractMod):
         1. 从 SQLite 加载全量历史数据到内存
         2. 预计算全量百分位矩阵（向量化）
         3. 加载或计算 IC_IR 权重
-        4. 订阅 POST_BAR 事件
+        4. 注册 API 函数供策略调用
+        5. 订阅 POST_BAR 事件
         """
         self._scorer = DividendScorer(mod_config)
         self._scorer.precompute(env)
+
+        # 通过 global_vars 存储评分结果（而非动态注入 Environment 属性）
+        env.global_vars.dividend_score = None
+
+        # 注册策略可调用的 API 函数
+        @export_as_api
+        def get_dividend_score():
+            """获取当日红利低波打分器评分结果"""
+            return Environment.get_instance().global_vars.dividend_score
+
         env.event_bus.add_listener(EVENT.POST_BAR, self._on_bar)
 
     def _on_bar(self, event):
-        """每个 bar 后计算当日评分，存入 context 供策略读取"""
+        """每个 bar 后计算当日评分，写入 global_vars 供策略读取"""
         date = event.trading_dt.date()
         score_result = self._scorer.score(date)  # O(1) 矩阵查找
-        # 将评分结果挂载到 environment，策略可通过 env 访问
-        Environment.get_instance().dividend_score = score_result
+        Environment.get_instance().global_vars.dividend_score = score_result
 
     def tear_down(self, success, exception=None):
         pass
@@ -706,8 +801,15 @@ class DividendScorerMod(AbstractMod):
 
 **策略中使用**：
 ```python
+from rqalpha.apis import *
+
 def handle_bar(context, bar_dict):
-    score = context.env.dividend_score
+    # 方式一：通过注册的 API 函数（推荐）
+    score = get_dividend_score()
+
+    # 方式二：通过 global_vars 直接访问
+    # score = context.dividend_score  # global_vars 中的属性可通过 context 访问
+
     if score and score['total_score'] < 3.5:
         order_value('512890.XSHG', 30000)
 ```
@@ -715,7 +817,7 @@ def handle_bar(context, bar_dict):
 ### 11.2 配置常量（config.py）
 
 ```python
-# dividend_scorer/config.py
+# rqalpha/dividend_scorer/config.py
 
 # === 目标 ETF ===
 ETF_CODE = "512890"
@@ -749,6 +851,9 @@ CACHE_DB_PATH = "~/.rqalpha/dividend_scorer/cache.db"
 CACHE_STALE_DAYS = 3           # 缓存过期天数（交易日）
 CACHE_EXPIRED_DAYS = 5         # 缓存不可用天数（交易日）
 API_CALL_INTERVAL = 0.5        # AKShare API 调用间隔（秒）
+
+# === 数据完整性 ===
+DATA_GAP_THRESHOLD = 0.05      # 时间序列缺失率阈值，超过则拒绝计算（5%）
 
 # === 领域知识权重（回退方案） ===
 DOMAIN_WEIGHTS = {
@@ -798,6 +903,7 @@ FEATURES = {
 | IC_IR 筛选后因子全军覆没 | 无法出分或单因子退化 | 存活因子 < 5 自动回退领域知识调权；回退后仍 < 3 则拒绝出分 |
 | 股息率数据更新延迟 | 实时分数不够准确 | 标注数据时效性，低频指标用最近可用缓存值 + 缓存超过 3 个交易日（A 股日历）标记过期 |
 | 多维度同时缺失 | 退化为单因子模型 | 可用维度数 < 3 时拒绝出分 |
+| 时间序列缺口静默传递 | `rolling()` 窗口偏移导致百分位计算错误 | `load_history()` 返回前校验交易日历覆盖率，缺失率 >5% 抛出 `DataGapError`，≤5% 标记 warning |
 
 ---
 
