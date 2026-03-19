@@ -2,8 +2,12 @@
 
 import argparse
 import json
+import re
+import shutil
 import sys
+import threading
 import time
+import unicodedata
 from collections import OrderedDict
 
 import pandas as pd
@@ -52,8 +56,8 @@ class DividendScorer(object):
         self.score_history_df = None
         self.weight_result_by_date = {}
 
-    def sync_all(self, start_date, end_date, force=False, progress=None):
-        self.data_fetcher.sync_all(start_date, end_date, force=force, progress=progress)
+    def sync_all(self, start_date, end_date, progress=None):
+        self.data_fetcher.sync_all(start_date, end_date, progress=progress)
 
     def precompute(self, env=None, start_date=None, end_date=None):
         if env is not None and getattr(env, "data_proxy", None) is not None:
@@ -266,7 +270,6 @@ def build_arg_parser():
     parser.add_argument("--bundle-path", dest="bundle_path", default=None, help="RQAlpha bundle path")
     parser.add_argument("--sync", action="store_true", help="sync data from AKShare before scoring")
     parser.add_argument("--sync-only", action="store_true", help="only sync data, do not score afterwards")
-    parser.add_argument("--force-sync", action="store_true", help="force remote sync even if local cache already covers the requested range")
     parser.add_argument("--json", action="store_true", help="print JSON output")
     return parser
 
@@ -276,12 +279,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     scorer = DividendScorer(db_path=args.db_path, bundle_path=args.bundle_path)
     if args.sync:
-        available_start = args.start_date or "2018-01-01"
+        available_start = args.start_date or "2020-01-01"
         available_end = args.end_date or pd.Timestamp.today().strftime("%Y-%m-%d")
         progress = SyncProgressReporter(stream=sys.stderr)
-        scorer.sync_all(available_start, available_end, force=args.force_sync, progress=progress)
+        progress.banner(
+            title="红利低波打分器缓存同步",
+            start_date=available_start,
+            end_date=available_end,
+            db_path=scorer.data_fetcher.db_path,
+        )
+        scorer.sync_all(available_start, available_end, progress=progress)
         if args.sync_only:
-            print("sync completed: {} -> {}".format(available_start, available_end))
+            print("sync success ✅: {} -> {}".format(available_start, available_end))
             return
     scorer.precompute(start_date=args.start_date, end_date=args.end_date)
     score_result = scorer.score_latest(date=args.date)
@@ -298,72 +307,338 @@ def _json_default(value):
 
 
 class SyncProgressReporter(object):
+    ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+    ELLIPSIS = "..."
+    # SkyEye animation: heartbeat
+    SPINNER_FRAMES = (
+        "💜",
+        "💙",
+        "💚",
+        "💛",
+    )
+
+    SPINNER_INTERVAL = 0.10   # refresh rate for elapsed time
+    SPINNER_FRAME_TICKS = 10  # advance heart every N ticks (~1s)
+
     def __init__(self, stream=None):
         self.stream = stream or sys.stderr
+        self.use_color = bool(getattr(self.stream, "isatty", lambda: False)())
         self.total_steps = 0
         self.current_step = 0
         self.current_label = ""
         self.step_started_at = None
+        self.sync_started_at = None
+        self._current_state = ""
+        self._current_message = ""
         self._line_open = False
         self._last_width = 0
+        self._spinner_index = 0
+        self._spinner_thread = None
+        self._spinner_stop = None
+        self._lock = threading.Lock()
+
+    def banner(self, title, start_date, end_date, db_path):
+        self._emit_line(self._style(title, "header"))
+        self._emit_line("  range : {} -> {}".format(start_date, end_date))
+        self._emit_line("  cache : {}".format(db_path))
+        self._emit_line("")
 
     def start(self, total_steps):
         self.total_steps = total_steps
+        self.current_step = 0
+        self.sync_started_at = time.time()
 
     def start_step(self, source_name, label):
-        self.current_step += 1
-        self.current_label = label
-        self.step_started_at = time.time()
-        self._render(self._format_line("START", "starting"))
+        self._stop_spinner()
+        with self._lock:
+            self.current_step += 1
+            self.current_label = label
+            self.step_started_at = time.time()
+            self._current_state = "RUN"
+            self._current_message = "preparing"
+            self._spinner_index = 0
+            line = self._format_line("RUN", "preparing", spinner=self._spinner_frame())
+        if self.use_color:
+            self._render(line)
+            self._start_spinner()
+        else:
+            self._emit_line(line)
 
-    def update_step(self, current=None, total=None, detail=None):
+    def update_step(self, current=None, total=None, detail=None, stats=None):
         if current is None or total in (None, 0):
             return
-        self._render(self._format_line("RUN", self._progress_bar(current, total, detail)))
+        if not self.use_color:
+            return
+        with self._lock:
+            self._current_state = "RUN"
+            self._current_message = self._progress_bar(current, total, detail, stats)
+            self._render(self._format_line("RUN", self._current_message, spinner=self._spinner_frame()))
 
     def finish_step(self, status, detail=None):
-        elapsed = 0.0 if self.step_started_at is None else max(time.time() - self.step_started_at, 0.0)
         suffix = detail or "-"
-        suffix = "{} | {:.1f}s".format(suffix, elapsed)
-        self._render(self._format_line(status.upper(), suffix), newline=True)
+        self._stop_spinner()
+        with self._lock:
+            self._current_state = status.upper()
+            self._current_message = suffix
+        line = self._format_line(status.upper(), suffix)
+        if self.use_color:
+            self._render(line, newline=True)
+        else:
+            self._emit_line(line)
 
     def close(self):
+        self._stop_spinner()
         if self._line_open:
             self.stream.write("\n")
             self.stream.flush()
             self._line_open = False
 
-    def _format_line(self, state, message):
-        return "[sync {}/{}] {:<8} {:<5} {}".format(
-            self.current_step,
-            self.total_steps,
-            self.current_label,
-            state,
-            message,
-        )
+    def _format_line(self, state, message, spinner=None):
+        phase = "[{}/{}]".format(self.current_step, self.total_steps)
+        label = self._pad_display(self.current_label, 10)
+        spinner_width = max(self._display_width(frame) for frame in self.SPINNER_FRAMES)
+        if self.use_color and spinner:
+            visible = self.ANSI_RE.sub("", spinner)
+            pad = max(spinner_width - self._display_width(visible), 0)
+            spinner_token = spinner + (" " * pad)
+        else:
+            spinner_token = " " * spinner_width
+        state_padded = self._pad_display(state, 4)
+        elapsed = 0.0 if self.step_started_at is None else max(time.time() - self.step_started_at, 0.0)
+        show_elapsed = state.strip() != "RUN" or elapsed >= 0.5
+        elapsed_str = self._pad_display(self._format_duration(elapsed) if show_elapsed else "", 6)
+        prefix_parts = [
+            self._style(phase, "phase"),
+            self._style(label, "label"),
+            spinner_token,
+            self._style(state_padded, self._state_style(state.strip())),
+            self._style(elapsed_str, "phase"),
+        ]
+        prefix = " ".join(prefix_parts)
+        terminal_width = self._terminal_width()
+        if terminal_width is None:
+            return "{} {}".format(prefix, message)
+        available = max(terminal_width - self._display_width(prefix) - 1, 8)
+        fitted_message = message
+        if self._display_width(message) > available:
+            fitted_message = self._truncate_display(self.ANSI_RE.sub("", message), available)
+        return "{} {}".format(prefix, fitted_message)
 
-    def _progress_bar(self, current, total, detail):
-        width = 24
-        filled = int(round(width * float(current) / float(total)))
-        bar = "[{}{}]".format("#" * filled, "." * (width - filled))
-        message = "{} {}/{}".format(bar, current, total)
+    def _progress_bar(self, current, total, detail, stats):
+        width = 22
+        ratio = max(0.0, min(float(current) / float(total), 1.0))
+        filled = int(round(width * ratio))
+        percent = "{:>5.1f}%".format(ratio * 100.0)
+        filled_bar = self._style("█" * filled, "bar_fill")
+        empty_bar = self._style("░" * (width - filled), "bar_empty")
+        bar = "{}{}".format(filled_bar, empty_bar)
+        message = "{} {}/{} {}".format(bar, current, total, percent)
+        elapsed = 0.0 if self.step_started_at is None else max(time.time() - self.step_started_at, 0.0)
+        if current > 0 and elapsed >= 0.5:
+            rate = current / elapsed
+            eta = (total - current) / rate if rate > 0 else None
+            if eta is not None:
+                message = "{} | 预计剩余 {}".format(message, self._format_duration(eta))
         if detail:
-            message = "{} {}".format(message, detail)
+            message = "{} | {}".format(message, detail)
         return message
 
     def _render(self, line, newline=False):
-        padded = line
-        if len(padded) < self._last_width:
-            padded += " " * (self._last_width - len(padded))
+        fitted = self._fit_line_to_terminal(line)
+        visible_width = self._display_width(fitted)
+        padded = fitted
+        if visible_width < self._last_width:
+            padded += " " * (self._last_width - visible_width)
+        clear = "\r\033[2K" if self.use_color else "\r"
         if newline:
-            self.stream.write("\r" + padded + "\n")
+            self.stream.write(clear + padded + "\n")
             self.stream.flush()
             self._line_open = False
+            self._last_width = 0
         else:
-            self.stream.write("\r" + padded)
+            self.stream.write(clear + padded)
             self.stream.flush()
             self._line_open = True
-        self._last_width = len(line)
+            self._last_width = visible_width
+
+    def _emit_line(self, line):
+        if self._line_open:
+            clear = "\r\033[2K" if self.use_color else ("\r" + " " * self._last_width + "\r")
+            self.stream.write(clear)
+            self.stream.flush()
+            self._line_open = False
+            self._last_width = 0
+        self.stream.write(line + "\n")
+        self.stream.flush()
+
+    def _style(self, text, kind):
+        if not self.use_color:
+            return text
+        if not text:
+            return text
+        styles = {
+            "header": "\033[1;36m",
+            "phase": "\033[1;37m",
+            "label": "\033[1;34m",
+            "spinner": "\033[1;35m",
+            "run": "\033[1;36m",
+            "done": "\033[1;32m",
+            "skip": "\033[1;33m",
+            "fail": "\033[1;31m",
+            "bar_fill": "\033[32m",
+            "bar_empty": "\033[2;37m",
+        }
+        prefix = styles.get(kind, "")
+        suffix = "\033[0m" if prefix else ""
+        return "{}{}{}".format(prefix, text, suffix)
+
+    @staticmethod
+    def _state_style(state):
+        if state == "DONE":
+            return "done"
+        if state == "SKIP":
+            return "skip"
+        if state == "FAIL":
+            return "fail"
+        return "run"
+
+    @classmethod
+    def _display_width(cls, text):
+        visible = cls.ANSI_RE.sub("", str(text))
+        total = 0
+        for ch in visible:
+            cp = ord(ch)
+            # variation selectors and zero-width joiners take no space
+            if cp in (0xFE0E, 0xFE0F, 0x200D):
+                continue
+            # emoji and other wide Unicode blocks rendered as 2 columns
+            if (0x1F300 <= cp <= 0x1FAFF) or (0x2600 <= cp <= 0x27BF):
+                total += 2
+            elif unicodedata.east_asian_width(ch) in ("W", "F"):
+                total += 2
+            else:
+                total += 1
+        return total
+
+    @classmethod
+    def _pad_display(cls, text, width):
+        text = str(text)
+        pad = max(width - cls._display_width(text), 0)
+        return text + (" " * pad)
+
+    @staticmethod
+    def _format_duration(seconds):
+        if seconds is None:
+            return "-"
+        seconds = max(float(seconds), 0.0)
+        if seconds < 60:
+            return "{:.1f}s".format(seconds)
+        whole = int(round(seconds))
+        minutes, secs = divmod(whole, 60)
+        if minutes < 60:
+            return "{}m{:02d}s".format(minutes, secs)
+        hours, minutes = divmod(minutes, 60)
+        return "{}h{:02d}m".format(hours, minutes)
+
+    @staticmethod
+    def _format_stats(stats):
+        parts = []
+        for key in ("empty", "out", "rows"):
+            if key not in stats:
+                continue
+            value = stats[key]
+            if value is None:
+                continue
+            if key == "rows":
+                parts.append("rows={:,}".format(int(value)))
+            else:
+                parts.append("{}={}".format(key, int(value)))
+        return " ".join(parts)
+
+    def _terminal_width(self):
+        if not self.use_color:
+            return None
+        try:
+            return shutil.get_terminal_size(fallback=(100, 20)).columns
+        except Exception:
+            return 100
+
+    def _fit_line_to_terminal(self, line):
+        width = self._terminal_width()
+        if width is None:
+            return line
+        max_width = max(width - 1, 20)
+        if self._display_width(line) <= max_width:
+            return line
+        plain = self.ANSI_RE.sub("", line)
+        return self._truncate_display(plain, max_width)
+
+    @classmethod
+    def _truncate_display(cls, text, max_width):
+        text = str(text)
+        if cls._display_width(text) <= max_width:
+            return text
+        if max_width <= cls._display_width(cls.ELLIPSIS):
+            return cls.ELLIPSIS[:max_width]
+        target = max_width - cls._display_width(cls.ELLIPSIS)
+        out = []
+        used = 0
+        for ch in text:
+            ch_width = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if used + ch_width > target:
+                break
+            out.append(ch)
+            used += ch_width
+        return "".join(out) + cls.ELLIPSIS
+
+    def _spinner_frame(self):
+        idx = self._spinner_index % len(self.SPINNER_FRAMES)
+        return self.SPINNER_FRAMES[idx]
+
+    def _start_spinner(self):
+        if not self.use_color:
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._spinner_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="dividend-scorer-sync-spinner",
+        )
+        with self._lock:
+            self._spinner_stop = stop_event
+            self._spinner_thread = thread
+        thread.start()
+
+    def _stop_spinner(self):
+        thread = None
+        stop_event = None
+        with self._lock:
+            stop_event = self._spinner_stop
+            thread = self._spinner_thread
+            self._spinner_stop = None
+            self._spinner_thread = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.3)
+
+    def _spinner_loop(self, stop_event):
+        tick = 0
+        while not stop_event.wait(self.SPINNER_INTERVAL):
+            with self._lock:
+                if self._current_state != "RUN":
+                    continue
+                tick += 1
+                if tick % self.SPINNER_FRAME_TICKS == 0:
+                    self._spinner_index = (self._spinner_index + 1) % len(self.SPINNER_FRAMES)
+                self._render(
+                    self._format_line(
+                        self._current_state,
+                        self._current_message,
+                        spinner=self._spinner_frame(),
+                    )
+                )
 
 
 if __name__ == "__main__":

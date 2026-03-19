@@ -6,10 +6,13 @@ import sqlite3
 import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime
+from http.client import RemoteDisconnected
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from requests.exceptions import RequestException
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from rqalpha.data.data_proxy import DataProxy
 from rqalpha.data.base_data_source.data_source import BaseDataSource
@@ -23,6 +26,15 @@ from rqalpha.dividend_scorer.config import (
     DATA_GAP_THRESHOLD,
     ETF_CODE,
     INDEX_CODE,
+)
+
+AKSHARE_MAX_RETRIES = 3
+AKSHARE_RETRY_BASE_DELAY = 1.0
+AKSHARE_RETRIABLE_EXCEPTIONS = (
+    RequestException,
+    RemoteDisconnected,
+    Urllib3HTTPError,
+    TimeoutError,
 )
 
 
@@ -226,7 +238,7 @@ class DataFetcher(object):
         self._bundle_proxy = None
         self._init_db()
 
-    def sync_all(self, start_date, end_date, force=False, progress=None):
+    def sync_all(self, start_date, end_date, progress=None):
         ak = self._require_akshare()
         start_date = self._normalize_date(start_date)
         end_date = self._normalize_date(end_date)
@@ -234,58 +246,103 @@ class DataFetcher(object):
         progress.start(total_steps=6)
         try:
             with self._connect() as conn:
-                progress.start_step("index_daily", "指数估值")
-                if self._should_skip_sync(conn, "index_daily", start_date, end_date, force=force):
-                    progress.finish_step("skip", self._format_skip_detail(conn, "index_daily"))
-                else:
-                    rows = self._sync_index_daily(conn, ak, start_date, end_date)
-                    self._update_sync_checkpoint(conn, "index_daily", start_date, end_date)
-                    progress.finish_step("done", self._format_done_detail(conn, "index_daily", rows))
+                self._run_sync_stage(
+                    conn=conn,
+                    progress=progress,
+                    source_name="index_daily",
+                    label="指数估值",
+                    start_date=start_date,
+                    end_date=end_date,
+                    runner=lambda: self._sync_index_daily(conn, ak, start_date, end_date),
+                    detail_formatter=lambda rows: self._format_done_detail(conn, "index_daily", rows),
+                )
 
-                progress.start_step("etf_daily", "ETF行情")
-                if self._should_skip_sync(conn, "etf_daily", start_date, end_date, force=force):
-                    progress.finish_step("skip", self._format_skip_detail(conn, "etf_daily"))
-                else:
-                    rows = self._sync_etf_daily(conn, ak, start_date, end_date)
-                    self._update_sync_checkpoint(conn, "etf_daily", start_date, end_date)
-                    progress.finish_step("done", self._format_done_detail(conn, "etf_daily", rows))
+                self._run_sync_stage(
+                    conn=conn,
+                    progress=progress,
+                    source_name="etf_daily",
+                    label="ETF行情",
+                    start_date=start_date,
+                    end_date=end_date,
+                    runner=lambda: self._sync_etf_daily(conn, ak, start_date, end_date),
+                    detail_formatter=lambda rows: self._format_done_detail(conn, "etf_daily", rows),
+                )
 
-                progress.start_step("etf_nav", "ETF净值")
-                if self._should_skip_sync(conn, "etf_nav", start_date, end_date, force=force):
-                    progress.finish_step("skip", self._format_skip_detail(conn, "etf_nav"))
-                else:
-                    rows = self._sync_etf_nav(conn, ak, start_date, end_date)
-                    self._update_sync_checkpoint(conn, "etf_nav", start_date, end_date)
-                    progress.finish_step("done", self._format_done_detail(conn, "etf_nav", rows))
+                self._run_sync_stage(
+                    conn=conn,
+                    progress=progress,
+                    source_name="etf_nav",
+                    label="ETF净值",
+                    start_date=start_date,
+                    end_date=end_date,
+                    runner=lambda: self._sync_etf_nav(conn, ak, start_date, end_date),
+                    detail_formatter=lambda rows: self._format_done_detail(conn, "etf_nav", rows),
+                )
 
-                progress.start_step("bond_yield", "国债利率")
-                if self._should_skip_sync(conn, "bond_yield", start_date, end_date, force=force):
-                    progress.finish_step("skip", self._format_skip_detail(conn, "bond_yield"))
-                else:
-                    rows = self._sync_bond_yield(conn, ak, start_date, end_date)
-                    self._update_sync_checkpoint(conn, "bond_yield", start_date, end_date)
-                    progress.finish_step("done", self._format_done_detail(conn, "bond_yield", rows))
+                self._run_sync_stage(
+                    conn=conn,
+                    progress=progress,
+                    source_name="bond_yield",
+                    label="国债利率",
+                    start_date=start_date,
+                    end_date=end_date,
+                    runner=lambda: self._sync_bond_yield(conn, ak, start_date, end_date),
+                    detail_formatter=lambda rows: self._format_done_detail(conn, "bond_yield", rows),
+                )
 
-                progress.start_step("index_weight", "指数权重")
-                if self._should_skip_sync(conn, "index_weight", start_date, end_date, force=force):
-                    stock_codes = self._load_cached_stock_codes(conn)
-                    progress.finish_step("skip", self._format_skip_detail(conn, "index_weight"))
-                else:
-                    stock_codes = self._sync_index_weights(conn, ak)
-                    self._update_sync_checkpoint(conn, "index_weight", start_date, end_date)
-                    progress.finish_step("done", self._format_done_detail(conn, "index_weight", len(stock_codes)))
+                stock_codes = self._run_sync_stage(
+                    conn=conn,
+                    progress=progress,
+                    source_name="index_weight",
+                    label="指数权重",
+                    start_date=start_date,
+                    end_date=end_date,
+                    runner=lambda: self._sync_index_weights(conn, ak),
+                    detail_formatter=lambda codes: self._format_done_detail(conn, "index_weight", len(codes)),
+                    skip_value_factory=lambda: self._load_cached_stock_codes(conn),
+                )
 
-                progress.start_step("stock_indicator", "成分股指标")
-                if self._should_skip_sync(conn, "stock_indicator", start_date, end_date, force=force):
-                    progress.finish_step("skip", self._format_skip_detail(conn, "stock_indicator"))
-                else:
-                    rows = self._sync_stock_indicators(
-                        conn, ak, stock_codes, start_date, end_date, progress=progress
-                    )
-                    self._update_sync_checkpoint(conn, "stock_indicator", start_date, end_date)
-                    progress.finish_step("done", self._format_done_detail(conn, "stock_indicator", rows))
+                self._run_sync_stage(
+                    conn=conn,
+                    progress=progress,
+                    source_name="stock_indicator",
+                    label="成分股指标",
+                    start_date=start_date,
+                    end_date=end_date,
+                    runner=lambda: self._sync_stock_indicators(
+                        conn, ak, stock_codes, start_date, end_date,
+                        name_map=self._load_stock_name_map(conn),
+                        progress=progress,
+                    ),
+                    detail_formatter=lambda summary: self._format_stock_indicator_done_detail(conn, summary),
+                )
         finally:
             progress.close()
+
+    def _run_sync_stage(
+        self,
+        conn,
+        progress,
+        source_name,
+        label,
+        start_date,
+        end_date,
+        runner,
+        detail_formatter,
+        skip_value_factory=None,
+    ):
+        progress.start_step(source_name, label)
+        try:
+            if self._should_skip_sync(conn, source_name, start_date, end_date):
+                progress.finish_step("skip", self._format_skip_detail(conn, source_name))
+                return skip_value_factory() if skip_value_factory is not None else None
+            result = runner()
+            self._update_sync_checkpoint(conn, source_name, start_date, end_date)
+            progress.finish_step("done", detail_formatter(result))
+            return result
+        except Exception as exc:
+            progress.finish_step("fail", self._format_error_detail(exc))
+            raise
 
     def load_history(self, start_date, end_date):
         start_date = self._normalize_date(start_date)
@@ -438,7 +495,7 @@ class DataFetcher(object):
             df.attrs["warnings"] = warnings
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
@@ -448,6 +505,14 @@ class DataFetcher(object):
         db_dir = os.path.dirname(self.db_path)
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir)
+        # Remove stale WAL/SHM files: empty WAL + non-empty SHM = crashed previous session
+        wal_path = self.db_path + "-wal"
+        shm_path = self.db_path + "-shm"
+        wal_stale = os.path.exists(wal_path) and os.path.getsize(wal_path) == 0
+        shm_exists = os.path.exists(shm_path)
+        if wal_stale and shm_exists:
+            os.remove(wal_path)
+            os.remove(shm_path)
         with self._connect() as conn:
             for sql in CREATE_TABLE_SQL:
                 conn.execute(sql)
@@ -544,7 +609,7 @@ class DataFetcher(object):
         self._update_meta(conn, "etf_daily", "etf_daily", self.etf_code)
         return len(rows)
 
-    def _sync_etf_nav(self, conn, ak, start_date, end_date):
+    def _sync_etf_nav(self, conn, ak, start_date, end_date, progress=None):
         df = self._call_akshare(ak.fund_etf_fund_info_em, fund=self.etf_code)
         if df is None or df.empty:
             return 0
@@ -621,24 +686,50 @@ class DataFetcher(object):
         self._update_meta(conn, "index_weight", "index_weight", self.index_code)
         return stock_codes
 
-    def _sync_stock_indicators(self, conn, ak, stock_codes, start_date, end_date, progress=None):
+    def _sync_stock_indicators(self, conn, ak, stock_codes, start_date, end_date, name_map=None, progress=None):
         if not stock_codes:
-            return 0
+            return {
+                "total_stocks": 0,
+                "synced_stocks": 0,
+                "empty_fetches": 0,
+                "out_of_range": 0,
+                "invalid_rows": 0,
+                "rows": 0,
+            }
         now = datetime.now().isoformat()
         savepoint_name = "stock_indicator_sync"
         inserted_rows = 0
+        synced_stocks = 0
+        empty_fetches = 0
+        out_of_range = 0
+        invalid_rows = 0
+        name_map = name_map or {}
         conn.execute("SAVEPOINT {}".format(savepoint_name))
         try:
             total = len(stock_codes)
             for index, stock_code in enumerate(stock_codes, start=1):
-                if progress is not None:
-                    progress.update_step(current=index, total=total, detail=stock_code)
+                stock_name = name_map.get(stock_code, "")
+                stock_label = "\033[33m{} {}\033[0m".format(stock_code, stock_name).strip()
                 df = self._fetch_stock_indicator(ak, stock_code)
                 if df is None or df.empty:
+                    empty_fetches += 1
+                    if progress is not None:
+                        progress.update_step(
+                            current=index,
+                            total=total,
+                            detail="{} 无数据".format(stock_label),
+                        )
                     time.sleep(API_CALL_INTERVAL)
                     continue
                 df = self._filter_date_range(df, start_date, end_date)
                 if df.empty:
+                    out_of_range += 1
+                    if progress is not None:
+                        progress.update_step(
+                            current=index,
+                            total=total,
+                            detail="{} 超出范围".format(stock_label),
+                        )
                     time.sleep(API_CALL_INTERVAL)
                     continue
                 date_col = self._find_column(df, ("date", "trade_date", "日期"))
@@ -659,10 +750,24 @@ class DataFetcher(object):
                     for _, row in df.iterrows()
                 ]
                 if not rows:
+                    invalid_rows += 1
+                    if progress is not None:
+                        progress.update_step(
+                            current=index,
+                            total=total,
+                            detail="{} 无有效行".format(stock_label),
+                        )
                     time.sleep(API_CALL_INTERVAL)
                     continue
                 conn.executemany(UPSERT_STOCK_INDICATOR_SQL, rows)
                 inserted_rows += len(rows)
+                synced_stocks += 1
+                if progress is not None:
+                    progress.update_step(
+                        current=index,
+                        total=total,
+                        detail="{} +{}行".format(stock_label, len(rows)),
+                    )
                 time.sleep(API_CALL_INTERVAL)
             conn.execute("RELEASE SAVEPOINT {}".format(savepoint_name))
         except Exception:
@@ -672,7 +777,14 @@ class DataFetcher(object):
         if inserted_rows == 0:
             raise RuntimeError("stock_indicator sync produced no rows")
         self._update_meta(conn, "stock_indicator", "stock_indicator", None)
-        return inserted_rows
+        return {
+            "total_stocks": total,
+            "synced_stocks": synced_stocks,
+            "empty_fetches": empty_fetches,
+            "out_of_range": out_of_range,
+            "invalid_rows": invalid_rows,
+            "rows": inserted_rows,
+        }
 
     def _fetch_stock_indicator(self, ak, stock_code):
         for func_name in ("stock_a_indicator_lg", "stock_a_lg_indicator"):
@@ -942,9 +1054,7 @@ class DataFetcher(object):
             return numeric / 100.0
         return numeric
 
-    def _should_skip_sync(self, conn, source_name, start_date, end_date, force=False):
-        if force:
-            return False
+    def _should_skip_sync(self, conn, source_name, start_date, end_date):
         if not self._has_cached_source_data(conn, source_name):
             return False
         return self._checkpoint_covers_range(conn, source_name, start_date, end_date)
@@ -1009,15 +1119,48 @@ class DataFetcher(object):
         ).fetchall()
         return [row["stock_code"] for row in rows]
 
+    def _load_stock_name_map(self, conn):
+        rows = conn.execute(
+            """
+            SELECT stock_code, stock_name
+            FROM index_weight
+            WHERE index_code = ?
+            """,
+            (self.index_code,),
+        ).fetchall()
+        return {row["stock_code"]: row["stock_name"] for row in rows}
+
     def _format_done_detail(self, conn, source_name, rows_inserted):
         meta = self._read_source_meta(conn, source_name)
         if meta is None:
-            return "{} rows".format(rows_inserted)
-        return "{} rows | cache={} | last={}".format(
-            rows_inserted,
-            meta.get("record_count", "-"),
+            return "new={:,}".format(int(rows_inserted))
+        cache_size = meta.get("record_count", "-")
+        cache_repr = "{:,}".format(int(cache_size)) if isinstance(cache_size, (int, float)) else cache_size
+        return "new={} | cache={} | last={}".format(
+            "{:,}".format(int(rows_inserted)),
+            cache_repr,
             meta.get("last_update_date") or "-",
         )
+
+    def _format_stock_indicator_done_detail(self, conn, summary):
+        meta = self._read_source_meta(conn, "stock_indicator")
+        cache_size = meta.get("record_count", "-") if meta is not None else "-"
+        cache_repr = "{:,}".format(int(cache_size)) if isinstance(cache_size, (int, float)) else cache_size
+        parts = [
+            "stocks={}/{}".format(summary.get("synced_stocks", 0), summary.get("total_stocks", 0)),
+        ]
+        empty = summary.get("empty_fetches", 0)
+        out = summary.get("out_of_range", 0) + summary.get("invalid_rows", 0)
+        if empty > 0:
+            parts.append("empty={}".format(empty))
+        if out > 0:
+            parts.append("out={}".format(out))
+        parts.extend([
+            "new={}".format("{:,}".format(int(summary.get("rows", 0)))),
+            "cache={}".format(cache_repr),
+            "last={}".format(meta.get("last_update_date") if meta else "-"),
+        ])
+        return " | ".join(parts)
 
     def _format_skip_detail(self, conn, source_name):
         checkpoint = conn.execute(
@@ -1038,6 +1181,13 @@ class DataFetcher(object):
             )
         return "covered {} | last={}".format(range_repr, meta.get("last_update_date") if meta else "-")
 
+    @staticmethod
+    def _format_error_detail(exc, limit=120):
+        text = "{}: {}".format(type(exc).__name__, exc)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
     def _read_source_meta(self, conn, source_name):
         row = conn.execute(
             """
@@ -1056,6 +1206,24 @@ class DataFetcher(object):
                 yield
 
     def _call_akshare(self, func, *args, **kwargs):
+        last_exc = None
+        func_name = getattr(func, "__name__", repr(func))
+        for attempt in range(1, AKSHARE_MAX_RETRIES + 1):
+            try:
+                with self._suppress_akshare_output():
+                    return func(*args, **kwargs)
+            except AKSHARE_RETRIABLE_EXCEPTIONS as exc:
+                last_exc = exc
+                if attempt >= AKSHARE_MAX_RETRIES:
+                    break
+                delay = AKSHARE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                time.sleep(delay)
+        if last_exc is not None:
+            raise RuntimeError(
+                "akshare call {} failed after {} attempts: {}".format(
+                    func_name, AKSHARE_MAX_RETRIES, last_exc
+                )
+            ) from last_exc
         with self._suppress_akshare_output():
             return func(*args, **kwargs)
 
@@ -1069,13 +1237,16 @@ class DataFetcher(object):
 
 
 class NullSyncProgress(object):
+    def banner(self, title, start_date, end_date, db_path):
+        pass
+
     def start(self, total_steps):
         pass
 
     def start_step(self, source_name, label):
         pass
 
-    def update_step(self, current=None, total=None, detail=None):
+    def update_step(self, current=None, total=None, detail=None, stats=None):
         pass
 
     def finish_step(self, status, detail=None):

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from rqalpha.dividend_scorer.config import DOMAIN_WEIGHTS
 from rqalpha.dividend_scorer.config import VALUATION_FEATURES
@@ -435,6 +436,24 @@ def test_sync_all_skips_remote_calls_when_checkpoint_covers_requested_range(tmp_
     monkeypatch.setattr(fetcher, "_require_akshare", lambda: FakeAk())
 
     fetcher.sync_all("2024-01-01", "2024-01-31")
+
+
+def test_call_akshare_retries_transient_network_errors(tmp_path, monkeypatch):
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"))
+    calls = []
+
+    def flaky():
+        calls.append("call")
+        if len(calls) < 2:
+            raise RequestsConnectionError("remote closed")
+        return {"ok": True}
+
+    monkeypatch.setattr("rqalpha.dividend_scorer.data_fetcher.time.sleep", lambda _: None)
+
+    result = fetcher._call_akshare(flaky)
+
+    assert result == {"ok": True}
+    assert len(calls) == 2
 
 
 def test_dividend_scorer_precompute_reads_end_date_from_rqattrdict_env():
