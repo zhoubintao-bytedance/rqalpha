@@ -5,6 +5,7 @@
 - 同步打分器所需缓存到 SQLite
 - 用 CLI 直接查看指定日期评分
 - 在策略中调用 `get_dividend_score()`
+- 用参数审计脚本检查“是否过拟合 / 是否退化”
 - 画出 `512890` 走势与打分曲线的对比图
 
 ## 1. 能力概览
@@ -17,7 +18,7 @@
 仓库里已经有两份可直接运行的示例策略：
 
 - [dividend_low_vol_score_strategy.py](rqalpha/examples/dividend_low_vol_score_strategy.py)
-  固定阈值交易示例：`score < 3.5` 买入，`score > 6.5` 清仓
+  滚动分位交易示例：过去 2 年分数分布里 `score_percentile <= 20%` 买入，`>= 80%` 卖出，再由 `confidence` 决定 `95% / 47.5% / 0%` 仓位
 - [dividend_score_vs_price_plot_strategy.py](rqalpha/examples/dividend_score_vs_price_plot_strategy.py)
   只负责画图，对比 `512890` 走势与 `dividend_score`
 
@@ -123,6 +124,7 @@ uv run python -m rqalpha.dividend_scorer.main --date 2025-03-18 --json
 常用返回字段：
 
 - `total_score`
+- `score_percentile`
 - `confidence`
 - `features`
 - `confidence_modifiers`
@@ -131,7 +133,7 @@ uv run python -m rqalpha.dividend_scorer.main --date 2025-03-18 --json
 
 ## 5. 第三步：在策略中使用
 
-### 5.1 运行固定阈值示例策略
+### 5.1 运行滚动分位示例策略
 
 推荐先用命令行临时开启 Mod，不要急着改全局配置：
 
@@ -177,13 +179,79 @@ def handle_bar(context, bar_dict):
     if not score or score.get("error"):
         return
 
-    if score["total_score"] < 3.5:
-        order_target_percent("512890.XSHG", 0.95)
-    elif score["total_score"] > 6.5:
-        order_target_percent("512890.XSHG", 0)
+    confidence_multiplier = {
+        "normal": 1.0,
+        "lowered": 0.5,
+        "low": 0.0,
+    }.get(score["confidence"], 0.0)
+
+    if score["score_percentile"] <= 0.2:
+        context.signal_target_percent = 0.95
+    elif score["score_percentile"] >= 0.8:
+        context.signal_target_percent = 0.0
+
+    order_target_percent("512890.XSHG", context.signal_target_percent * confidence_multiplier)
 ```
 
-## 6. 画出 `512890` 真实走势 vs 打分曲线
+当前示例策略的交易逻辑：
+
+- 用最近 `504` 个交易日分数做滚动分位，不再硬编码 `3.5 / 6.5`
+- `score_percentile <= 20%` 进入买入 regime
+- `score_percentile >= 80%` 进入卖出 regime
+- `signal_target_percent` 会保留上一次 regime，形成简单滞后带，避免分位数在阈值附近来回抖动
+- `confidence=normal/lowered/low` 分别对应 `1.0 / 0.5 / 0.0` 仓位乘子
+- 打分权重默认回到固定领域先验，`ic_ir` 只保留作诊断，不直接驱动交易
+
+日频回测里要注意一件事：
+
+- `get_dividend_score()` 现在返回的是“上一交易日已经确认”的分数
+- `score["date"]` 是信号对应日期
+- `score["trade_date"]` 是当前执行交易的日期
+
+这样做是为了避免“用今天收盘后才能知道的分数，去成交今天收盘价”的前视偏差。
+
+## 6. 第四步：参数审计与过拟合检查
+
+如果你改了阈值、窗口或权重，先不要急着看收益，先跑参数审计：
+
+```bash
+uv run python -m rqalpha.dividend_scorer.parameter_audit \
+  --db-path ~/.rqalpha/dividend_scorer/cache.db
+```
+
+这份脚本会统一检查：
+
+- `20 / 60 / 120` 日三个周期里，低分组是否持续优于高分组
+- `2019-2021 / 2022-2023 / 2024-2026` 三段是否都通过
+- 每段低分组、高分组样本是否足够，避免少量样本“看起来很准”
+- 最终给出 `accurate / mixed / overfit_risk` 结论
+
+如果你想把当前版本存成 baseline：
+
+```bash
+uv run python -m rqalpha.dividend_scorer.parameter_audit \
+  --db-path ~/.rqalpha/dividend_scorer/cache.db \
+  --write-json /tmp/dividend_scorer_audit_baseline.json
+```
+
+以后新版本可以直接和旧 baseline 比较。当前脚本会额外检查 `20 / 60 / 120` 日整体 low-high spread 是否退化：
+
+```bash
+uv run python -m rqalpha.dividend_scorer.parameter_audit \
+  --db-path ~/.rqalpha/dividend_scorer/cache.db \
+  --baseline-json /tmp/dividend_scorer_audit_baseline.json
+```
+
+如果你还想把交易层面的回测也一起验掉：
+
+```bash
+uv run python strategy_scorer.py \
+  rqalpha/examples/dividend_low_vol_score_strategy.py \
+  --mod dividend_scorer \
+  --log high
+```
+
+## 7. 画出 `512890` 真实走势 vs 打分曲线
 
 如果你现在主要想验证：
 
@@ -227,7 +295,7 @@ uv run rqalpha run \
 - 上面的 `2019-01-18 -> 2026-03-06` 是我本地 bundle 上 `512890.XSHG` 实际验证通过的可用区间
 - 如果你的 bundle 更完整，可以按你本地实际可用区间调整 `-s` 和 `-e`
 
-## 7. 常开方式
+## 8. 常开方式
 
 如果你想长期测试，可以把 `~/.rqalpha/mod_config.yml` 改成：
 
@@ -244,9 +312,129 @@ mod:
 - `-mc dividend_scorer.enabled true`
 - `-mc dividend_scorer.db_path ~/.rqalpha/dividend_scorer/cache.db`
 
-## 8. 常见问题
+## 9. 下一步迭代方向
 
-### 8.1 报错 `akshare is required for sync_all`
+这一版已经完成了三件关键收缩：
+
+- 交易阈值从绝对分数改成滚动分位阈值
+- 权重默认退回固定领域先验，不再让 `ic_ir` 自由漂移
+- `confidence` 不再只是提示，而是直接参与控仓
+
+但如果目标是“打分要准，能合理指导买入卖出”，下一步优先级我会这样排：
+
+### 9.1 第一优先级：先提升分数的校准度，而不是继续调交易参数
+
+当前最明显的问题不是方向错，而是最近阶段低分信号太少：
+
+- `2024-2026` 段里，`score_percentile <= 20%` 的样本只有 `4-6` 个
+- 这说明打分虽然还能区分高低，但买点覆盖度偏窄，交易决策会变得“过于惜买”
+
+下一步应该优先做的不是把 `20%` 改成 `25%` 或 `30%`，而是先回答这个问题：
+
+- 同样是 `score_percentile=15%`
+- 在 `2019-2021 / 2022-2023 / 2024-2026`
+- 它对应的 `20/60/120` 日未来收益分布是否稳定
+
+更稳的演进方向：
+
+- 把分位信号从“二元买卖阈值”逐步扩展成“连续刻度”
+- 例如输出一个更平滑的 `cheapness_band` 或 `expected_forward_return_band`
+- 交易层再决定是全仓、半仓还是观望
+
+原则：
+
+- 先做分数校准
+- 再决定交易映射
+- 不要直接拿收益最好的阈值反推打分定义
+
+### 9.2 第二优先级：降低交易层抖动，让买卖更像“区间决策”而不是“逐日追分”
+
+现在的策略已经有简单滞后带，但仍然存在两类噪声：
+
+- `confidence` 上下波动会触发频繁再平衡
+- 某些区间里虽然还处在“低估 regime”，仓位却在 `95% / 47.5% / 0%` 之间切换较快
+
+下一步更合理的方向：
+
+- 把 `score signal` 和 `execution sizing` 彻底拆开
+- `score_percentile` 只负责决定“便宜 / 中性 / 偏贵”
+- `confidence` 只负责限制最大仓位变化速度
+
+可以考虑的做法：
+
+- 加最小持有期或最小信号持续天数
+- 加仓位变化缓冲，例如单日最多调整 `25%`
+- 让 `low confidence` 默认“不加新仓”，但不强制当天立刻砍老仓
+
+这样做的目的不是优化收益曲线，而是让打分器表达“估值判断”，让执行层表达“交易纪律”。
+
+### 9.3 第三优先级：强化数据口径的一致性，尤其是红利维度的点时可用性
+
+红利打分器的根基不是回测，而是数据口径。
+
+后面最值得继续补强的是：
+
+- 股息率历史重建是否足够点时，不要让未来公告结果回填过去
+- 指数 PE 空窗期是否还能进一步缩短
+- 成分股权重、ETF 净值、指数估值三类数据的日期对齐是否绝对一致
+
+建议把“能否算出来”继续细化为“算出来时有多可靠”：
+
+- `confirmed`: 已经被多源确认
+- `estimated`: 用退化链路重建
+- `missing`: 当前维度不参与
+
+这样后续交易或审计可以直接区分：
+
+- 是估值真的便宜
+- 还是只是红利维度当前置信度不足
+
+### 9.4 第四优先级：把“过拟合检查”变成固定验收流程，而不是人工解释
+
+当前已经有 `parameter_audit.py`，并支持：
+
+- 当前配置直接审计
+- 保存 baseline
+- 和 baseline 做退化比较
+
+下一步建议把下面这套标准固定下来，任何改动都必须通过：
+
+- `20 / 60 / 120` 日 low-high spread 不能退化
+- `2019-2021 / 2022-2023 / 2024-2026` 三段都要保持低分优于高分
+- 最近阶段不能只剩极少数 low sample
+- 全量回测里不能重新退回“全靠少数窗口抬分”
+
+如果某次改动只能提升某一段收益，但会破坏这些验收门槛，就应该判定为过拟合，而不是“参数优化成功”。
+
+### 9.5 第五优先级：让最终输出更像“估值温度计”，而不只是一个总分
+
+现在输出已经有：
+
+- `total_score`
+- `score_percentile`
+- `confidence`
+
+但如果要更好指导买卖，建议后续继续增强为：
+
+- `总分`: 反映整体相对贵贱
+- `分位`: 反映所处历史位置
+- `主导因子`: 当前是红利、PE、价格偏离还是溢价在主导
+- `信号解释`: 为什么今天从可买转为中性，或者从中性转为偏贵
+
+这样策略和人工判断都能回答：
+
+- “为什么现在是低估”
+- “为什么只是半仓低估”
+- “为什么今天不该追”
+
+如果只能保留一句话来概括后续方向，就是：
+
+- 先把分数做成稳定、可解释、跨阶段仍然有效的估值刻度
+- 再让交易规则尽量少地扭曲这个刻度
+
+## 10. 常见问题
+
+### 10.1 报错 `akshare is required for sync_all`
 
 原因：
 
@@ -259,7 +447,7 @@ mod:
 uv sync --python 3.13 --extra dividend-scorer
 ```
 
-### 8.2 走代理时报 `ProxyError`
+### 10.2 走代理时报 `ProxyError`
 
 原因：
 
@@ -280,7 +468,7 @@ uv run python -m rqalpha.dividend_scorer.main \
   --end-date 2026-03-19
 ```
 
-### 8.3 报错 `etf_daily cache is empty, run sync_all first`
+### 10.3 报错 `etf_daily cache is empty, run sync_all first`
 
 原因：
 
@@ -292,7 +480,7 @@ uv run python -m rqalpha.dividend_scorer.main \
 1. 先执行一次 `--sync`
 2. 确认策略和 CLI 用的是同一个 `db_path`
 
-### 8.4 打分器在策略里返回 `error`
+### 10.4 打分器在策略里返回 `error`
 
 常见原因：
 
@@ -309,7 +497,7 @@ uv run python -m rqalpha.dividend_scorer.main --json
 
 先确认评分本身能正常算出来，再进策略。
 
-### 8.5 画图时报 benchmark 或日期覆盖错误
+### 10.5 画图时报 benchmark 或日期覆盖错误
 
 常见原因：
 
@@ -320,3 +508,49 @@ uv run python -m rqalpha.dividend_scorer.main --json
 
 - 对比图策略优先用 `-bm null`
 - 根据你本地 bundle 的实际覆盖范围调整 `-s` 和 `-e`
+
+### 10.6 `strategy_scorer` 里 2019 初期窗口分数很低
+
+常见原因：
+
+- `512890.XSHG` 上市日是 `2019-01-18`
+- 但 `strategy_scorer.py` 的滚动窗口从 `2016-02-01` 开始
+- 所以前几个窗口虽然“跑通了”，但真正有持仓的交易日极少，年化收益/夏普/Sortino 会被稀疏样本放大
+
+建议：
+
+```bash
+uv run python strategy_scorer.py \
+  rqalpha/examples/dividend_low_vol_score_strategy.py \
+  --mod dividend_scorer \
+  --drop-sparse-windows \
+  --log high
+```
+
+当前版本会在输出里显式标记：
+
+- `首次建仓滞后 X 天`
+- `持仓仅 X/Y 个交易日`
+- `窗口内无持仓日`
+
+这些窗口更适合单独看，不适合直接混进综合分。
+
+### 10.7 `strategy_scorer` 里卖出胜率 100%，是不是有问题
+
+先分清楚这两个口径：
+
+- `卖出胜率` 只统计“已经平仓的卖出”
+- 它不包含期末仍然持有仓位的浮盈浮亏
+
+另外滚动窗口本身是重叠的，所以同一个真实卖点会在多个窗口里重复出现。当前版本会额外提示：
+
+- `卖出 N 笔只对应 M 个实际卖点日`
+
+所以看到 `100%` 不代表策略没有回撤，更不代表没有过拟合；要结合：
+
+- 窗口总收益率
+- 期末是否仍有持仓
+- 浮盈/浮亏
+- 综合分与稳定性分
+
+一起看。

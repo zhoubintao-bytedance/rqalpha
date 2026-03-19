@@ -138,6 +138,9 @@ WEIGHTS = {
 
 LAMBDA = 0.03           # 时间衰减参数
 BENCHMARK = "000300.XSHG"
+MIN_WINDOW_ACTIVE_DAYS = 60
+MIN_WINDOW_ACTIVE_RATIO = 0.25
+MAX_FIRST_ACTIVE_DELAY_DAYS = 60
 
 # 核心展示指标（用于输出行"核心指标"）
 CORE_INDICATORS = ["annualized_returns", "max_drawdown", "sharpe", "win_rate"]
@@ -280,11 +283,66 @@ def parse_window_arg(window_str):
     return sorted(nums)
 
 
-def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods=None):
+def analyze_window_sample(start, trades, portfolio):
+    """识别样本不足窗口，避免把明显失真的年化风险指标当成正常结果解读。"""
+    diagnostics = {
+        "total_days": 0,
+        "active_days": 0,
+        "active_ratio": 0.0,
+        "trade_count": 0,
+        "sell_count": 0,
+        "first_active_date": None,
+        "first_active_delay_days": None,
+        "warning_text": "",
+        "sparse": False,
+    }
+
+    if trades is not None and not trades.empty:
+        diagnostics["trade_count"] = int(len(trades))
+        if "side" in trades.columns:
+            diagnostics["sell_count"] = int((trades["side"] == "SELL").sum())
+
+    if portfolio is None or portfolio.empty or "market_value" not in portfolio.columns:
+        diagnostics["warning_text"] = "组合净值明细缺失"
+        diagnostics["sparse"] = True
+        return diagnostics
+
+    diagnostics["total_days"] = int(len(portfolio))
+    active_mask = portfolio["market_value"].fillna(0) > 0
+    diagnostics["active_days"] = int(active_mask.sum())
+    diagnostics["active_ratio"] = (
+        diagnostics["active_days"] / diagnostics["total_days"] if diagnostics["total_days"] else 0.0
+    )
+
+    warnings_list = []
+    if diagnostics["active_days"] == 0:
+        warnings_list.append("窗口内无持仓日")
+    else:
+        first_active_ts = portfolio.index[active_mask][0]
+        first_active_date = first_active_ts.date()
+        diagnostics["first_active_date"] = first_active_date
+        diagnostics["first_active_delay_days"] = (first_active_date - start).days
+
+        if diagnostics["first_active_delay_days"] > MAX_FIRST_ACTIVE_DELAY_DAYS:
+            warnings_list.append("首次建仓滞后 {} 天".format(diagnostics["first_active_delay_days"]))
+        if diagnostics["active_days"] < MIN_WINDOW_ACTIVE_DAYS:
+            warnings_list.append(
+                "持仓仅 {}/{} 个交易日".format(diagnostics["active_days"], diagnostics["total_days"])
+            )
+        elif diagnostics["active_ratio"] < MIN_WINDOW_ACTIVE_RATIO:
+            warnings_list.append("持仓覆盖率仅 {:.0%}".format(diagnostics["active_ratio"]))
+
+    diagnostics["sparse"] = bool(warnings_list)
+    diagnostics["warning_text"] = "；".join(warnings_list)
+    return diagnostics
+
+
+def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods=None, drop_sparse=False):
     """对策略文件执行滚动窗口回测，返回结果列表
 
     selected_indices: 要执行的窗口编号列表（1-based），None 表示全部37个
     extra_mods: 额外启用的 mod 名称列表
+    drop_sparse: 是否跳过持仓样本明显不足的窗口
     """
     with open(strategy_file) as f:
         source_code = f.read()
@@ -333,11 +391,20 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods
 
             summary = result["sys_analyser"]["summary"]
             trades = result["sys_analyser"]["trades"]
+            portfolio = result["sys_analyser"].get("portfolio")
+            sample_diagnostics = analyze_window_sample(start, trades, portfolio)
+            if drop_sparse and sample_diagnostics["sparse"]:
+                print("跳过(样本不足: {})".format(sample_diagnostics["warning_text"]))
+                continue
+
             window_score = score_window(summary)
             use_color = sys.stdout.isatty()
             sc = rating_color(window_score, use_color)
             rst = "\033[0m" if use_color else ""
-            print(f"得分 {sc}{window_score:.1f}{rst}")
+            message = f"得分 {sc}{window_score:.1f}{rst}"
+            if sample_diagnostics["warning_text"]:
+                message += "  [样本不足: {}]".format(sample_diagnostics["warning_text"])
+            print(message)
 
             results.append({
                 "idx": idx,
@@ -346,6 +413,7 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods
                 "summary": summary,
                 "score": window_score,
                 "trades": trades,
+                "sample_diagnostics": sample_diagnostics,
             })
         except Exception as e:
             print(f"异常: {e}")
@@ -473,6 +541,7 @@ def build_trade_log(window_results, level, cash):
     n_sell = len(sells)
     n_win = sum(1 for r in sells if r["pnl"] is not None and r["pnl"] > 0)
     win_pct = n_win / n_sell * 100 if n_sell > 0 else 0
+    unique_sell_dates = len({r["datetime"].date() for r in sells}) if sells else 0
 
     level_desc = {"low": "最近1个窗口", "mid": "最近4个窗口", "high": "全部窗口"}
     use_color_hdr = sys.stdout.isatty()
@@ -484,6 +553,9 @@ def build_trade_log(window_results, level, cash):
         wp_str = f"{win_pct:.1f}%"
     header = f"【交易日志】({level_desc[level]}, 买入{len(buys)}笔 卖出{n_sell}笔, 卖出胜率 {wp_str})"
     print(f"\n{header}")
+    print("注: 卖出胜率只统计已平仓卖出，不包含仍持仓仓位的浮盈浮亏。")
+    if unique_sell_dates and unique_sell_dates < n_sell:
+        print(f"注: 卖出 {n_sell} 笔只对应 {unique_sell_dates} 个实际卖点日，滚动窗口重叠会重复统计同一天的卖出。")
 
     headers = [
         "#", "窗口", "方向", "证券代码", "股票名称",
@@ -1055,6 +1127,8 @@ HELP_TEXT = """\
                           mid  = 最近 4 个窗口（约1年）
                           high = 全部 37 个窗口
     --plot              绘制价格走势图，在收盘价曲线上标注买卖点（保存为 PNG 文件）
+    --drop-sparse-windows
+                        跳过持仓样本明显不足的窗口，避免 ETF 晚上市/长期空仓扭曲综合分
     --search, -s PATTERN  搜索股票代码或名称（正则匹配，不跑回测）
                           匹配 order_book_id 或 symbol，仅显示 Active 的股票/ETF/指数
     --help              显示此帮助信息
@@ -1102,12 +1176,16 @@ EXAMPLE_TEXT = """\
     python strategy_scorer.py my_strategy.py -w 37 --plot        # 单窗口图表
     python strategy_scorer.py my_strategy.py -w 35-37 --plot     # 多窗口各一张图
 
-6. 用自带的示例策略测试:
+6. 跳过 ETF 晚上市或长期空仓造成的稀疏窗口:
+
+    python strategy_scorer.py my_strategy.py --drop-sparse-windows
+
+7. 用自带的示例策略测试:
 
     python strategy_scorer.py rqalpha/examples/demo_strategy.py
     python strategy_scorer.py rqalpha/examples/demo_strategy.py --cash 500000 --log mid
 
-7. 策略文件格式要求:
+8. 策略文件格式要求:
 
     策略文件需包含 rqalpha 标准接口函数，最小示例：
 
@@ -1129,7 +1207,7 @@ EXAMPLE_TEXT = """\
             order_target_percent(context.stock, 0)
     ```
 
-8. 输出示例:
+9. 输出示例:
 
     ==================================================
     【策略综合得分】 32.5 分 | 收益 + 风险 + 指标加权总分
@@ -1144,7 +1222,7 @@ EXAMPLE_TEXT = """\
      2   #37   卖出  000001.XSHE  平安银行  2025-03-03  11.51   500    5755    +40.00       500  +40.00
      3   #37   卖出  000001.XSHE  平安银行  2025-03-10  11.60   500    5800    +85.00         0  +125.00
 
-9. 搜索股票代码:
+10. 搜索股票代码:
 
     python strategy_scorer.py --search "平安"           # 搜索名称包含"平安"的股票
     python strategy_scorer.py -s "000001"               # 搜索代码包含 000001 的证券
@@ -1152,7 +1230,7 @@ EXAMPLE_TEXT = """\
     python strategy_scorer.py -s "^600[0-9]{3}"         # 正则：搜索60开头的上交所股票
     python strategy_scorer.py -s "银行"                 # 搜索名称包含"银行"的所有股票
 
-10. 评分参考:
+11. 评分参考:
 
     E  (>=60分)  优秀策略，各维度表现均衡
     M+ (>=30分)  良好策略，有一定优势
@@ -1216,6 +1294,8 @@ def main():
     parser.add_argument("--plot", action="store_true", help="绘制价格走势+买卖点图表")
     parser.add_argument("--mod", type=str, nargs="*", default=None,
                         help="启用额外的 mod，如 --mod dividend_scorer")
+    parser.add_argument("--drop-sparse-windows", action="store_true",
+                        help="跳过持仓样本明显不足的窗口")
     parser.add_argument("--search", "-s", type=str, default=None,
                         help="搜索股票代码或名称（正则匹配）")
     args = parser.parse_args()
@@ -1261,7 +1341,13 @@ def main():
     print("开始滑动窗口回测")
     print("=" * 50)
     t_start = time.time()
-    window_results = run_rolling_backtests(args.strategy_file, args.cash, selected_indices, extra_mods=args.mod)
+    window_results = run_rolling_backtests(
+        args.strategy_file,
+        args.cash,
+        selected_indices,
+        extra_mods=args.mod,
+        drop_sparse=args.drop_sparse_windows,
+    )
 
     if not window_results:
         print("\n错误: 没有成功的回测窗口")
@@ -1269,6 +1355,14 @@ def main():
 
     total_expected = len(selected_indices) if selected_indices else 37
     print(f"\n成功完成 {len(window_results)}/{total_expected} 个窗口回测")
+    sparse_windows = [w for w in window_results if w.get("sample_diagnostics", {}).get("sparse")]
+    if sparse_windows:
+        sparse_desc = ", ".join(
+            "#{}({})".format(w["idx"], w["sample_diagnostics"]["warning_text"]) for w in sparse_windows
+        )
+        print("样本不足窗口: {}".format(sparse_desc))
+        if not args.drop_sparse_windows:
+            print("建议: 如需更公平地比较综合分，可加 --drop-sparse-windows 跳过这些窗口。")
 
     # 窗口数少于5个时，跳过综合评分，只输出单窗口得分和交易日志
     if len(window_results) < 5:
@@ -1281,6 +1375,8 @@ def main():
             sc = rating_color(w['score'], use_color)
             rl = rating_label(w['score'], use_color)
             print(f"窗口 {w['start']} ~ {w['end']}  得分: {sc}{w['score']:.1f}{RST} [{rl}]")
+            if w.get("sample_diagnostics", {}).get("warning_text"):
+                print("  样本不足: {}".format(w["sample_diagnostics"]["warning_text"]))
             s = w["summary"]
             ann_ret = s.get("annualized_returns", 0) * 100
             max_dd = abs(s.get("max_drawdown", 0)) * 100

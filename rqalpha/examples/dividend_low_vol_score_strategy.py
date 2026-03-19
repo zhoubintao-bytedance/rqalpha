@@ -12,10 +12,11 @@ from rqalpha.apis import *
 
 def init(context):
     context.etf = "512890.XSHG"
-    context.target_percent = 0.95
-    context.buy_threshold = 3.5
-    context.sell_threshold = 6.5
+    context.max_target_percent = 0.95
+    context.buy_percentile = 0.20
+    context.sell_percentile = 0.80
     context.last_score_date = None
+    context.signal_target_percent = 0.0
     update_universe(context.etf)
 
 
@@ -34,27 +35,58 @@ def handle_bar(context, bar_dict):
     context.last_score_date = score_date
 
     total_score = score.get("total_score")
-    if total_score is None:
+    score_percentile = score.get("score_percentile")
+    if total_score is None or score_percentile is None:
         return
 
-    position = get_position(context.etf)
-    has_position = position.quantity > 0
+    confidence = score.get("confidence")
+    confidence_multiplier = {
+        "normal": 1.0,
+        "lowered": 0.5,
+        "low": 0.0,
+    }.get(confidence, 0.0)
 
     logger.info(
-        "dividend score date={} score={:.2f} confidence={} method={}".format(
+        "dividend score signal_date={} trade_date={} score={:.2f} percentile={:.1%} confidence={} method={}".format(
             score_date,
+            score.get("trade_date"),
             total_score,
-            score.get("confidence"),
+            score_percentile,
+            confidence,
             score.get("model_meta", {}).get("method"),
         )
     )
 
-    if total_score < context.buy_threshold and not has_position:
-        logger.info("buy signal triggered: {:.2f} < {:.2f}".format(total_score, context.buy_threshold))
-        order_target_percent(context.etf, context.target_percent)
-    elif total_score > context.sell_threshold and has_position:
-        logger.info("sell signal triggered: {:.2f} > {:.2f}".format(total_score, context.sell_threshold))
-        order_target_percent(context.etf, 0)
+    if score_percentile <= context.buy_percentile:
+        context.signal_target_percent = context.max_target_percent
+        logger.info(
+            "buy regime triggered: percentile {:.1%} <= {:.1%}".format(
+                score_percentile, context.buy_percentile
+            )
+        )
+    elif score_percentile >= context.sell_percentile:
+        context.signal_target_percent = 0.0
+        logger.info(
+            "sell regime triggered: percentile {:.1%} >= {:.1%}".format(
+                score_percentile, context.sell_percentile
+            )
+        )
+
+    desired_target_percent = context.signal_target_percent * confidence_multiplier
+    position = get_position(context.etf)
+    current_market_value = position.market_value if position is not None else 0.0
+    portfolio_value = context.portfolio.total_value
+    current_target_percent = current_market_value / portfolio_value if portfolio_value > 0 else 0.0
+
+    if abs(desired_target_percent - current_target_percent) >= 0.05:
+        logger.info(
+            "rebalance target: signal_target={:.0%} confidence_target={:.0%} current={:.0%}".format(
+                context.signal_target_percent,
+                desired_target_percent,
+                current_target_percent,
+            )
+        )
+        order_target_percent(context.etf, desired_target_percent)
 
 
 def after_trading(context):

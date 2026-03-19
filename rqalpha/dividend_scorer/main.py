@@ -8,10 +8,19 @@ from collections import OrderedDict
 
 import pandas as pd
 
-from rqalpha.dividend_scorer.config import ETF_CODE, VALUATION_FEATURES
+from rqalpha.dividend_scorer.config import (
+    ETF_CODE,
+    SCORE_BUY_PERCENTILE,
+    SCORE_PERCENTILE_MIN_DATA,
+    SCORE_PERCENTILE_WINDOW,
+    SCORE_SELL_PERCENTILE,
+    VALUATION_FEATURES,
+    WEIGHT_DYNAMIC_DIAGNOSTIC,
+    WEIGHT_PRIOR_BLEND,
+)
 from rqalpha.dividend_scorer.data_fetcher import DataFetcher
 from rqalpha.dividend_scorer.feature_engine import FeatureEngine
-from rqalpha.dividend_scorer.score_synthesizer import ScoreSynthesizer
+from rqalpha.dividend_scorer.score_synthesizer import ScoreSynthesizer, ScoreUnavailableError
 from rqalpha.dividend_scorer.weight_calculator import WeightCalculator
 
 
@@ -25,6 +34,8 @@ class DividendScorer(object):
         feature_engine=None,
         weight_calculator=None,
         score_synthesizer=None,
+        prior_blend=WEIGHT_PRIOR_BLEND,
+        dynamic_diagnostic=WEIGHT_DYNAMIC_DIAGNOSTIC,
     ):
         self.data_fetcher = data_fetcher or DataFetcher(
             db_path=db_path,
@@ -34,8 +45,12 @@ class DividendScorer(object):
         self.feature_engine = feature_engine or FeatureEngine()
         self.weight_calculator = weight_calculator or WeightCalculator()
         self.score_synthesizer = score_synthesizer or ScoreSynthesizer()
+        self.prior_blend = float(prior_blend)
+        self.dynamic_diagnostic = bool(dynamic_diagnostic)
         self.history_df = None
         self.weight_result = None
+        self.score_history_df = None
+        self.weight_result_by_date = {}
 
     def sync_all(self, start_date, end_date, force=False, progress=None):
         self.data_fetcher.sync_all(start_date, end_date, force=force, progress=progress)
@@ -49,33 +64,112 @@ class DividendScorer(object):
         end_date = end_date or self._get_env_end_date(env) or available_end
         history_df = self.data_fetcher.load_history(start_date, end_date)
         feature_matrix = self.feature_engine.precompute(history_df)
-        self.weight_result = self.weight_calculator.calculate_ic_ir_weights(
+
+        self.weight_result = self.weight_calculator.calculate_shrunk_weights(
             feature_matrix.loc[:, list(VALUATION_FEATURES)],
             history_df["etf_close_hfq"],
+            prior_blend=self.prior_blend,
+            compute_diagnostics=self.dynamic_diagnostic,
         )
         self.history_df = history_df
+        self.score_history_df = self._build_score_history()
         return self
 
     def score(self, date=None):
-        if self.history_df is None or self.weight_result is None:
+        if self.history_df is None or self.weight_result is None or self.score_history_df is None:
             self.precompute()
         if date is None:
             date = self.history_df.index[-1]
         resolved_date = self._resolve_date(date)
+        score_row = self.score_history_df.loc[resolved_date]
+        if bool(score_row.get("error")):
+            raise ScoreUnavailableError(score_row["error"])
         feature_snapshot = self.feature_engine.compute_single(resolved_date)
         freshness = self.data_fetcher.get_data_freshness(reference_date=resolved_date.date())
+        weight_result = self.weight_result_by_date.get(resolved_date, self.weight_result)
         result = self.score_synthesizer.synthesize(
             feature_snapshot=feature_snapshot,
-            weight_result=self.weight_result,
+            weight_result=weight_result,
             freshness=freshness,
         )
         result["date"] = resolved_date.strftime("%Y-%m-%d")
         result["etf"] = ETF_CODE
         result["data_freshness"] = freshness
+        result["score_percentile"] = self._maybe_float(score_row.get("score_percentile"))
+        result["score_percentile_sample_size"] = self._maybe_int(score_row.get("score_percentile_sample_size"))
+        result["score_percentile_window"] = SCORE_PERCENTILE_WINDOW
+        result["buy_percentile_threshold"] = SCORE_BUY_PERCENTILE
+        result["sell_percentile_threshold"] = SCORE_SELL_PERCENTILE
         return result
 
     def score_latest(self, date=None):
         return self.score(date=date)
+
+    def _build_score_history(self):
+        score_rows = []
+        self.weight_result_by_date = {}
+        static_weights = self.prior_blend >= 1.0
+
+        for date in self.history_df.index:
+            weight_result = self.weight_result
+            if not static_weights:
+                weight_result = self.weight_calculator.calculate_shrunk_weights(
+                    self.feature_engine.normalized_matrix.loc[:date, list(VALUATION_FEATURES)],
+                    self.history_df.loc[:date, "etf_close_hfq"],
+                    prior_blend=self.prior_blend,
+                    compute_diagnostics=False,
+                )
+            self.weight_result_by_date[date] = weight_result
+            try:
+                feature_snapshot = self.feature_engine.compute_single(date)
+                score_result = self.score_synthesizer.synthesize(
+                    feature_snapshot=feature_snapshot,
+                    weight_result=weight_result,
+                    freshness=None,
+                )
+                score_rows.append({
+                    "date": date,
+                    "total_score": float(score_result["total_score"]),
+                    "confidence": score_result["confidence"],
+                    "method": score_result["model_meta"]["method"],
+                    "fallback_reason": score_result["model_meta"]["fallback_reason"],
+                    "error": None,
+                })
+            except ScoreUnavailableError as exc:
+                score_rows.append({
+                    "date": date,
+                    "total_score": None,
+                    "confidence": None,
+                    "method": weight_result.get("method"),
+                    "fallback_reason": weight_result.get("fallback_reason"),
+                    "error": str(exc),
+                })
+
+        score_df = pd.DataFrame(score_rows).set_index("date")
+        percentile_series, count_series = self._rolling_hazen_percentile(score_df["total_score"])
+        score_df["score_percentile"] = percentile_series
+        score_df["score_percentile_sample_size"] = count_series
+        return score_df
+
+    @staticmethod
+    def _rolling_hazen_percentile(series):
+        counts = series.rolling(window=SCORE_PERCENTILE_WINDOW, min_periods=1).count()
+        percentile = series.rolling(window=SCORE_PERCENTILE_WINDOW, min_periods=1).apply(
+            DividendScorer._hazen_percentile_of_last,
+            raw=False,
+        )
+        percentile = percentile.where(counts >= SCORE_PERCENTILE_MIN_DATA)
+        return percentile, counts
+
+    @staticmethod
+    def _hazen_percentile_of_last(window):
+        valid = pd.Series(window).dropna()
+        if len(valid) == 0:
+            return None
+        current = valid.iloc[-1]
+        ranks = valid.rank(method="average")
+        rank = ranks.iloc[-1]
+        return (rank - 0.5) / float(len(valid))
 
     def _resolve_date(self, date):
         ts = pd.Timestamp(date)
@@ -97,11 +191,31 @@ class DividendScorer(object):
             return base_config.get("end_date")
         return None
 
+    @staticmethod
+    def _maybe_float(value):
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+
+    @staticmethod
+    def _maybe_int(value):
+        if value is None or pd.isna(value):
+            return None
+        return int(value)
+
 
 def format_score_report(score_result):
     lines = []
     lines.append("红利低波打分器 | {} | {}".format(score_result["etf"], score_result["date"]))
     lines.append("综合评分: {:.2f} / 10".format(score_result["total_score"]))
+    if score_result.get("score_percentile") is not None:
+        lines.append(
+            "滚动分位: {:.1%} (window={}d, n={})".format(
+                score_result["score_percentile"],
+                score_result.get("score_percentile_window"),
+                score_result.get("score_percentile_sample_size"),
+            )
+        )
     lines.append("置信度: {}".format(score_result["confidence"]))
     lines.append("权重方案: {}".format(score_result["model_meta"]["method"]))
     lines.append("")

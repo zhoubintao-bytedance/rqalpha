@@ -25,5 +25,5 @@ rqalpha_test_coverage_report/
 .DS_Store
 rqalpha/_version.py
 
-.claude/settings.local.json
+.claude/*
 uv.lock

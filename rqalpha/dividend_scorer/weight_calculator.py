@@ -23,6 +23,7 @@ from rqalpha.dividend_scorer.config import (
     SUBSAMPLE_INTERVAL_S,
     TRADING_DAYS_A_YEAR,
     VALUATION_FEATURES,
+    WEIGHT_PRIOR_BLEND,
     WEIGHT_CONCENTRATION_MAX,
 )
 
@@ -115,6 +116,74 @@ class WeightCalculator(object):
             "test_ic_avg": float(np.nanmean([stat["ic_mean"] for stat in ic_stats.values()])),
             "test_ic_ir_avg": float(np.nanmean([stat["ic_ir"] for stat in ic_stats.values()])),
         }
+
+    def calculate_prior_weights(self, feature_matrix):
+        available_features = [
+            feature_name
+            for feature_name in VALUATION_FEATURES
+            if feature_name in feature_matrix.columns and feature_matrix[feature_name].notna().any()
+        ]
+        return {
+            "weights": self._domain_weights(available_features),
+            "method": "fixed_domain_prior",
+            "fallback_reason": None,
+            "ic_stats": {},
+            "training_start": None,
+            "training_end": None,
+            "sample_count": 0,
+            "test_ic_avg": np.nan,
+            "test_ic_ir_avg": np.nan,
+        }
+
+    def calculate_shrunk_weights(
+        self,
+        feature_matrix,
+        price_series,
+        prior_blend=WEIGHT_PRIOR_BLEND,
+        compute_diagnostics=False,
+    ):
+        domain_result = self.calculate_prior_weights(feature_matrix)
+        diagnostic_result = None
+
+        if prior_blend >= 1.0:
+            result = dict(domain_result)
+            result["prior_blend"] = float(prior_blend)
+            if compute_diagnostics:
+                diagnostic_result = self.calculate_ic_ir_weights(feature_matrix, price_series)
+                result["diagnostic_weight_result"] = diagnostic_result
+            return result
+
+        dynamic_result = self.calculate_ic_ir_weights(feature_matrix, price_series)
+        if dynamic_result.get("method") != "ic_ir":
+            result = dict(domain_result)
+            result["prior_blend"] = float(prior_blend)
+            result["fallback_reason"] = dynamic_result.get("fallback_reason")
+            if compute_diagnostics:
+                result["diagnostic_weight_result"] = dynamic_result
+            return result
+
+        blended_weights = OrderedDict()
+        for feature_name in VALUATION_FEATURES:
+            domain_weight = float(domain_result["weights"].get(feature_name, 0.0) or 0.0)
+            dynamic_weight = float(dynamic_result["weights"].get(feature_name, 0.0) or 0.0)
+            blended_weights[feature_name] = prior_blend * domain_weight + (1.0 - prior_blend) * dynamic_weight
+        blended_weights = self._normalize_weights(blended_weights)
+
+        result = {
+            "weights": blended_weights,
+            "method": "shrunk_ic_ir",
+            "fallback_reason": None,
+            "ic_stats": dynamic_result.get("ic_stats", {}),
+            "training_start": dynamic_result.get("training_start"),
+            "training_end": dynamic_result.get("training_end"),
+            "sample_count": dynamic_result.get("sample_count", 0),
+            "test_ic_avg": dynamic_result.get("test_ic_avg"),
+            "test_ic_ir_avg": dynamic_result.get("test_ic_ir_avg"),
+            "prior_blend": float(prior_blend),
+        }
+        if compute_diagnostics:
+            result["diagnostic_weight_result"] = dynamic_result
+        return result
 
     def _select_training_sample(self, joined):
         if len(joined) > self.sample_out_years * TRADING_DAYS_A_YEAR:
