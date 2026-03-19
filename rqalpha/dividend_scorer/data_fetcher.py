@@ -36,6 +36,9 @@ AKSHARE_RETRIABLE_EXCEPTIONS = (
     Urllib3HTTPError,
     TimeoutError,
 )
+SQLITE_CONNECT_TIMEOUT = 30
+SQLITE_BUSY_TIMEOUT_MS = 30000
+SQLITE_INIT_RETRIES = 3
 
 
 CREATE_TABLE_SQL = (
@@ -495,10 +498,10 @@ class DataFetcher(object):
             df.attrs["warnings"] = warnings
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(self.db_path, timeout=SQLITE_CONNECT_TIMEOUT)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = {}".format(SQLITE_BUSY_TIMEOUT_MS))
         return conn
 
     def _init_db(self):
@@ -513,9 +516,27 @@ class DataFetcher(object):
         if wal_stale and shm_exists:
             os.remove(wal_path)
             os.remove(shm_path)
-        with self._connect() as conn:
-            for sql in CREATE_TABLE_SQL:
-                conn.execute(sql)
+        last_exc = None
+        for attempt in range(1, SQLITE_INIT_RETRIES + 1):
+            try:
+                with self._connect() as conn:
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    for sql in CREATE_TABLE_SQL:
+                        conn.execute(sql)
+                return
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if "locked" not in str(exc).lower() or attempt >= SQLITE_INIT_RETRIES:
+                    break
+                time.sleep(float(attempt))
+        if last_exc is not None and "locked" in str(last_exc).lower():
+            raise RuntimeError(
+                "cache db is locked: {}. another dividend_scorer sync process is probably still running; stop the old process and retry".format(
+                    self.db_path
+                )
+            ) from last_exc
+        if last_exc is not None:
+            raise last_exc
 
     def _sync_index_daily(self, conn, ak, start_date, end_date):
         inserted_rows = 0
@@ -709,7 +730,7 @@ class DataFetcher(object):
             total = len(stock_codes)
             for index, stock_code in enumerate(stock_codes, start=1):
                 stock_name = name_map.get(stock_code, "")
-                stock_label = "\033[33m{} {}\033[0m".format(stock_code, stock_name).strip()
+                stock_label = "{} {}".format(stock_code, stock_name).strip()
                 df = self._fetch_stock_indicator(ak, stock_code)
                 if df is None or df.empty:
                     empty_fetches += 1
@@ -1218,14 +1239,11 @@ class DataFetcher(object):
                     break
                 delay = AKSHARE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
                 time.sleep(delay)
-        if last_exc is not None:
-            raise RuntimeError(
-                "akshare call {} failed after {} attempts: {}".format(
-                    func_name, AKSHARE_MAX_RETRIES, last_exc
-                )
-            ) from last_exc
-        with self._suppress_akshare_output():
-            return func(*args, **kwargs)
+        raise RuntimeError(
+            "akshare call {} failed after {} attempts: {}".format(
+                func_name, AKSHARE_MAX_RETRIES, last_exc
+            )
+        ) from last_exc
 
     @staticmethod
     def _require_akshare():

@@ -440,7 +440,7 @@ class SyncProgressReporter(object):
             if eta is not None:
                 message = "{} | 预计剩余 {}".format(message, self._format_duration(eta))
         if detail:
-            message = "{} | {}".format(message, detail)
+            message = "{} | {}".format(message, self._style(detail, "skip"))
         return message
 
     def _render(self, line, newline=False):
@@ -626,19 +626,20 @@ class SyncProgressReporter(object):
     def _spinner_loop(self, stop_event):
         tick = 0
         while not stop_event.wait(self.SPINNER_INTERVAL):
+            line = None
             with self._lock:
                 if self._current_state != "RUN":
                     continue
                 tick += 1
                 if tick % self.SPINNER_FRAME_TICKS == 0:
                     self._spinner_index = (self._spinner_index + 1) % len(self.SPINNER_FRAMES)
-                self._render(
-                    self._format_line(
-                        self._current_state,
-                        self._current_message,
-                        spinner=self._spinner_frame(),
-                    )
+                line = self._format_line(
+                    self._current_state,
+                    self._current_message,
+                    spinner=self._spinner_frame(),
                 )
+            if line is not None:
+                self._render(line)
 
 
 if __name__ == "__main__":
