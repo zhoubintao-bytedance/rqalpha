@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import shutil
 import sys
@@ -14,6 +15,7 @@ import pandas as pd
 
 from rqalpha.dividend_scorer.config import (
     ETF_CODE,
+    FEATURE_DISPLAY_NAMES,
     SCORE_BUY_PERCENTILE,
     SCORE_PERCENTILE_MIN_DATA,
     SCORE_PERCENTILE_WINDOW,
@@ -26,6 +28,15 @@ from rqalpha.dividend_scorer.data_fetcher import DataFetcher
 from rqalpha.dividend_scorer.feature_engine import FeatureEngine
 from rqalpha.dividend_scorer.score_synthesizer import ScoreSynthesizer, ScoreUnavailableError
 from rqalpha.dividend_scorer.weight_calculator import WeightCalculator
+
+HEARTBEAT_FRAMES = (
+    "💜",
+    "💙",
+    "💚",
+    "💛",
+)
+HEARTBEAT_INTERVAL = 0.10
+HEARTBEAT_FRAME_TICKS = 10
 
 
 class DividendScorer(object):
@@ -209,38 +220,36 @@ class DividendScorer(object):
 
 
 def format_score_report(score_result):
-    lines = []
-    lines.append("红利低波打分器 | {} | {}".format(score_result["etf"], score_result["date"]))
-    lines.append("综合评分: {:.2f} / 10".format(score_result["total_score"]))
-    if score_result.get("score_percentile") is not None:
-        lines.append(
-            "滚动分位: {:.1%} (window={}d, n={})".format(
-                score_result["score_percentile"],
-                score_result.get("score_percentile_window"),
-                score_result.get("score_percentile_sample_size"),
-            )
-        )
-    lines.append("置信度: {}".format(score_result["confidence"]))
-    lines.append("权重方案: {}".format(score_result["model_meta"]["method"]))
+    lines = ["", ""]
+    summary_items = [
+        ("ETF", score_result["etf"]),
+        ("日期", score_result["date"]),
+        ("综合评分", "{:.2f} / 10".format(score_result["total_score"])),
+        ("滚动分位", _format_percentile_summary(score_result)),
+        ("置信度", _format_confidence_display(score_result.get("confidence"))),
+        ("权重方案", _format_weight_method_display(score_result["model_meta"]["method"])),
+        ("msg", _build_score_summary_message(score_result)),
+    ]
+    lines.extend(_render_text_box(_format_key_value_lines(summary_items), title="红利低波打分器结论"))
     lines.append("")
     lines.append("估值指标:")
+    feature_rows = []
     for feature_name, feature_info in score_result["features"].items():
-        raw_value = feature_info.get("raw")
-        raw_repr = "-" if raw_value is None else "{:.6g}".format(raw_value)
-        percentile = feature_info.get("percentile")
-        normalized = feature_info.get("normalized")
-        sub_score = feature_info.get("sub_score")
-        weight = feature_info.get("weight", 0.0)
-        lines.append(
-            "  {:<18} raw={:<10} pct={} norm={} sub={} weight={:.1%}".format(
-                feature_name,
-                raw_repr,
-                "-" if percentile is None else "{:.2f}".format(percentile),
-                "-" if normalized is None else "{:.2f}".format(normalized),
-                "-" if sub_score is None else "{:.2f}".format(sub_score),
-                weight,
-            )
+        feature_rows.append([
+            FEATURE_DISPLAY_NAMES.get(feature_name, feature_name),
+            feature_name,
+            _format_metric_value(feature_info.get("raw"), "{:.6g}"),
+            _format_metric_value(feature_info.get("percentile"), "{:.2f}"),
+            _format_metric_value(feature_info.get("normalized"), "{:.2f}"),
+            _format_metric_value(feature_info.get("sub_score"), "{:.2f}"),
+            _format_metric_value(feature_info.get("weight"), "{:.1%}"),
+        ])
+    lines.extend(
+        _render_text_table(
+            headers=("指标", "指标英文", "原始值", "分位", "归一值", "子分", "权重"),
+            rows=feature_rows,
         )
+    )
     lines.append("")
     lines.append("置信度修正因子:")
     for feature_name, feature_info in score_result["confidence_modifiers"].items():
@@ -261,6 +270,247 @@ def format_score_report(score_result):
     return "\n".join(lines)
 
 
+def _format_metric_value(value, pattern):
+    if value is None or pd.isna(value):
+        return "-"
+    return pattern.format(value)
+
+
+def _format_percentile_summary(score_result):
+    percentile = score_result.get("score_percentile")
+    if percentile is None:
+        return "-"
+    return "{:.1%} (window={}d, n={})".format(
+        percentile,
+        score_result.get("score_percentile_window"),
+        score_result.get("score_percentile_sample_size"),
+    )
+
+
+def _format_confidence_display(confidence):
+    label_map = {
+        "normal": "normal（正常）",
+        "lowered": "lowered（下调）",
+        "low": "low（较低）",
+    }
+    return label_map.get(confidence, confidence or "-")
+
+
+def _format_weight_method_display(method):
+    label_map = {
+        "fixed_domain_prior": "fixed_domain_prior（固定先验权重）",
+        "shrunk_ic_ir": "shrunk_ic_ir（先验+动态收缩）",
+        "ic_ir": "ic_ir（动态IC/IR权重）",
+        "domain_knowledge_fallback": "domain_knowledge_fallback（领域先验回退）",
+    }
+    return label_map.get(method, method or "-")
+
+
+def _build_score_summary_message(score_result):
+    total_score = score_result.get("total_score")
+    percentile = score_result.get("score_percentile")
+    percentile_window = score_result.get("score_percentile_window")
+    buy_threshold = score_result.get("buy_percentile_threshold")
+    sell_threshold = score_result.get("sell_percentile_threshold")
+    confidence = score_result.get("confidence")
+    warnings = score_result.get("warnings") or []
+
+    parts = []
+    if total_score is not None:
+        summary = "当前评分 {:.2f}/10".format(total_score)
+        if percentile is not None:
+            summary = "{}，位于近{}日{:.1%}分位，{}".format(
+                summary,
+                percentile_window,
+                percentile,
+                _describe_percentile_zone(percentile, buy_threshold, sell_threshold),
+            )
+        parts.append(summary)
+    elif percentile is not None:
+        parts.append(
+            "当前位于近{}日{:.1%}分位，{}".format(
+                percentile_window,
+                percentile,
+                _describe_percentile_zone(percentile, buy_threshold, sell_threshold),
+            )
+        )
+
+    confidence_map = {
+        "normal": "置信度正常",
+        "lowered": "置信度已下调",
+        "low": "置信度较低",
+    }
+    parts.append(confidence_map.get(confidence, "置信度={}".format(confidence)))
+
+    warning_hint = _summarize_warnings(warnings)
+    if warning_hint:
+        parts.append(warning_hint)
+    return "；".join(parts) + "。"
+
+
+def _describe_percentile_zone(percentile, buy_threshold, sell_threshold):
+    buy_threshold = 0.2 if buy_threshold is None else float(buy_threshold)
+    sell_threshold = 0.8 if sell_threshold is None else float(sell_threshold)
+    if percentile <= buy_threshold:
+        return "接近历史低位，配置性价比较高"
+    if percentile >= sell_threshold:
+        return "接近历史高位，追高性价比较弱"
+    if percentile < 0.5:
+        return "处于历史中低位，可继续跟踪"
+    return "处于历史中高位，宜耐心等更好位置"
+
+
+def _summarize_warnings(warnings):
+    if not warnings:
+        return ""
+    if any(str(item).startswith("stale_sources:") for item in warnings):
+        return "存在数据新鲜度告警"
+    if "under_sampled_percentile_window" in warnings:
+        return "分位样本窗口仍偏短"
+    return "存在额外告警"
+
+
+def _format_key_value_lines(items):
+    key_width = max(_display_width(key) for key, _ in items)
+    return [
+        "{}  {}".format(_pad_display(key, key_width), value)
+        for key, value in items
+    ]
+
+
+def _render_text_box(lines, title=None):
+    width = max(_display_width(line) for line in lines) if lines else 0
+    if title:
+        title_width = _display_width(title)
+        width = max(width, title_width + 4)
+
+    output = []
+    if title:
+        pad_total = width - _display_width(title) - 2
+        pad_left = pad_total // 2
+        pad_right = pad_total - pad_left
+        output.append("┌─" + ("─" * pad_left) + " " + title + " " + ("─" * pad_right) + "─┐")
+    else:
+        output.append("┌" + ("─" * (width + 2)) + "┐")
+    for line in lines:
+        output.append("│ " + line + (" " * max(width - _display_width(line), 0)) + " │")
+    output.append("└" + ("─" * (width + 2)) + "┘")
+    return output
+
+
+def _render_text_table(headers, rows):
+    headers = [str(item) for item in headers]
+    normalized_rows = [[str(cell) for cell in row] for row in rows]
+    columns = len(headers)
+    widths = []
+    for idx in range(columns):
+        cells = [headers[idx]]
+        cells.extend(row[idx] for row in normalized_rows)
+        widths.append(max(_display_width(cell) for cell in cells))
+
+    top = "┌" + "┬".join("─" * (width + 2) for width in widths) + "┐"
+    sep = "├" + "┼".join("─" * (width + 2) for width in widths) + "┤"
+    bottom = "└" + "┴".join("─" * (width + 2) for width in widths) + "┘"
+
+    output = [top, _render_table_row(headers, widths), sep]
+    if normalized_rows:
+        for row in normalized_rows:
+            output.append(_render_table_row(row, widths))
+    else:
+        empty = ["-"] + [""] * (columns - 1)
+        output.append(_render_table_row(empty, widths))
+    output.append(bottom)
+    return output
+
+
+def _render_table_row(cells, widths):
+    padded = [
+        " " + _pad_display(cell, width) + " "
+        for cell, width in zip(cells, widths)
+    ]
+    return "│" + "│".join(padded) + "│"
+
+
+def _display_width(text):
+    visible = str(text)
+    total = 0
+    for ch in visible:
+        cp = ord(ch)
+        if cp in (0xFE0E, 0xFE0F, 0x200D):
+            continue
+        if (0x1F300 <= cp <= 0x1FAFF) or (0x2600 <= cp <= 0x27BF):
+            total += 2
+        elif unicodedata.east_asian_width(ch) in ("W", "F"):
+            total += 2
+        else:
+            total += 1
+    return total
+
+
+def _pad_display(text, width):
+    text = str(text)
+    return text + (" " * max(width - _display_width(text), 0))
+
+
+def _candidate_logo_paths():
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return (
+        os.path.join(repo_root, "logo.txt"),
+        os.path.join(repo_root, "RFC", "logo.txt"),
+    )
+
+
+def _resolve_logo_path():
+    for path in _candidate_logo_paths():
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _render_gradient_logo(stream, use_color):
+    logo_path = _resolve_logo_path()
+    if logo_path is None:
+        return
+
+    with open(logo_path, "r") as handle:
+        lines = [line.rstrip("\n") for line in handle.readlines()]
+
+    colors = [
+        (17, 95, 179),
+        (27, 113, 179),
+        (37, 130, 178),
+        (47, 148, 178),
+        (56, 166, 178),
+        (66, 183, 177),
+        (76, 201, 177),
+    ]
+
+    for line in lines:
+        if not use_color:
+            stream.write(line + "\n")
+            continue
+        if not line:
+            stream.write("\n")
+            continue
+        size = len(line)
+        painted = []
+        for index, ch in enumerate(line):
+            if ch == " ":
+                painted.append(ch)
+                continue
+            t = index / max(size - 1, 1)
+            palette_index = t * (len(colors) - 1)
+            left = min(int(palette_index), len(colors) - 2)
+            frac = palette_index - left
+            red = int(colors[left][0] + (colors[left + 1][0] - colors[left][0]) * frac)
+            green = int(colors[left][1] + (colors[left + 1][1] - colors[left][1]) * frac)
+            blue = int(colors[left][2] + (colors[left + 1][2] - colors[left][2]) * frac)
+            painted.append("\033[38;2;{};{};{}m{}\033[0m".format(red, green, blue, ch))
+        stream.write("".join(painted) + "\n")
+    stream.write("\n")
+    stream.flush()
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Dividend low-volatility scorer")
     parser.add_argument("--date", dest="date", default=None, help="score date, defaults to latest available date")
@@ -269,7 +519,7 @@ def build_arg_parser():
     parser.add_argument("--db-path", dest="db_path", default=None, help="SQLite cache path")
     parser.add_argument("--bundle-path", dest="bundle_path", default=None, help="RQAlpha bundle path")
     parser.add_argument("--sync", action="store_true", help="sync data from AKShare before scoring")
-    parser.add_argument("--sync-only", action="store_true", help="only sync data, do not score afterwards")
+    parser.add_argument("--sync-only", action="store_true", help="only sync data and exit, implies --sync")
     parser.add_argument("--json", action="store_true", help="print JSON output")
     return parser
 
@@ -277,11 +527,18 @@ def build_arg_parser():
 def main(argv=None):
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    ui_stream = sys.stderr
+    show_cli_ui = _should_show_cli_ui(args, stream=ui_stream)
+    do_sync = bool(args.sync or args.sync_only)
+
+    if show_cli_ui:
+        _render_gradient_logo(ui_stream, use_color=True)
+
     scorer = DividendScorer(db_path=args.db_path, bundle_path=args.bundle_path)
-    if args.sync:
+    if do_sync:
         available_start = args.start_date or "2020-01-01"
         available_end = args.end_date or pd.Timestamp.today().strftime("%Y-%m-%d")
-        progress = SyncProgressReporter(stream=sys.stderr)
+        progress = SyncProgressReporter(stream=ui_stream)
         progress.banner(
             title="红利低波打分器缓存同步",
             start_date=available_start,
@@ -292,8 +549,18 @@ def main(argv=None):
         if args.sync_only:
             print("sync success ✅: {} -> {}".format(available_start, available_end))
             return
-    scorer.precompute(start_date=args.start_date, end_date=args.end_date)
-    score_result = scorer.score_latest(date=args.date)
+    indicator = CliActivityIndicator(
+        label="正在预计算估值特征",
+        stream=ui_stream,
+        enabled=show_cli_ui,
+    )
+    indicator.start()
+    try:
+        scorer.precompute(start_date=args.start_date, end_date=args.end_date)
+        indicator.update("正在生成评分报告")
+        score_result = scorer.score_latest(date=args.date)
+    finally:
+        indicator.stop()
     if args.json:
         print(json.dumps(score_result, ensure_ascii=False, indent=2, default=_json_default))
         return
@@ -306,19 +573,109 @@ def _json_default(value):
     return value
 
 
+def _should_show_cli_ui(args, stream=None):
+    if getattr(args, "json", False):
+        return False
+    target = stream or sys.stderr
+    return bool(getattr(target, "isatty", lambda: False)())
+
+
+class CliActivityIndicator(object):
+    def __init__(self, label, stream=None, enabled=True):
+        self.stream = stream or sys.stderr
+        self.enabled = bool(enabled and getattr(self.stream, "isatty", lambda: False)())
+        self.label = label
+        self._line_open = False
+        self._last_width = 0
+        self._spinner_index = 0
+        self._spinner_thread = None
+        self._spinner_stop = None
+        self._lock = threading.Lock()
+
+    def start(self):
+        if not self.enabled:
+            return self
+        with self._lock:
+            self._spinner_index = 0
+        self._render_current()
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._spinner_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="dividend-scorer-cli-spinner",
+        )
+        with self._lock:
+            self._spinner_stop = stop_event
+            self._spinner_thread = thread
+        thread.start()
+        return self
+
+    def update(self, label):
+        if not self.enabled:
+            return
+        with self._lock:
+            self.label = label
+        self._render_current()
+
+    def stop(self):
+        if not self.enabled:
+            return
+        thread = None
+        stop_event = None
+        with self._lock:
+            stop_event = self._spinner_stop
+            thread = self._spinner_thread
+            self._spinner_stop = None
+            self._spinner_thread = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.3)
+        with self._lock:
+            if self._line_open:
+                self.stream.write("\r\033[2K")
+                self.stream.flush()
+                self._line_open = False
+                self._last_width = 0
+
+    def _spinner_loop(self, stop_event):
+        tick = 0
+        while not stop_event.wait(HEARTBEAT_INTERVAL):
+            with self._lock:
+                tick += 1
+                if tick % HEARTBEAT_FRAME_TICKS == 0:
+                    self._spinner_index = (self._spinner_index + 1) % len(HEARTBEAT_FRAMES)
+            self._render_current()
+
+    def _render_current(self):
+        if not self.enabled:
+            return
+        with self._lock:
+            frame = HEARTBEAT_FRAMES[self._spinner_index % len(HEARTBEAT_FRAMES)]
+            line = "{} {}".format(frame, self._style(self.label, "run"))
+            visible_width = _display_width(line)
+            padded = line
+            if visible_width < self._last_width:
+                padded += " " * (self._last_width - visible_width)
+            self.stream.write("\r\033[2K" + padded)
+            self.stream.flush()
+            self._line_open = True
+            self._last_width = visible_width
+
+    @staticmethod
+    def _style(text, kind):
+        if kind != "run" or not text:
+            return text
+        return "\033[1;36m{}\033[0m".format(text)
+
+
 class SyncProgressReporter(object):
     ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
     ELLIPSIS = "..."
-    # SkyEye animation: heartbeat
-    SPINNER_FRAMES = (
-        "💜",
-        "💙",
-        "💚",
-        "💛",
-    )
-
-    SPINNER_INTERVAL = 0.10   # refresh rate for elapsed time
-    SPINNER_FRAME_TICKS = 10  # advance heart every N ticks (~1s)
+    SPINNER_FRAMES = HEARTBEAT_FRAMES
+    SPINNER_INTERVAL = HEARTBEAT_INTERVAL
+    SPINNER_FRAME_TICKS = HEARTBEAT_FRAME_TICKS
 
     def __init__(self, stream=None):
         self.stream = stream or sys.stderr

@@ -58,6 +58,19 @@ CONFIDENCE_FEATURES = (
     "volume_ratio",
 )
 
+FEATURE_DISPLAY_NAMES = {
+    "dividend_yield_pct": "股息率",
+    "yield_spread": "股债利差",
+    "pe_percentile": "PE分位",
+    "ma250_deviation": "相对250日均线偏离",
+    "price_percentile": "价格分位",
+    "rsi_20": "20日RSI",
+    "premium_rate": "溢价率",
+    "premium_rate_ma20": "20日平均溢价率",
+    "volatility_percentile": "波动率分位",
+    "volume_ratio": "量比",
+}
+
 VALUATION_FEATURES = tuple(FEATURES.keys())
 ALL_FEATURES = VALUATION_FEATURES + CONFIDENCE_FEATURES
 

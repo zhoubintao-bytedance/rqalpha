@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+from collections import OrderedDict
+import io
 import sqlite3
 from types import SimpleNamespace
 
@@ -12,6 +14,9 @@ from rqalpha.dividend_scorer.config import VALUATION_FEATURES
 from rqalpha.dividend_scorer.data_fetcher import DataFetcher
 from rqalpha.dividend_scorer.feature_engine import FeatureEngine
 from rqalpha.dividend_scorer.main import DividendScorer
+from rqalpha.dividend_scorer.main import SyncProgressReporter
+from rqalpha.dividend_scorer.main import format_score_report
+from rqalpha.dividend_scorer.main import main as dividend_main
 from rqalpha.dividend_scorer.score_synthesizer import ScoreSynthesizer
 from rqalpha.dividend_scorer.weight_calculator import WeightCalculator
 from rqalpha.utils import RqAttrDict
@@ -204,6 +209,192 @@ def test_score_synthesizer_renormalizes_weights_and_applies_confidence_penalty()
     assert result["confidence"] == "lowered"
     assert np.isclose(sum(item["weight"] for item in result["features"].values()), 1.0)
     assert result["features"]["price_percentile"]["weight"] == 0.0
+
+
+def test_format_score_report_displays_chinese_feature_names():
+    report = format_score_report(
+        {
+            "etf": "512890",
+            "date": "2026-03-19",
+            "total_score": 6.32,
+            "score_percentile": 0.709,
+            "score_percentile_window": 504,
+            "score_percentile_sample_size": 504,
+            "confidence": "lowered",
+            "model_meta": {"method": "fixed_domain_prior"},
+            "features": OrderedDict(
+                [
+                    (
+                        "dividend_yield_pct",
+                        {
+                            "raw": 0.0321,
+                            "percentile": 0.25,
+                            "normalized": 0.75,
+                            "sub_score": 7.5,
+                            "weight": 0.2,
+                        },
+                    ),
+                    (
+                        "premium_rate_ma20",
+                        {
+                            "raw": -0.0012,
+                            "percentile": 0.40,
+                            "normalized": 0.40,
+                            "sub_score": 4.0,
+                            "weight": 0.1,
+                        },
+                    ),
+                ]
+            ),
+            "confidence_modifiers": OrderedDict(),
+            "warnings": [],
+        }
+    )
+
+    assert "红利低波打分器结论" in report
+    assert "ETF" in report
+    assert "日期" in report
+    assert "综合评分" in report
+    assert "滚动分位" in report
+    assert "置信度" in report
+    assert "权重方案" in report
+    assert "msg" in report
+    assert "当前评分 6.32/10" in report
+    assert "处于历史中高位" in report
+    assert "│ 指标" in report
+    assert "│ 指标英文" in report
+    assert "│ 原始值" in report
+    assert "│ 分位" in report
+    assert "│ 归一值" in report
+    assert "│ 子分" in report
+    assert "│ 权重" in report
+    assert "股息率" in report
+    assert "dividend_yield_pct" in report
+    assert "20日平均溢价率" in report
+    assert "premium_rate_ma20" in report
+
+
+def test_sync_banner_prints_logo_before_title(tmp_path, monkeypatch):
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return False
+
+    stream = FakeStream()
+    reporter = SyncProgressReporter(stream=stream)
+    reporter.banner(
+        title="红利低波打分器缓存同步",
+        start_date="2020-01-01",
+        end_date="2026-03-20",
+        db_path="/tmp/cache.db",
+    )
+
+    output = stream.getvalue()
+    assert output.startswith("红利低波打分器缓存同步\n")
+    assert "红利低波打分器缓存同步" in output
+
+
+def test_main_sync_only_implies_sync(monkeypatch):
+    calls = []
+
+    class FakeScorer(object):
+        def __init__(self, db_path=None, bundle_path=None):
+            self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def sync_all(self, start_date, end_date, progress=None):
+            calls.append(("sync_all", start_date, end_date, progress is not None))
+
+        def precompute(self, start_date=None, end_date=None):
+            calls.append(("precompute", start_date, end_date))
+
+        def score_latest(self, date=None):
+            calls.append(("score_latest", date))
+            return {}
+
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return False
+
+    stdout = io.StringIO()
+    stderr = FakeStream()
+    monkeypatch.setattr("rqalpha.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    dividend_main(["--sync-only"])
+
+    assert calls
+    assert calls[0][0] == "sync_all"
+    assert calls[0][1] == "2020-01-01"
+    assert calls[0][3] is True
+    assert all(call[0] != "precompute" for call in calls)
+    assert "sync success ✅" in stdout.getvalue()
+
+
+def test_main_scoring_prints_logo_and_runs_cli_spinner(monkeypatch):
+    calls = []
+
+    class FakeScorer(object):
+        def __init__(self, db_path=None, bundle_path=None):
+            self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def precompute(self, start_date=None, end_date=None):
+            calls.append(("precompute", start_date, end_date))
+
+        def score_latest(self, date=None):
+            calls.append(("score_latest", date))
+            return {
+                "etf": "512890",
+                "date": "2026-03-19",
+                "total_score": 6.32,
+                "score_percentile": 0.709,
+                "score_percentile_window": 504,
+                "score_percentile_sample_size": 504,
+                "buy_percentile_threshold": 0.2,
+                "sell_percentile_threshold": 0.8,
+                "confidence": "lowered",
+                "model_meta": {"method": "fixed_domain_prior"},
+                "features": OrderedDict(),
+                "confidence_modifiers": OrderedDict(),
+                "warnings": [],
+            }
+
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return True
+
+    class FakeIndicator(object):
+        def __init__(self, label, stream=None, enabled=True):
+            calls.append(("indicator_init", label, enabled))
+
+        def start(self):
+            calls.append(("indicator_start",))
+            return self
+
+        def update(self, label):
+            calls.append(("indicator_update", label))
+
+        def stop(self):
+            calls.append(("indicator_stop",))
+
+    def fake_render_logo(stream, use_color):
+        calls.append(("logo", use_color))
+
+    stdout = io.StringIO()
+    stderr = FakeStream()
+    monkeypatch.setattr("rqalpha.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("rqalpha.dividend_scorer.main.CliActivityIndicator", FakeIndicator)
+    monkeypatch.setattr("rqalpha.dividend_scorer.main._render_gradient_logo", fake_render_logo)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    dividend_main([])
+
+    assert ("logo", True) in calls
+    assert ("indicator_init", "正在预计算估值特征", True) in calls
+    assert ("indicator_start",) in calls
+    assert ("indicator_update", "正在生成评分报告") in calls
+    assert ("indicator_stop",) in calls
+    assert "红利低波打分器结论" in stdout.getvalue()
 
 
 def test_data_fetcher_load_history_aggregates_dividend_yield(tmp_path):
