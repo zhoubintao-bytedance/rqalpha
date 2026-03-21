@@ -1,0 +1,16 @@
+profile: baseline
+etf: 512890.XSHG
+max_target_percent: 0.90
+fast_window: 5
+slow_window: 15
+deadband: 0.08
+default_step_limit: 0.18
+initial_step_limit: 0.30
+bootstrap_percentile_window: 252
+bootstrap_min_score_samples: 20
+heat_cooldown_weeks: 2
+heat_cooldown_min_percentile: 0.80
+heat_cooldown_release_buffer: 0.10
+high_reentry_guard_percentile: 0.85
+high_reentry_confirm_weeks: 2
+high_reentry_confirm_trend: -0.01

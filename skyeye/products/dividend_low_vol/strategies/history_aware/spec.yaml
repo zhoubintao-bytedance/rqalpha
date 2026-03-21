@@ -1,0 +1,30 @@
+strategy_id: dividend_low_vol.history_aware
+name: 红利低波历史感知策略
+family: valuation_aware_allocation
+benchmark: 512890.XSHG
+instrument: 512890.XSHG
+status: baseline
+entrypoint: strategies/history_aware/strategy.py
+rolling_score_start_date: "2020-02-01"
+hypothesis: 最近5/15期评分分位的快慢均值和趋势，能够比单日分位更稳地决定主仓位；高位过热和低置信度阶段应主动减慢加仓或限制回补。
+signal_inputs:
+  - score_percentile
+  - price_percentile
+  - premium_rate
+  - premium_rate_ma20
+  - rsi_20
+positioning_rule: 主仓位由历史感知分位映射到连续目标仓位区间，并通过 deadband 与 step_limit 控制调仓节奏。
+risk_controls:
+  - heat_override
+  - confidence_slowdown
+  - high_reentry_guard
+rebalance_frequency: weekly
+expected_good_regimes:
+  - 估值回归主导的震荡市
+  - 高位过热后回撤明显的阶段
+expected_bad_regimes:
+  - 长时间单边上涨且估值维持中高位
+  - 低波资产持续抱团但回撤很浅的阶段
+notes:
+  - 单区间原生回测用于看真实净值和基准对比
+  - 滚动打分用于看跨年份稳定性

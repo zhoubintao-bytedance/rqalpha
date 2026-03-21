@@ -79,12 +79,17 @@ include = ["rqalpha", "rqalpha.*", "skyeye", "skyeye.*"]
 ]
 "skyeye" = [
     "*.md",
-    "examples/*.*",
+    "artifacts/*.md",
     "docs/*.*",
     "docs/manuals/*.*",
     "docs/rfc/*.*",
     "docs/assets/*.*",
     "experiments/charts/dividend_scorer/*.*",
+    "products/dividend_low_vol/*.md",
+    "products/dividend_low_vol/strategies/*/*.md",
+    "products/dividend_low_vol/strategies/*/*.yaml",
+    "products/dividend_low_vol/strategies/*/profiles/*.yaml",
+    "reports/*.md",
 ]
 
 [tool.setuptools_scm]

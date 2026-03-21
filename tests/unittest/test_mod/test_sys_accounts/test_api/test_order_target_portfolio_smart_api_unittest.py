@@ -221,7 +221,7 @@ def test_order_target_portfolio_smart_limit_order(environment, on_handle_bar, as
 
 def test_order_target_portfolio_smart_partial_limit_prices_error(environment, on_handle_bar, assert_submitted_orders):
     """测试部分股票指定限价 - 缺失价格应该报错"""
-    with pytest.raises(RQInvalidArgument, match="price of .* is needed"):
+    with pytest.raises(RQInvalidArgument) as exc_info:
         order_target_portfolio_smart(
             {
                 "000001.XSHE": 0.1,
@@ -231,6 +231,12 @@ def test_order_target_portfolio_smart_partial_limit_prices_error(environment, on
                 "000001.XSHE": 12.0,  # 只指定了000001的价格，缺少000004
             }
         )
+    message = str(exc_info.value)
+    assert "000004.XSHE" in message
+    assert (
+        ("price of" in message and "is needed" in message)
+        or ("需要" in message and "的价格" in message)
+    )
 
 
 def test_order_target_portfolio_smart_custom_valuation_prices(environment, on_handle_bar, assert_submitted_orders):
@@ -258,7 +264,7 @@ def test_order_target_portfolio_smart_custom_valuation_prices(environment, on_ha
 
 def test_order_target_portfolio_smart_missing_valuation_price_error(environment, on_handle_bar, assert_submitted_orders):
     """测试缺失估值价格 - 应该报错"""
-    with pytest.raises(RQInvalidArgument, match="prices of .* is not provided"):
+    with pytest.raises(RQInvalidArgument) as exc_info:
         order_target_portfolio_smart(
             {
                 "000001.XSHE": 0.1,
@@ -269,6 +275,12 @@ def test_order_target_portfolio_smart_missing_valuation_price_error(environment,
                 # 缺少000004的估值价格
             }
         )
+    message = str(exc_info.value)
+    assert "000004.XSHE" in message
+    assert (
+        ("prices of" in message and "is not provided" in message)
+        or ("未提供" in message and "的价格" in message)
+    )
 
 
 

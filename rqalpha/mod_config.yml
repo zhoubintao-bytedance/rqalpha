@@ -20,4 +20,4 @@ mod:
     enabled: true
   dividend_scorer:
     enabled: false
-    lib: skyeye.mod.rqalpha_mod_dividend_scorer
+    lib: skyeye.products.dividend_low_vol.mod.rqalpha_mod_dividend_scorer

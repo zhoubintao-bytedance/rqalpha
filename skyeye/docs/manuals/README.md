@@ -1,6 +1,6 @@
 # SkyEye Manuals
 
-如果你第一次使用 `skyeye/`，推荐按下面顺序走一遍。默认都在仓库根目录执行。
+如果你第一次使用 `skyeye/`，推荐按下面顺序走。默认都在仓库根目录执行。
 
 ## 1. 建环境
 
@@ -9,9 +9,9 @@ uv venv --python 3.13
 uv sync --python 3.13 --extra dividend-scorer
 ```
 
-如果你只想给普通 RQAlpha 策略做回测打分，不联动红利低波打分器，也可以只看：
-
-- [策略回测打分器.md](./策略回测打分器.md)
+如果仓库根目录已经有 `.venv/` 且依赖已经装好，通常不需要重复执行 `uv venv`。
+如果只是补齐或更新依赖，直接执行 `uv sync --python 3.13 --extra dividend-scorer` 即可。
+如果你确实要重建环境，再手动删除 `.venv/` 或使用 `uv venv --clear --python 3.13`。
 
 ## 2. 下载 bundle
 
@@ -24,31 +24,23 @@ uv run rqalpha download-bundle
 - bundle：`~/.rqalpha/bundle`
 - 红利低波缓存库：`~/.rqalpha/dividend_scorer/cache.db`
 
-## 3. 同步红利低波打分器缓存
+## 3. 一键打分
 
+[方式1] 对红利低波一键打分，会输出当前最新可用日期的评分报告。
 ```bash
-uv run python -m skyeye.dividend_scorer.main \
-  --sync-only \
-  --end-date "$(date +%F)"
+uv run python -m skyeye.products.dividend_low_vol.scorer.main
 ```
 
-这条命令只做同步，不输出评分。
-首次同步会从 `2020-01-01` 全量建库；后续默认按“上次成功日期往前回溯 10 个交易日 -> 今天”做增量同步。
-
-## 4. 直接看最新评分
-
+[方式2] 对 `2026-03-19` 当天价格的红利低波进行评分，如果输入的日期不是交易日，会自动调整到最近的交易日。
 ```bash
-uv run python -m skyeye.dividend_scorer.main --json
+uv run python -m skyeye.products.dividend_low_vol.scorer.main --end-date 2026-03-19
 ```
 
-默认命令会先自动检查今天这一天是否需要同步；如果缓存已覆盖，请求会直接 `skip`，然后输出当前最新可用日期的评分。
-这一步先确认评分本身能正常算出来，再进入策略和回测。
-
-## 5. 用 RQAlpha 原生回测跑单区间并保存图片
+## 4. 跑单区间原生回测并生成图片
 
 ```bash
 env UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/mplconfig uv run rqalpha run \
-  -f skyeye/examples/dividend_low_vol_score_strategy_history_aware.py \
+  -f skyeye/products/dividend_low_vol/strategies/history_aware/strategy.py \
   -s 2024-05-03 \
   -e 2025-04-20 \
   --account stock 100000 \
@@ -60,37 +52,46 @@ env UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/mplconfig uv run rqalpha run \
   -mc dividend_scorer.db_path ~/.rqalpha/dividend_scorer/cache.db
 ```
 
-这条路径适合做“单区间策略迭代”：
+这条路径用来回答单一区间里策略有没有跑赢 `512890.XSHG` 买入持有，以及仓位变化是否合理。
 
-- 直接对比策略净值和 `512890.XSHG` 买入持有
-- 把回测图片落到本地，方便横向比较不同参数版本
-- 一边看收益/回撤，一边看日志里的仓位变化是否符合预期
-
-如果你是在本地桌面环境运行，也可以去掉前面的 `UV_CACHE_DIR` 和 `MPLCONFIGDIR`。
-
-## 6. 给策略做滚动窗口打分
+## 5. 跑滚动窗口打分
 
 ```bash
-uv run python skyeye/strategy_scorer.py \
-  skyeye/examples/dividend_low_vol_score_strategy_history_aware.py \
+uv run python -m skyeye.evaluation.rolling_score.cli \
+  skyeye/products/dividend_low_vol/strategies/history_aware/strategy.py \
   -w 37 \
   --mod dividend_scorer \
   -mc dividend_scorer.db_path ~/.rqalpha/dividend_scorer/cache.db \
   --log high
 ```
 
-如果窗口 37 没问题，再逐步扩大到 `33-37` 或完整窗口。
+这条路径用来看跨年份稳定性，而不是只看单一区间。
 
-这条路径和上面的原生回测是互补关系：
+## 6. 跑基础单元测试
 
-- `rqalpha run --plot-save`：看某一个具体区间的真实净值、基准对比和图片
-- `skyeye/strategy_scorer.py`：看多窗口稳定性，避免策略只在单一区间表现好
+```bash
+env UV_CACHE_DIR=/tmp/uv-cache PYTHONPATH="$PWD" MPLCONFIGDIR=/tmp/mplconfig uv run pytest -q \
+  tests/dividend_scorer \
+  tests/unittest \
+  tests/evaluation \
+  tests/products
+```
 
-## 7. 接下来读什么
+这条路径用来验证评分器、滚动打分器、产品线逻辑和基础单元测试没有被改坏。
+如果你要跑 `tests/` 全量集成测试，需要先补齐 `TA-Lib`，否则 `tests/integration_tests/test_backtest_results/` 会在收集阶段失败。
+
+## 7. 当前结构的基本约定
+
+- 红利低波产品线在 `skyeye/products/dividend_low_vol/`
+- 策略目录必须带 `spec.yaml`、`profiles/` 和薄 `strategy.py`
+- 如果后续需要独立诊断脚本，放在 `skyeye/products/dividend_low_vol/tools/`，不要伪装成策略
+- 滚动窗口打分器主入口是 `python -m skyeye.evaluation.rolling_score.cli`
+
+## 8. 接下来读什么
 
 - [红利低波打分器使用说明.md](./红利低波打分器使用说明.md)
-  适合继续看缓存同步、CLI 输出、策略调用、参数审计和诊断工具画图
+  适合看评分器、单区间回测、单元测试和策略迭代约定。
 - [策略回测打分器.md](./策略回测打分器.md)
-  适合继续看滚动窗口打分、日志解释、稀疏窗口和 `--mod/-mc` 用法
+  适合看滚动窗口打分、策略卡片、窗口选择和 `--mod/-mc`。
 - [../rfc/dividend_scorer_iteration_directions.md](../rfc/dividend_scorer_iteration_directions.md)
-  适合看后续设计讨论和迭代优先级，不是使用手册
+  适合看设计讨论和迭代优先级，不是使用手册。
