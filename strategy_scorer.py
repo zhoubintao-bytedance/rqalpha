@@ -258,6 +258,22 @@ def generate_windows():
     return windows
 
 
+def extract_strategy_scorer_start_date(strategy_file):
+    with open(strategy_file, "r", encoding="utf-8") as f:
+        source = f.read()
+    match = re.search(
+        r'^\s*STRATEGY_SCORER_START_DATE\s*=\s*[\'"](\d{4}-\d{2}-\d{2})[\'"]\s*$',
+        source,
+        re.MULTILINE,
+    )
+    if not match:
+        return None
+    try:
+        return datetime.datetime.strptime(match.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
 def parse_window_arg(window_str):
     """解析 --window 参数，返回窗口编号列表（1-based）
 
@@ -281,6 +297,37 @@ def parse_window_arg(window_str):
             print(f"错误: 窗口编号 {n} 超出范围 (1-37)")
             sys.exit(1)
     return sorted(nums)
+
+
+def parse_cli_scalar(value):
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if lowered in ("none", "null"):
+        return None
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if re.fullmatch(r"[+-]?\d+", stripped):
+        return int(stripped)
+    if re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?", stripped):
+        return float(stripped)
+    return value
+
+
+def parse_mod_config_args(items):
+    mod_configs = OrderedDict()
+    for key, raw_value in items or []:
+        if "." not in key:
+            print("错误: --mod-config 键必须是 <mod>.<field>，例如 dividend_scorer.prior_blend")
+            sys.exit(1)
+        mod_name, field_name = key.split(".", 1)
+        if not mod_name or not field_name:
+            print("错误: --mod-config 键必须是 <mod>.<field>，例如 dividend_scorer.prior_blend")
+            sys.exit(1)
+        mod_configs.setdefault(mod_name, OrderedDict())
+        mod_configs[mod_name][field_name] = parse_cli_scalar(raw_value)
+    return mod_configs
 
 
 def analyze_window_sample(start, trades, portfolio):
@@ -337,12 +384,18 @@ def analyze_window_sample(start, trades, portfolio):
     return diagnostics
 
 
-def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods=None, drop_sparse=False):
+def run_rolling_backtests(
+    strategy_file,
+    cash,
+    selected_indices=None,
+    extra_mods=None,
+    mod_configs=None,
+):
     """对策略文件执行滚动窗口回测，返回结果列表
 
     selected_indices: 要执行的窗口编号列表（1-based），None 表示全部37个
     extra_mods: 额外启用的 mod 名称列表
-    drop_sparse: 是否跳过持仓样本明显不足的窗口
+    mod_configs: 额外的 mod 配置，格式为 {mod_name: {key: value}}
     """
     with open(strategy_file) as f:
         source_code = f.read()
@@ -375,9 +428,19 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods
                 "sys_progress": {"enabled": False},
             },
         }
-        if extra_mods:
-            for mod_name in extra_mods:
-                config["mod"][mod_name] = {"enabled": True}
+        enabled_mods = []
+        for mod_name in extra_mods or []:
+            if mod_name not in enabled_mods:
+                enabled_mods.append(mod_name)
+        for mod_name in (mod_configs or {}).keys():
+            if mod_name not in enabled_mods:
+                enabled_mods.append(mod_name)
+        for mod_name in enabled_mods:
+            config["mod"][mod_name] = {"enabled": True}
+        for mod_name, mod_config in (mod_configs or {}).items():
+            config["mod"].setdefault(mod_name, {"enabled": True})
+            config["mod"][mod_name]["enabled"] = True
+            config["mod"][mod_name].update(mod_config)
 
         try:
             with warnings.catch_warnings():
@@ -393,9 +456,6 @@ def run_rolling_backtests(strategy_file, cash, selected_indices=None, extra_mods
             trades = result["sys_analyser"]["trades"]
             portfolio = result["sys_analyser"].get("portfolio")
             sample_diagnostics = analyze_window_sample(start, trades, portfolio)
-            if drop_sparse and sample_diagnostics["sparse"]:
-                print("跳过(样本不足: {})".format(sample_diagnostics["warning_text"]))
-                continue
 
             window_score = score_window(summary)
             use_color = sys.stdout.isatty()
@@ -996,6 +1056,25 @@ def compute_market_env_scores(quarterly_scores, benchmark_quarterly_returns):
         result[env] = np.mean(scores) if scores else "N/A"
     return result
 
+
+def summarize_window_results(window_results, benchmark_quarterly_returns=None):
+    quarterly_scores, quarterly_raw_indicators = project_to_quarters(window_results)
+    composite, core_indicators = compute_composite_score(quarterly_scores, quarterly_raw_indicators)
+    stability = compute_stability_score(quarterly_scores)
+    benchmark_returns = benchmark_quarterly_returns
+    if benchmark_returns is None:
+        benchmark_returns = get_benchmark_quarterly_returns()
+    market_env = compute_market_env_scores(quarterly_scores, benchmark_returns)
+    return {
+        "quarterly_scores": quarterly_scores,
+        "quarterly_raw_indicators": quarterly_raw_indicators,
+        "composite": composite,
+        "core_indicators": core_indicators,
+        "stability": stability,
+        "market_env": market_env,
+        "overfit_flags": detect_overfit_flags(quarterly_scores),
+    }
+
 def detect_overfit_flags(quarterly_scores):
     """检测过拟合迹象，返回警告列表
 
@@ -1127,8 +1206,12 @@ HELP_TEXT = """\
                           mid  = 最近 4 个窗口（约1年）
                           high = 全部 37 个窗口
     --plot              绘制价格走势图，在收盘价曲线上标注买卖点（保存为 PNG 文件）
-    --drop-sparse-windows
-                        跳过持仓样本明显不足的窗口，避免 ETF 晚上市/长期空仓扭曲综合分
+    --mod MOD [MOD ...]
+                        启用额外的 mod，例如 --mod dividend_scorer
+    --mod-config, -mc KEY VALUE
+                        设置 mod 配置，可重复传入，例如
+                          -mc dividend_scorer.prior_blend 0.7
+                          -mc dividend_scorer.dynamic_diagnostic false
     --search, -s PATTERN  搜索股票代码或名称（正则匹配，不跑回测）
                           匹配 order_book_id 或 symbol，仅显示 Active 的股票/ETF/指数
     --help              显示此帮助信息
@@ -1176,9 +1259,10 @@ EXAMPLE_TEXT = """\
     python strategy_scorer.py my_strategy.py -w 37 --plot        # 单窗口图表
     python strategy_scorer.py my_strategy.py -w 35-37 --plot     # 多窗口各一张图
 
-6. 跳过 ETF 晚上市或长期空仓造成的稀疏窗口:
+6. 启用额外 mod 并传递配置:
 
-    python strategy_scorer.py my_strategy.py --drop-sparse-windows
+    python strategy_scorer.py my_strategy.py --mod dividend_scorer
+    python strategy_scorer.py my_strategy.py --mod dividend_scorer -mc dividend_scorer.prior_blend 0.7
 
 7. 用自带的示例策略测试:
 
@@ -1294,8 +1378,15 @@ def main():
     parser.add_argument("--plot", action="store_true", help="绘制价格走势+买卖点图表")
     parser.add_argument("--mod", type=str, nargs="*", default=None,
                         help="启用额外的 mod，如 --mod dividend_scorer")
-    parser.add_argument("--drop-sparse-windows", action="store_true",
-                        help="跳过持仓样本明显不足的窗口")
+    parser.add_argument(
+        "--mod-config",
+        "-mc",
+        metavar=("KEY", "VALUE"),
+        nargs=2,
+        action="append",
+        default=None,
+        help="设置 mod 配置，如 -mc dividend_scorer.prior_blend 0.7",
+    )
     parser.add_argument("--search", "-s", type=str, default=None,
                         help="搜索股票代码或名称（正则匹配）")
     args = parser.parse_args()
@@ -1319,6 +1410,14 @@ def main():
     selected_indices = None
     if args.window:
         selected_indices = parse_window_arg(args.window)
+    elif args.mod and "dividend_scorer" in args.mod:
+        strategy_floor_date = extract_strategy_scorer_start_date(args.strategy_file)
+        if strategy_floor_date is not None:
+            selected_indices = [
+                i + 1 for i, (start, _) in enumerate(generate_windows()) if start >= strategy_floor_date
+            ]
+
+    mod_configs = parse_mod_config_args(args.mod_config)
 
     all_windows = generate_windows()
     if selected_indices:
@@ -1346,7 +1445,7 @@ def main():
         args.cash,
         selected_indices,
         extra_mods=args.mod,
-        drop_sparse=args.drop_sparse_windows,
+        mod_configs=mod_configs,
     )
 
     if not window_results:
@@ -1361,8 +1460,6 @@ def main():
             "#{}({})".format(w["idx"], w["sample_diagnostics"]["warning_text"]) for w in sparse_windows
         )
         print("样本不足窗口: {}".format(sparse_desc))
-        if not args.drop_sparse_windows:
-            print("建议: 如需更公平地比较综合分，可加 --drop-sparse-windows 跳过这些窗口。")
 
     # 窗口数少于5个时，跳过综合评分，只输出单窗口得分和交易日志
     if len(window_results) < 5:
@@ -1399,17 +1496,12 @@ def main():
         return
 
     # 季度网格投影
-    quarterly_scores, quarterly_raw_indicators = project_to_quarters(window_results)
-
-    # 综合得分 + 核心指标
-    composite, core_indicators = compute_composite_score(quarterly_scores, quarterly_raw_indicators)
-
-    # 稳定性评分
-    stability = compute_stability_score(quarterly_scores)
-
-    # 市场环境
-    benchmark_qr = get_benchmark_quarterly_returns()
-    market_env = compute_market_env_scores(quarterly_scores, benchmark_qr)
+    summary = summarize_window_results(window_results)
+    quarterly_scores = summary["quarterly_scores"]
+    composite = summary["composite"]
+    core_indicators = summary["core_indicators"]
+    stability = summary["stability"]
+    market_env = summary["market_env"]
 
     # 输出报告
     use_color = sys.stdout.isatty()
@@ -1433,7 +1525,7 @@ def main():
     shc = indicator_color("sharpe", sharpe_val, use_color)
     wc = indicator_color("win_rate", win_rate_val / 100, use_color)
     summary_lines.append(f"【核心指标】年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
-    overfit_flags = detect_overfit_flags(quarterly_scores)
+    overfit_flags = summary["overfit_flags"]
     if overfit_flags:
         warn_color = "\033[41;97m" if use_color else ""
         summary_lines.append(f"{warn_color}提示: ⚑过拟合风险{RST}")
