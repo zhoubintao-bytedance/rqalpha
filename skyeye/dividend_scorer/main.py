@@ -66,20 +66,42 @@ class DividendScorer(object):
         self.weight_result = None
         self.score_history_df = None
         self.weight_result_by_date = {}
+        self.target_end_date = None
+        self.loaded_end_date = None
 
     def sync_all(self, start_date, end_date, progress=None):
         self.data_fetcher.sync_all(start_date, end_date, progress=progress)
 
-    def precompute(self, env=None, start_date=None, end_date=None):
+    def prepare(self, env=None, start_date=None, end_date=None, auto_sync=True, sync_progress=None):
         if env is not None and getattr(env, "data_proxy", None) is not None:
             self.data_fetcher.data_proxy = env.data_proxy
 
+        if auto_sync:
+            sync_start, sync_end = self._resolve_sync_range(
+                env=env,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            self.sync_all(sync_start, sync_end, progress=sync_progress)
+
+        return self.precompute(env=env, start_date=start_date, end_date=end_date)
+
+    def precompute(self, env=None, start_date=None, end_date=None, progress=None):
+        if env is not None and getattr(env, "data_proxy", None) is not None:
+            self.data_fetcher.data_proxy = env.data_proxy
+
+        self._progress_update(progress, "pre-computing | 读取历史数据")
         available_start, available_end = self.data_fetcher.get_available_range()
         start_date = start_date or available_start
-        end_date = end_date or self._get_env_end_date(env) or available_end
-        history_df = self.data_fetcher.load_history(start_date, end_date)
+        requested_end_date = end_date or self._get_env_end_date(env) or pd.Timestamp.today().strftime("%Y-%m-%d")
+        self.target_end_date = self._resolve_reference_score_date(requested_end_date)
+        actual_end_ts = min(pd.Timestamp(self.target_end_date), pd.Timestamp(available_end))
+        self.loaded_end_date = actual_end_ts.strftime("%Y-%m-%d")
+        history_df = self.data_fetcher.load_history(start_date, actual_end_ts)
+        self._progress_update(progress, "pre-computing | 计算估值特征")
         feature_matrix = self.feature_engine.precompute(history_df)
 
+        self._progress_update(progress, "pre-computing | 计算收缩权重")
         self.weight_result = self.weight_calculator.calculate_shrunk_weights(
             feature_matrix.loc[:, list(VALUATION_FEATURES)],
             history_df["etf_close_hfq"],
@@ -87,20 +109,21 @@ class DividendScorer(object):
             compute_diagnostics=self.dynamic_diagnostic,
         )
         self.history_df = history_df
-        self.score_history_df = self._build_score_history()
+        self._progress_update(progress, "pre-computing | 计算历史分数")
+        self.score_history_df = self._build_score_history(progress=progress)
         return self
 
     def score(self, date=None):
         if self.history_df is None or self.weight_result is None or self.score_history_df is None:
             self.precompute()
-        if date is None:
-            date = self.history_df.index[-1]
-        resolved_date = self._resolve_date(date)
+        target_date = date or self.target_end_date or self.history_df.index[-1]
+        target_date = pd.Timestamp(self._resolve_reference_score_date(target_date))
+        resolved_date = self._resolve_date(target_date)
         score_row = self.score_history_df.loc[resolved_date]
         if bool(score_row.get("error")):
             raise ScoreUnavailableError(score_row["error"])
         feature_snapshot = self.feature_engine.compute_single(resolved_date)
-        freshness = self.data_fetcher.get_data_freshness(reference_date=resolved_date.date())
+        freshness = self.data_fetcher.get_data_freshness(reference_date=target_date.date())
         weight_result = self.weight_result_by_date.get(resolved_date, self.weight_result)
         result = self.score_synthesizer.synthesize(
             feature_snapshot=feature_snapshot,
@@ -108,6 +131,7 @@ class DividendScorer(object):
             freshness=freshness,
         )
         result["date"] = resolved_date.strftime("%Y-%m-%d")
+        result["requested_date"] = target_date.strftime("%Y-%m-%d")
         result["etf"] = ETF_CODE
         result["data_freshness"] = freshness
         result["score_percentile"] = self._maybe_float(score_row.get("score_percentile"))
@@ -115,17 +139,32 @@ class DividendScorer(object):
         result["score_percentile_window"] = SCORE_PERCENTILE_WINDOW
         result["buy_percentile_threshold"] = SCORE_BUY_PERCENTILE
         result["sell_percentile_threshold"] = SCORE_SELL_PERCENTILE
+        lag_days = self._count_score_lag_trading_days(result["date"], result["requested_date"])
+        result["score_lag_trading_days"] = lag_days
+        if lag_days:
+            warnings = list(result.get("warnings") or [])
+            warnings.append(
+                "score_date_lag: requested={} actual={} trading_days={}".format(
+                    result["requested_date"],
+                    result["date"],
+                    lag_days,
+                )
+            )
+            result["warnings"] = warnings
+            if result.get("confidence") == "normal":
+                result["confidence"] = "lowered"
         return result
 
     def score_latest(self, date=None):
         return self.score(date=date)
 
-    def _build_score_history(self):
+    def _build_score_history(self, progress=None):
         score_rows = []
         self.weight_result_by_date = {}
         static_weights = self.prior_blend >= 1.0
+        total_dates = len(self.history_df.index)
 
-        for date in self.history_df.index:
+        for idx, date in enumerate(self.history_df.index, start=1):
             weight_result = self.weight_result
             if not static_weights:
                 weight_result = self.weight_calculator.calculate_shrunk_weights(
@@ -159,6 +198,13 @@ class DividendScorer(object):
                     "fallback_reason": weight_result.get("fallback_reason"),
                     "error": str(exc),
                 })
+            if progress is not None and (idx == 1 or idx == total_dates or idx % 20 == 0):
+                self._progress_update_step(
+                    progress,
+                    current=idx,
+                    total=total_dates,
+                    detail="截止 {}".format(date.strftime("%Y-%m-%d")),
+                )
 
         score_df = pd.DataFrame(score_rows).set_index("date")
         percentile_series, count_series = self._rolling_hazen_percentile(score_df["total_score"])
@@ -195,6 +241,38 @@ class DividendScorer(object):
             raise KeyError("no history available on or before {}".format(ts.strftime("%Y-%m-%d")))
         return prior[-1]
 
+    def _resolve_sync_range(self, env=None, start_date=None, end_date=None):
+        return self.data_fetcher.suggest_sync_range(
+            start_date=start_date,
+            end_date=end_date or self._get_env_end_date(env) or pd.Timestamp.today().strftime("%Y-%m-%d"),
+        )
+
+    def _resolve_reference_score_date(self, date_value):
+        resolver = getattr(self.data_fetcher, "_latest_trading_day_on_or_before", None)
+        if callable(resolver):
+            return resolver(date_value)
+        return pd.Timestamp(date_value).strftime("%Y-%m-%d")
+
+    def _count_score_lag_trading_days(self, actual_date, target_date):
+        counter = getattr(self.data_fetcher, "_count_trading_days", None)
+        if callable(counter):
+            return counter(actual_date, target_date)
+        if pd.Timestamp(actual_date) >= pd.Timestamp(target_date):
+            return 0
+        return max(len(pd.bdate_range(start=actual_date, end=target_date)) - 1, 0)
+
+    @staticmethod
+    def _progress_update(progress, label):
+        if progress is None or not hasattr(progress, "update"):
+            return
+        progress.update(label)
+
+    @staticmethod
+    def _progress_update_step(progress, current, total, detail=None):
+        if progress is None or not hasattr(progress, "update_progress"):
+            return
+        progress.update_progress(current=current, total=total, detail=detail)
+
     @staticmethod
     def _get_env_end_date(env):
         base_config = getattr(getattr(env, "config", None), "base", None)
@@ -221,15 +299,20 @@ class DividendScorer(object):
 
 def format_score_report(score_result):
     lines = ["", ""]
+    requested_date = score_result.get("requested_date")
+    actual_date = score_result["date"]
+    date_label = "评分日期" if requested_date and requested_date != actual_date else "日期"
     summary_items = [
         ("ETF", score_result["etf"]),
-        ("日期", score_result["date"]),
+        (date_label, actual_date),
         ("综合评分", "{:.2f} / 10".format(score_result["total_score"])),
         ("滚动分位", _format_percentile_summary(score_result)),
         ("置信度", _format_confidence_display(score_result.get("confidence"))),
         ("权重方案", _format_weight_method_display(score_result["model_meta"]["method"])),
         ("msg", _build_score_summary_message(score_result)),
     ]
+    if requested_date and requested_date != actual_date:
+        summary_items.insert(1, ("目标日期", requested_date))
     lines.extend(_render_text_box(_format_key_value_lines(summary_items), title="红利低波打分器结论"))
     lines.append("")
     lines.append("估值指标:")
@@ -313,13 +396,16 @@ def _build_score_summary_message(score_result):
     buy_threshold = score_result.get("buy_percentile_threshold")
     sell_threshold = score_result.get("sell_percentile_threshold")
     confidence = score_result.get("confidence")
+    requested_date = score_result.get("requested_date")
+    actual_date = score_result.get("date")
+    lag_days = score_result.get("score_lag_trading_days")
     warnings = score_result.get("warnings") or []
 
     parts = []
     if total_score is not None:
         summary = "当前评分 {:.2f}/10".format(total_score)
         if percentile is not None:
-            summary = "{}，位于近{}日{:.1%}分位，{}".format(
+            summary = "{}，位于近{}日{:.1%}分位（单日信号），{}".format(
                 summary,
                 percentile_window,
                 percentile,
@@ -328,7 +414,7 @@ def _build_score_summary_message(score_result):
         parts.append(summary)
     elif percentile is not None:
         parts.append(
-            "当前位于近{}日{:.1%}分位，{}".format(
+            "当前位于近{}日{:.1%}分位（单日信号），{}".format(
                 percentile_window,
                 percentile,
                 _describe_percentile_zone(percentile, buy_threshold, sell_threshold),
@@ -341,6 +427,18 @@ def _build_score_summary_message(score_result):
         "low": "置信度较低",
     }
     parts.append(confidence_map.get(confidence, "置信度={}".format(confidence)))
+    if lag_days:
+        parts.append(
+            "目标日期 {}，但当前只能计算到 {}，滞后 {} 个交易日".format(
+                requested_date,
+                actual_date,
+                lag_days,
+            )
+        )
+    if percentile is not None:
+        parts.append(
+            "单日分位仅反映当前位置，不是历史感知策略的直接开平仓信号，实际调仓仍会结合近5/15期分位均值、趋势、热度与置信度"
+        )
 
     warning_hint = _summarize_warnings(warnings)
     if warning_hint:
@@ -352,12 +450,12 @@ def _describe_percentile_zone(percentile, buy_threshold, sell_threshold):
     buy_threshold = 0.2 if buy_threshold is None else float(buy_threshold)
     sell_threshold = 0.8 if sell_threshold is None else float(sell_threshold)
     if percentile <= buy_threshold:
-        return "接近历史低位，配置性价比较高"
+        return "接近历史低位，历史感知策略的主仓位通常会偏高"
     if percentile >= sell_threshold:
-        return "接近历史高位，追高性价比较弱"
+        return "接近历史高位，历史感知策略的主仓位通常会偏低"
     if percentile < 0.5:
-        return "处于历史中低位，可继续跟踪"
-    return "处于历史中高位，宜耐心等更好位置"
+        return "处于历史中低位，历史感知策略的主仓位通常偏中高"
+    return "处于历史中高位，历史感知策略的主仓位通常偏中性偏低"
 
 
 def _summarize_warnings(warnings):
@@ -372,10 +470,18 @@ def _summarize_warnings(warnings):
 
 def _format_key_value_lines(items):
     key_width = max(_display_width(key) for key, _ in items)
-    return [
-        "{}  {}".format(_pad_display(key, key_width), value)
-        for key, value in items
-    ]
+    max_width = _preferred_text_box_content_width()
+    prefix_width = key_width + 2
+    value_width = max(max_width - prefix_width, 20)
+    lines = []
+    for key, value in items:
+        prefix = "{}  ".format(_pad_display(key, key_width))
+        wrapped_values = _wrap_display_text(value, value_width)
+        lines.append("{}{}".format(prefix, wrapped_values[0]))
+        continuation_prefix = " " * _display_width(prefix)
+        for wrapped in wrapped_values[1:]:
+            lines.append("{}{}".format(continuation_prefix, wrapped))
+    return lines
 
 
 def _render_text_box(lines, title=None):
@@ -396,6 +502,69 @@ def _render_text_box(lines, title=None):
         output.append("│ " + line + (" " * max(width - _display_width(line), 0)) + " │")
     output.append("└" + ("─" * (width + 2)) + "┘")
     return output
+
+
+def _preferred_text_box_content_width():
+    try:
+        columns = int(shutil.get_terminal_size(fallback=(100, 20)).columns)
+    except Exception:
+        columns = 100
+    return max(min(columns - 4, 96), 48)
+
+
+def _wrap_display_text(text, max_width):
+    text = str(text)
+    if max_width is None or max_width <= 0:
+        return text.splitlines() or [text]
+
+    paragraphs = text.splitlines() or [text]
+    lines = []
+    for paragraph in paragraphs:
+        if paragraph == "":
+            lines.append("")
+            continue
+        lines.extend(_wrap_display_paragraph(paragraph, max_width))
+    return lines or [""]
+
+
+def _wrap_display_paragraph(text, max_width):
+    if _display_width(text) <= max_width:
+        return [text]
+
+    chars = list(str(text))
+    lines = []
+    start = 0
+    total = len(chars)
+    while start < total:
+        used = 0
+        end = start
+        preferred_break = None
+        while end < total:
+            ch = chars[end]
+            ch_width = _display_char_width(ch)
+            if end > start and used + ch_width > max_width:
+                break
+            used += ch_width
+            end += 1
+            if _is_display_wrap_boundary(ch):
+                preferred_break = end
+            if used >= max_width:
+                break
+
+        if end >= total:
+            lines.append("".join(chars[start:total]).rstrip())
+            break
+
+        if preferred_break is not None and preferred_break > start:
+            end = preferred_break
+        elif end == start:
+            end = start + 1
+
+        lines.append("".join(chars[start:end]).rstrip())
+        start = end
+        while start < total and chars[start] == " ":
+            start += 1
+    return lines or [""]
 
 
 def _render_text_table(headers, rows):
@@ -435,21 +604,28 @@ def _display_width(text):
     visible = str(text)
     total = 0
     for ch in visible:
-        cp = ord(ch)
-        if cp in (0xFE0E, 0xFE0F, 0x200D):
-            continue
-        if (0x1F300 <= cp <= 0x1FAFF) or (0x2600 <= cp <= 0x27BF):
-            total += 2
-        elif unicodedata.east_asian_width(ch) in ("W", "F"):
-            total += 2
-        else:
-            total += 1
+        total += _display_char_width(ch)
     return total
 
 
 def _pad_display(text, width):
     text = str(text)
     return text + (" " * max(width - _display_width(text), 0))
+
+
+def _display_char_width(ch):
+    cp = ord(ch)
+    if cp in (0xFE0E, 0xFE0F, 0x200D):
+        return 0
+    if (0x1F300 <= cp <= 0x1FAFF) or (0x2600 <= cp <= 0x27BF):
+        return 2
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def _is_display_wrap_boundary(ch):
+    return ch.isspace() or ch in ",.;:!?)]}%，。；：！？、）》」』】"
 
 
 def _candidate_logo_paths():
@@ -518,7 +694,8 @@ def build_arg_parser():
     parser.add_argument("--end-date", dest="end_date", default=None, help="history end date")
     parser.add_argument("--db-path", dest="db_path", default=None, help="SQLite cache path")
     parser.add_argument("--bundle-path", dest="bundle_path", default=None, help="RQAlpha bundle path")
-    parser.add_argument("--sync", action="store_true", help="sync data from AKShare before scoring")
+    parser.add_argument("--sync", action="store_true", help="explicitly enable auto sync before scoring (default)")
+    parser.add_argument("--no-sync", action="store_true", help="skip auto sync and score from local cache only")
     parser.add_argument("--sync-only", action="store_true", help="only sync data and exit, implies --sync")
     parser.add_argument(
         "--prior-blend",
@@ -535,9 +712,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.prior_blend < 0.0 or args.prior_blend > 1.0:
         parser.error("--prior-blend must be within [0, 1]")
+    if args.no_sync and (args.sync or args.sync_only):
+        parser.error("--no-sync cannot be combined with --sync or --sync-only")
     ui_stream = sys.stderr
     show_cli_ui = _should_show_cli_ui(args, stream=ui_stream)
-    do_sync = bool(args.sync or args.sync_only)
+    do_sync = not args.no_sync
 
     if show_cli_ui:
         _render_gradient_logo(ui_stream, use_color=True)
@@ -547,19 +726,27 @@ def main(argv=None):
         bundle_path=args.bundle_path,
         prior_blend=args.prior_blend,
     )
+    sync_start = None
+    sync_end = None
+    end_date_warning = None
     if do_sync:
-        available_start = args.start_date or "2020-01-01"
-        available_end = args.end_date or pd.Timestamp.today().strftime("%Y-%m-%d")
-        progress = SyncProgressReporter(stream=ui_stream)
-        progress.banner(
-            title="红利低波打分器缓存同步",
-            start_date=available_start,
-            end_date=available_end,
-            db_path=scorer.data_fetcher.db_path,
+        sync_start, sync_end = scorer._resolve_sync_range(
+            start_date=args.start_date,
+            end_date=args.end_date,
         )
-        scorer.sync_all(available_start, available_end, progress=progress)
+        end_date_warning = _build_end_date_warning(args.end_date, sync_end)
+        progress = SyncProgressReporter(stream=ui_stream)
+        if show_cli_ui:
+            progress.banner(
+                title="红利低波打分器缓存同步",
+                start_date=sync_start,
+                end_date=sync_end,
+                db_path=scorer.data_fetcher.db_path,
+                end_date_warning=end_date_warning,
+            )
+        scorer.sync_all(sync_start, sync_end, progress=progress)
         if args.sync_only:
-            print("sync success ✅: {} -> {}".format(available_start, available_end))
+            print("sync success ✅: {} -> {}".format(sync_start, sync_end))
             return
     indicator = CliActivityIndicator(
         label="正在预计算估值特征",
@@ -568,7 +755,7 @@ def main(argv=None):
     )
     indicator.start()
     try:
-        scorer.precompute(start_date=args.start_date, end_date=args.end_date)
+        scorer.precompute(start_date=args.start_date, end_date=args.end_date, progress=indicator)
         indicator.update("正在生成评分报告")
         score_result = scorer.score_latest(date=args.date)
     finally:
@@ -592,6 +779,48 @@ def _should_show_cli_ui(args, stream=None):
     return bool(getattr(target, "isatty", lambda: False)())
 
 
+def _build_end_date_warning(requested_end_date, actual_end_date):
+    requested_end_date = _normalize_cli_date(requested_end_date)
+    actual_end_date = _normalize_cli_date(actual_end_date)
+    if requested_end_date is None or actual_end_date is None:
+        return None
+    if requested_end_date == actual_end_date:
+        return None
+    reason = _describe_end_date_roll_back_reason(requested_end_date, actual_end_date)
+    if reason:
+        return "请求的 end-date={}，实际计算日期={}（原因：{}）".format(
+            requested_end_date,
+            actual_end_date,
+            reason,
+        )
+    return "请求的 end-date={}，实际计算日期={}".format(requested_end_date, actual_end_date)
+
+
+def _normalize_cli_date(date_value):
+    if date_value in (None, ""):
+        return None
+    return pd.Timestamp(date_value).strftime("%Y-%m-%d")
+
+
+def _describe_end_date_roll_back_reason(requested_end_date, actual_end_date):
+    requested_ts = pd.Timestamp(requested_end_date).normalize()
+    actual_ts = pd.Timestamp(actual_end_date).normalize()
+    if requested_ts <= actual_ts:
+        return ""
+
+    closure_days = pd.date_range(actual_ts + pd.Timedelta(days=1), requested_ts, freq="D")
+    if len(closure_days) == 0:
+        return ""
+
+    weekend_days = sum(1 for day in closure_days if day.weekday() >= 5)
+    holiday_days = len(closure_days) - weekend_days
+    if holiday_days == 0:
+        return "该日期落在周末休市，已回退到最近交易日"
+    if weekend_days == 0:
+        return "该日期处于节假日休市区间，已回退到最近交易日"
+    return "该日期处于周末和节假日连休区间，已回退到最近交易日"
+
+
 class CliActivityIndicator(object):
     def __init__(self, label, stream=None, enabled=True):
         self.stream = stream or sys.stderr
@@ -603,12 +832,20 @@ class CliActivityIndicator(object):
         self._spinner_thread = None
         self._spinner_stop = None
         self._lock = threading.Lock()
+        self._stage_started_at = None
+        self._progress_current = None
+        self._progress_total = None
+        self._progress_detail = None
 
     def start(self):
         if not self.enabled:
             return self
         with self._lock:
             self._spinner_index = 0
+            self._stage_started_at = time.time()
+            self._progress_current = None
+            self._progress_total = None
+            self._progress_detail = None
         self._render_current()
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -628,6 +865,19 @@ class CliActivityIndicator(object):
             return
         with self._lock:
             self.label = label
+            self._stage_started_at = time.time()
+            self._progress_current = None
+            self._progress_total = None
+            self._progress_detail = None
+        self._render_current()
+
+    def update_progress(self, current=None, total=None, detail=None):
+        if not self.enabled or current is None or total in (None, 0):
+            return
+        with self._lock:
+            self._progress_current = int(current)
+            self._progress_total = int(total)
+            self._progress_detail = detail
         self._render_current()
 
     def stop(self):
@@ -666,6 +916,15 @@ class CliActivityIndicator(object):
         with self._lock:
             frame = HEARTBEAT_FRAMES[self._spinner_index % len(HEARTBEAT_FRAMES)]
             line = "{} {}".format(frame, self._style(self.label, "run"))
+            if self._progress_total not in (None, 0) and self._progress_current is not None:
+                line = "{} {}".format(
+                    line,
+                    self._progress_bar(
+                        self._progress_current,
+                        self._progress_total,
+                        detail=self._progress_detail,
+                    ),
+                )
             visible_width = _display_width(line)
             padded = line
             if visible_width < self._last_width:
@@ -677,9 +936,47 @@ class CliActivityIndicator(object):
 
     @staticmethod
     def _style(text, kind):
-        if kind != "run" or not text:
+        if not text:
             return text
-        return "\033[1;36m{}\033[0m".format(text)
+        if kind == "run":
+            return "\033[1;36m{}\033[0m".format(text)
+        if kind == "bar_fill":
+            return "\033[1;36m{}\033[0m".format(text)
+        if kind == "bar_empty":
+            return "\033[2;37m{}\033[0m".format(text)
+        if kind == "detail":
+            return "\033[2;37m{}\033[0m".format(text)
+        return text
+
+    def _progress_bar(self, current, total, detail=None):
+        width = 18
+        ratio = max(0.0, min(float(current) / float(total), 1.0))
+        filled = int(round(width * ratio))
+        percent = "{:>5.1f}%".format(ratio * 100.0)
+        filled_bar = self._style("█" * filled, "bar_fill")
+        empty_bar = self._style("░" * (width - filled), "bar_empty")
+        message = "{}{} {}/{} {}".format(filled_bar, empty_bar, current, total, percent)
+        elapsed = 0.0 if self._stage_started_at is None else max(time.time() - self._stage_started_at, 0.0)
+        if current > 0 and elapsed >= 0.5:
+            rate = current / elapsed
+            eta = (total - current) / rate if rate > 0 else None
+            if eta is not None:
+                message = "{} | 预计剩余 {}".format(message, self._format_duration(eta))
+        if detail:
+            message = "{} | {}".format(message, self._style(detail, "detail"))
+        return message
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(int(round(seconds)), 0)
+        if seconds >= 3600:
+            hours, remainder = divmod(seconds, 3600)
+            minutes = remainder // 60
+            return "{}h{:02d}m".format(hours, minutes)
+        if seconds >= 60:
+            minutes, remainder = divmod(seconds, 60)
+            return "{}m{:02d}s".format(minutes, remainder)
+        return "{:.1f}s".format(float(seconds))
 
 
 class SyncProgressReporter(object):
@@ -706,10 +1003,12 @@ class SyncProgressReporter(object):
         self._spinner_stop = None
         self._lock = threading.Lock()
 
-    def banner(self, title, start_date, end_date, db_path):
+    def banner(self, title, start_date, end_date, db_path, end_date_warning=None):
         self._emit_line(self._style(title, "header"))
         self._emit_line("  range : {} -> {}".format(start_date, end_date))
         self._emit_line("  cache : {}".format(db_path))
+        if end_date_warning:
+            self._emit_line(self._style("  warn  : {}".format(end_date_warning), "warn"))
         self._emit_line("")
 
     def start(self, total_steps):
@@ -852,6 +1151,7 @@ class SyncProgressReporter(object):
             "spinner": "\033[1;35m",
             "run": "\033[1;36m",
             "done": "\033[1;32m",
+            "warn": "\033[1;33m",
             "skip": "\033[1;33m",
             "fail": "\033[1;31m",
             "bar_fill": "\033[32m",

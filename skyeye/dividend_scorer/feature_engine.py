@@ -88,7 +88,7 @@ class FeatureEngine(object):
         raw["rsi_20"] = self._compute_rsi(close, period=20)
         raw["premium_rate"] = premium_rate
         raw["premium_rate_ma20"] = premium_rate.rolling(window=20, min_periods=5).mean()
-        daily_returns = close_hfq.pct_change()
+        daily_returns = close_hfq.pct_change(fill_method=None)
         raw["volatility_percentile"] = daily_returns.rolling(window=20, min_periods=5).std() * np.sqrt(252.0)
         raw["volume_ratio"] = volume / volume.rolling(window=20, min_periods=5).mean()
         return raw

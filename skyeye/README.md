@@ -10,9 +10,3 @@
 - 自研 mod 主实现：`skyeye/mod/rqalpha_mod_dividend_scorer/`
 - 文档主目录：`skyeye/docs/`
 - 实验图表主目录：`skyeye/experiments/`
-
-当前状态：
-
-- 旧兼容壳和旧自研入口已从活动路径删除
-- 后续自研迭代只在 `skyeye/` 下进行
-- 后续自研迭代、文档、验证与运行全部以 `skyeye/` 为准

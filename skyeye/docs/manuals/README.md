@@ -28,12 +28,12 @@ uv run rqalpha download-bundle
 
 ```bash
 uv run python -m skyeye.dividend_scorer.main \
-  --sync \
   --sync-only \
   --end-date "$(date +%F)"
 ```
 
-首次同步时间通常最长，后续会命中 SQLite 缓存。
+这条命令只做同步，不输出评分。
+首次同步会从 `2020-01-01` 全量建库；后续默认按“上次成功日期往前回溯 10 个交易日 -> 今天”做增量同步。
 
 ## 4. 直接看最新评分
 
@@ -41,6 +41,7 @@ uv run python -m skyeye.dividend_scorer.main \
 uv run python -m skyeye.dividend_scorer.main --json
 ```
 
+默认命令会先自动检查今天这一天是否需要同步；如果缓存已覆盖，请求会直接 `skip`，然后输出当前最新可用日期的评分。
 这一步先确认评分本身能正常算出来，再进入策略和回测。
 
 ## 5. 跑一遍示例策略

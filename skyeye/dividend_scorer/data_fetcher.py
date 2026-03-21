@@ -17,6 +17,7 @@ from urllib3.exceptions import HTTPError as Urllib3HTTPError
 from rqalpha.data.data_proxy import DataProxy
 from rqalpha.data.base_data_source.data_source import BaseDataSource
 from rqalpha.utils import RqAttrDict
+from rqalpha.utils.datetime_func import convert_int_to_date
 
 from skyeye.dividend_scorer.config import (
     API_CALL_INTERVAL,
@@ -26,6 +27,8 @@ from skyeye.dividend_scorer.config import (
     DATA_GAP_THRESHOLD,
     ETF_CODE,
     INDEX_CODE,
+    SYNC_DEFAULT_START_DATE,
+    SYNC_OVERLAP_TRADING_DAYS,
 )
 
 AKSHARE_MAX_RETRIES = 3
@@ -39,6 +42,21 @@ AKSHARE_RETRIABLE_EXCEPTIONS = (
 SQLITE_CONNECT_TIMEOUT = 30
 SQLITE_BUSY_TIMEOUT_MS = 30000
 SQLITE_INIT_RETRIES = 3
+SYNC_SOURCE_NAMES = (
+    "index_daily",
+    "etf_daily",
+    "etf_nav",
+    "bond_yield",
+    "index_weight",
+    "stock_indicator",
+)
+TRADING_DAY_SYNC_SOURCE_NAMES = (
+    "index_daily",
+    "etf_daily",
+    "etf_nav",
+    "bond_yield",
+    "stock_indicator",
+)
 
 
 CREATE_TABLE_SQL = (
@@ -241,79 +259,85 @@ class DataFetcher(object):
         self._bundle_proxy = None
         self._init_db()
 
-    def sync_all(self, start_date, end_date, progress=None):
+    def sync_all(self, start_date=None, end_date=None, progress=None):
         ak = self._require_akshare()
-        start_date = self._normalize_date(start_date)
-        end_date = self._normalize_date(end_date)
+        start_date = self._normalize_date(start_date) if start_date is not None else None
+        end_date = self._normalize_date(end_date or datetime.now().date())
         progress = progress or NullSyncProgress()
         progress.start(total_steps=6)
         try:
             with self._connect() as conn:
+                index_start, index_end = self._resolve_source_sync_range(conn, "index_daily", start_date, end_date)
                 self._run_sync_stage(
                     conn=conn,
                     progress=progress,
                     source_name="index_daily",
                     label="指数估值",
-                    start_date=start_date,
-                    end_date=end_date,
-                    runner=lambda: self._sync_index_daily(conn, ak, start_date, end_date),
+                    start_date=index_start,
+                    end_date=index_end,
+                    runner=lambda: self._sync_index_daily(conn, ak, index_start, index_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "index_daily", rows),
                 )
 
+                etf_daily_start, etf_daily_end = self._resolve_source_sync_range(conn, "etf_daily", start_date, end_date)
                 self._run_sync_stage(
                     conn=conn,
                     progress=progress,
                     source_name="etf_daily",
                     label="ETF行情",
-                    start_date=start_date,
-                    end_date=end_date,
-                    runner=lambda: self._sync_etf_daily(conn, ak, start_date, end_date),
+                    start_date=etf_daily_start,
+                    end_date=etf_daily_end,
+                    runner=lambda: self._sync_etf_daily(conn, ak, etf_daily_start, etf_daily_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "etf_daily", rows),
                 )
 
+                etf_nav_start, etf_nav_end = self._resolve_source_sync_range(conn, "etf_nav", start_date, end_date)
                 self._run_sync_stage(
                     conn=conn,
                     progress=progress,
                     source_name="etf_nav",
                     label="ETF净值",
-                    start_date=start_date,
-                    end_date=end_date,
-                    runner=lambda: self._sync_etf_nav(conn, ak, start_date, end_date),
+                    start_date=etf_nav_start,
+                    end_date=etf_nav_end,
+                    runner=lambda: self._sync_etf_nav(conn, ak, etf_nav_start, etf_nav_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "etf_nav", rows),
                 )
 
+                bond_start, bond_end = self._resolve_source_sync_range(conn, "bond_yield", start_date, end_date)
                 self._run_sync_stage(
                     conn=conn,
                     progress=progress,
                     source_name="bond_yield",
                     label="国债利率",
-                    start_date=start_date,
-                    end_date=end_date,
-                    runner=lambda: self._sync_bond_yield(conn, ak, start_date, end_date),
+                    start_date=bond_start,
+                    end_date=bond_end,
+                    runner=lambda: self._sync_bond_yield(conn, ak, bond_start, bond_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "bond_yield", rows),
                 )
 
+                weight_start, weight_end = self._resolve_source_sync_range(conn, "index_weight", start_date, end_date)
                 stock_codes = self._run_sync_stage(
                     conn=conn,
                     progress=progress,
                     source_name="index_weight",
                     label="指数权重",
-                    start_date=start_date,
-                    end_date=end_date,
+                    start_date=weight_start,
+                    end_date=weight_end,
                     runner=lambda: self._sync_index_weights(conn, ak),
                     detail_formatter=lambda codes: self._format_done_detail(conn, "index_weight", len(codes)),
                     skip_value_factory=lambda: self._load_cached_stock_codes(conn),
                 )
 
+                stock_start, stock_end = self._resolve_source_sync_range(conn, "stock_indicator", start_date, end_date)
                 self._run_sync_stage(
                     conn=conn,
                     progress=progress,
                     source_name="stock_indicator",
                     label="成分股指标",
-                    start_date=start_date,
-                    end_date=end_date,
+                    start_date=stock_start,
+                    end_date=stock_end,
                     runner=lambda: self._sync_stock_indicators(
-                        conn, ak, stock_codes, start_date, end_date,
+                        conn, ak, stock_codes, stock_start, stock_end,
                         name_map=self._load_stock_name_map(conn),
                         progress=progress,
                     ),
@@ -463,6 +487,17 @@ class DataFetcher(object):
             raise RuntimeError("etf_daily cache is empty, run sync_all first")
         return row["min_date"], row["max_date"]
 
+    def suggest_sync_range(self, start_date=None, end_date=None):
+        end_date = self._latest_trading_day_on_or_before(end_date or datetime.now().date())
+        if start_date is not None:
+            return self._normalize_date(start_date), end_date
+        with self._connect() as conn:
+            source_starts = [
+                self._resolve_source_sync_range(conn, source_name, None, end_date)[0]
+                for source_name in SYNC_SOURCE_NAMES
+            ]
+        return min(source_starts) if source_starts else SYNC_DEFAULT_START_DATE, end_date
+
     @staticmethod
     def validate_trading_day_coverage(df, start_date, end_date, gap_threshold=DATA_GAP_THRESHOLD, data_proxy=None):
         if df.empty:
@@ -504,6 +539,65 @@ class DataFetcher(object):
         conn.execute("PRAGMA busy_timeout = {}".format(SQLITE_BUSY_TIMEOUT_MS))
         return conn
 
+    def _resolve_source_sync_range(self, conn, source_name, start_date, end_date):
+        end_date = self._resolve_source_sync_end_date(source_name, end_date or datetime.now().date())
+        if start_date is not None:
+            return self._normalize_date(start_date), end_date
+        if not self._has_cached_source_data(conn, source_name):
+            return SYNC_DEFAULT_START_DATE, end_date
+        actual_start, actual_end = self._derive_source_coverage_range(conn, source_name, None, None)
+        checkpoint = self._read_sync_checkpoint(conn, source_name)
+        coverage_end = actual_end
+        if coverage_end is None and checkpoint is not None:
+            coverage_end = checkpoint.get("sync_end_date")
+        if coverage_end is None:
+            return SYNC_DEFAULT_START_DATE, end_date
+        overlap_start = self._shift_trading_days(coverage_end, -SYNC_OVERLAP_TRADING_DAYS)
+        return max(overlap_start, SYNC_DEFAULT_START_DATE), end_date
+
+    def _resolve_source_sync_end_date(self, source_name, end_date):
+        end_date = self._normalize_date(end_date)
+        if source_name not in TRADING_DAY_SYNC_SOURCE_NAMES:
+            return end_date
+        return self._latest_trading_day_on_or_before(end_date)
+
+    def _latest_trading_day_on_or_before(self, date_value):
+        end_ts = pd.Timestamp(self._normalize_date(date_value))
+        data_proxy = self.data_proxy or self._bundle_data_proxy()
+        window_start = end_ts - pd.Timedelta(days=32)
+        trading_dates = self._get_trading_dates(window_start, end_ts, data_proxy=data_proxy)
+        if len(trading_dates) == 0:
+            if end_ts.weekday() >= 5:
+                return pd.Timestamp(end_ts + pd.tseries.offsets.BDay(-1)).strftime("%Y-%m-%d")
+            return end_ts.strftime("%Y-%m-%d")
+        return pd.Timestamp(trading_dates[-1]).strftime("%Y-%m-%d")
+
+    def _shift_trading_days(self, date_value, offset):
+        base = pd.Timestamp(self._normalize_date(date_value))
+        if offset == 0:
+            return base.strftime("%Y-%m-%d")
+
+        data_proxy = self.data_proxy or self._bundle_data_proxy()
+        if data_proxy is not None:
+            lookback_days = max(abs(offset) * 5, 30)
+            if offset < 0:
+                window_start = base - pd.Timedelta(days=lookback_days)
+                trading_dates = self._get_trading_dates(window_start, base, data_proxy=data_proxy)
+                if len(trading_dates) > abs(offset):
+                    return pd.Timestamp(trading_dates[-(abs(offset) + 1)]).strftime("%Y-%m-%d")
+                if len(trading_dates) > 0:
+                    return pd.Timestamp(trading_dates[0]).strftime("%Y-%m-%d")
+            else:
+                window_end = base + pd.Timedelta(days=lookback_days)
+                trading_dates = self._get_trading_dates(base, window_end, data_proxy=data_proxy)
+                if len(trading_dates) > offset:
+                    return pd.Timestamp(trading_dates[offset]).strftime("%Y-%m-%d")
+                if len(trading_dates) > 0:
+                    return pd.Timestamp(trading_dates[-1]).strftime("%Y-%m-%d")
+
+        shifted = base + pd.tseries.offsets.BDay(offset)
+        return pd.Timestamp(shifted).strftime("%Y-%m-%d")
+
     def _init_db(self):
         db_dir = os.path.dirname(self.db_path)
         if db_dir and not os.path.exists(db_dir):
@@ -540,7 +634,14 @@ class DataFetcher(object):
 
     def _sync_index_daily(self, conn, ak, start_date, end_date):
         inserted_rows = 0
-        df = self._call_akshare(ak.stock_zh_index_hist_csindex, symbol=self.index_code)
+        range_start = self._normalize_date(start_date).replace("-", "")
+        range_end = self._normalize_date(end_date).replace("-", "")
+        df = self._call_akshare(
+            ak.stock_zh_index_hist_csindex,
+            symbol=self.index_code,
+            start_date=range_start,
+            end_date=range_end,
+        )
         if df is None or df.empty:
             df = pd.DataFrame()
         df = self._filter_date_range(df, start_date, end_date)
@@ -592,9 +693,40 @@ class DataFetcher(object):
         return inserted_rows
 
     def _sync_etf_daily(self, conn, ak, start_date, end_date):
-        raw_df = self._fetch_etf_history(ak, adjust="")
-        hfq_df = self._fetch_etf_history(ak, adjust="hfq")
+        target_end = self._resolve_source_sync_end_date("etf_daily", end_date)
+        raw_df = pd.DataFrame()
+        hfq_df = pd.DataFrame()
+        primary_error = None
+        try:
+            raw_df = self._fetch_etf_history(ak, adjust="", start_date=start_date, end_date=end_date)
+            hfq_df = self._fetch_etf_history(ak, adjust="hfq", start_date=start_date, end_date=end_date)
+        except RuntimeError as exc:
+            primary_error = exc
+        raw_df = self._filter_date_range(raw_df, start_date, end_date)
+        hfq_df = self._filter_date_range(hfq_df, start_date, end_date) if hfq_df is not None else pd.DataFrame()
+
+        raw_latest = self._frame_latest_date(raw_df)
+        hfq_latest = self._frame_latest_date(hfq_df)
+
+        if raw_latest is None or raw_latest < target_end:
+            raw_df = self._merge_etf_history_frames(
+                raw_df,
+                self._fetch_etf_history_sina(ak, start_date=start_date, end_date=end_date),
+            )
+            raw_latest = self._frame_latest_date(raw_df)
+
+        if raw_latest is None or raw_latest < target_end or hfq_latest is None:
+            bundle_raw, bundle_hfq = self._load_etf_history_from_bundle(start_date, end_date)
+            if raw_latest is None or raw_latest < target_end:
+                raw_df = self._merge_etf_history_frames(raw_df, bundle_raw)
+                raw_latest = self._frame_latest_date(raw_df)
+            hfq_df = self._merge_etf_history_frames(hfq_df, bundle_hfq)
+
         if raw_df is None or raw_df.empty:
+            if primary_error is not None:
+                raise RuntimeError(
+                    "ETF daily sync failed from AKShare, and no fallback history is available: {}".format(primary_error)
+                ) from primary_error
             return 0
         raw_df = self._filter_date_range(raw_df, start_date, end_date)
         if raw_df.empty:
@@ -630,8 +762,64 @@ class DataFetcher(object):
         self._update_meta(conn, "etf_daily", "etf_daily", self.etf_code)
         return len(rows)
 
+    def _fetch_etf_history_sina(self, ak, start_date=None, end_date=None):
+        func = getattr(ak, "fund_etf_hist_sina", None)
+        if func is None:
+            return pd.DataFrame()
+        for symbol in self._candidate_etf_sina_symbols():
+            try:
+                df = self._call_akshare(func, symbol=symbol)
+            except RuntimeError:
+                continue
+            df = self._filter_date_range(df, start_date, end_date)
+            if df is not None and not df.empty:
+                return df
+        return pd.DataFrame()
+
+    def _load_etf_history_from_bundle(self, start_date, end_date):
+        data_proxy = self.data_proxy or self._bundle_data_proxy()
+        if data_proxy is None:
+            return pd.DataFrame(), pd.DataFrame()
+
+        order_book_id = self._resolve_etf_order_book_id(data_proxy)
+        if order_book_id is None:
+            return pd.DataFrame(), pd.DataFrame()
+
+        end_dt = pd.Timestamp(end_date).to_pydatetime()
+        raw_bars = data_proxy.history_bars(
+            order_book_id,
+            None,
+            "1d",
+            ["datetime", "open", "high", "low", "close", "volume", "total_turnover"],
+            end_dt,
+            skip_suspended=False,
+            include_now=True,
+            adjust_type="none",
+        )
+        hfq_bars = data_proxy.history_bars(
+            order_book_id,
+            None,
+            "1d",
+            ["datetime", "close"],
+            end_dt,
+            skip_suspended=False,
+            include_now=True,
+            adjust_type="post",
+        )
+
+        raw_df = self._bars_to_etf_daily_frame(raw_bars, start_date, end_date)
+        hfq_df = self._bars_to_hfq_close_frame(hfq_bars, start_date, end_date)
+        return raw_df, hfq_df
+
     def _sync_etf_nav(self, conn, ak, start_date, end_date, progress=None):
-        df = self._call_akshare(ak.fund_etf_fund_info_em, fund=self.etf_code)
+        range_start = self._normalize_date(start_date).replace("-", "")
+        range_end = self._normalize_date(end_date).replace("-", "")
+        df = self._call_akshare(
+            ak.fund_etf_fund_info_em,
+            fund=self.etf_code,
+            start_date=range_start,
+            end_date=range_end,
+        )
         if df is None or df.empty:
             return 0
         df = self._filter_date_range(df, start_date, end_date)
@@ -963,19 +1151,107 @@ class DataFetcher(object):
             (source_name, row["last_update_date"], now, row["record_count"]),
         )
 
-    def _fetch_etf_history(self, ak, adjust):
+    def _fetch_etf_history(self, ak, adjust, start_date=None, end_date=None):
+        params = {
+            "symbol": self.etf_code,
+            "start_date": self._normalize_date(start_date or SYNC_DEFAULT_START_DATE).replace("-", ""),
+            "end_date": self._normalize_date(end_date or datetime.now().date()).replace("-", ""),
+        }
         try:
-            return self._call_akshare(ak.fund_etf_hist_em, symbol=self.etf_code, adjust=adjust)
+            if adjust:
+                params["adjust"] = adjust
+            return self._call_akshare(ak.fund_etf_hist_em, **params)
         except TypeError:
             if adjust:
-                return self._call_akshare(ak.fund_etf_hist_em, symbol=self.etf_code, adjust=adjust)
-            return self._call_akshare(ak.fund_etf_hist_em, symbol=self.etf_code)
+                return self._call_akshare(
+                    ak.fund_etf_hist_em,
+                    symbol=self.etf_code,
+                    start_date=params["start_date"],
+                    end_date=params["end_date"],
+                    adjust=adjust,
+                )
+            return self._call_akshare(
+                ak.fund_etf_hist_em,
+                symbol=self.etf_code,
+                start_date=params["start_date"],
+                end_date=params["end_date"],
+            )
 
     def _fetch_index_value_csindex(self, ak):
         func = getattr(ak, "stock_zh_index_value_csindex", None)
         if func is None:
             return pd.DataFrame()
         return self._call_akshare(func, symbol=self.index_code)
+
+    def _candidate_etf_sina_symbols(self):
+        code = str(self.etf_code)
+        preferred_prefixes = []
+        data_proxy = self.data_proxy or self._bundle_data_proxy()
+        order_book_id = self._resolve_etf_order_book_id(data_proxy) if data_proxy is not None else None
+        if order_book_id and order_book_id.endswith("XSHG"):
+            preferred_prefixes = ["sh", "sz"]
+        elif order_book_id and order_book_id.endswith("XSHE"):
+            preferred_prefixes = ["sz", "sh"]
+        elif code.startswith(("5", "6", "9")):
+            preferred_prefixes = ["sh", "sz"]
+        else:
+            preferred_prefixes = ["sz", "sh"]
+        return ["{}{}".format(prefix, code) for prefix in preferred_prefixes]
+
+    def _resolve_etf_order_book_id(self, data_proxy):
+        candidates = [self.etf_code]
+        if "." not in self.etf_code:
+            candidates.extend([
+                "{}.XSHG".format(self.etf_code),
+                "{}.XSHE".format(self.etf_code),
+            ])
+        for order_book_id in candidates:
+            try:
+                instrument = data_proxy.instruments(order_book_id)
+            except Exception:
+                instrument = None
+            if instrument is not None:
+                return order_book_id
+        return None
+
+    @classmethod
+    def _bars_to_etf_daily_frame(cls, bars, start_date, end_date):
+        if bars is None or len(bars) == 0:
+            return pd.DataFrame()
+        df = pd.DataFrame(bars)
+        if df.empty or "datetime" not in df.columns:
+            return pd.DataFrame()
+        df["date"] = [
+            convert_int_to_date(int(value)).strftime("%Y-%m-%d")
+            for value in df["datetime"]
+        ]
+        renamed = df.rename(
+            columns={
+                "open": "开盘",
+                "high": "最高",
+                "low": "最低",
+                "close": "收盘",
+                "volume": "成交量",
+                "total_turnover": "成交额",
+                "turnover_rate": "换手率",
+            }
+        )
+        columns = [col for col in ("date", "开盘", "最高", "最低", "收盘", "成交量", "成交额", "换手率") if col in renamed.columns]
+        return cls._filter_date_range(renamed.loc[:, columns], start_date, end_date)
+
+    @classmethod
+    def _bars_to_hfq_close_frame(cls, bars, start_date, end_date):
+        if bars is None or len(bars) == 0:
+            return pd.DataFrame()
+        df = pd.DataFrame(bars)
+        if df.empty or "datetime" not in df.columns or "close" not in df.columns:
+            return pd.DataFrame()
+        df["date"] = [
+            convert_int_to_date(int(value)).strftime("%Y-%m-%d")
+            for value in df["datetime"]
+        ]
+        renamed = df.rename(columns={"close": "收盘"})
+        return cls._filter_date_range(renamed.loc[:, ["date", "收盘"]], start_date, end_date)
 
     def _bundle_data_proxy(self):
         if self._bundle_proxy is not None:
@@ -1052,6 +1328,46 @@ class DataFetcher(object):
         mask = (normalized_dates >= pd.Timestamp(start_date)) & (normalized_dates <= pd.Timestamp(end_date))
         return df.loc[mask].copy()
 
+    @classmethod
+    def _frame_latest_date(cls, df):
+        if df is None or df.empty:
+            return None
+        date_col = cls._find_column(df, ("date", "日期", "trade_date", "净值日期", "调整日期"))
+        if date_col is None:
+            return None
+        normalized_dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
+        if normalized_dates.empty:
+            return None
+        return normalized_dates.max().strftime("%Y-%m-%d")
+
+    @classmethod
+    def _merge_etf_history_frames(cls, *frames):
+        merged_frames = []
+        seen_dates = set()
+        for frame in frames:
+            if frame is None or frame.empty:
+                continue
+            current = frame.copy()
+            date_col = cls._find_column(current, ("date", "日期", "trade_date", "净值日期", "调整日期"))
+            if date_col is None:
+                continue
+            current["_merge_date"] = pd.to_datetime(current[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+            current = current.dropna(subset=["_merge_date"])
+            if current.empty:
+                continue
+            current = current.sort_values("_merge_date").drop_duplicates(subset=["_merge_date"], keep="last")
+            if seen_dates:
+                current = current[~current["_merge_date"].isin(seen_dates)]
+            if current.empty:
+                continue
+            merged_frames.append(current)
+            seen_dates.update(current["_merge_date"].tolist())
+        if not merged_frames:
+            return pd.DataFrame()
+        merged = pd.concat(merged_frames, ignore_index=True, sort=False)
+        merged = merged.sort_values("_merge_date").drop(columns=["_merge_date"])
+        return merged.reset_index(drop=True)
+
     @staticmethod
     def _maybe_float(value):
         if value is None:
@@ -1110,6 +1426,24 @@ class DataFetcher(object):
         return row is not None
 
     def _checkpoint_covers_range(self, conn, source_name, start_date, end_date):
+        row = self._read_sync_checkpoint(conn, source_name)
+        if row is None or row["sync_start_date"] is None or row["sync_end_date"] is None:
+            return False
+        if not (row["sync_start_date"] <= start_date and row["sync_end_date"] >= end_date):
+            return False
+        actual_start, actual_end = self._derive_source_coverage_range(conn, source_name, None, None)
+        if actual_start is None or actual_end is None:
+            return False
+        return actual_start <= start_date and actual_end >= end_date
+
+    def _update_sync_checkpoint(self, conn, source_name, start_date, end_date):
+        actual_start, actual_end = self._derive_source_coverage_range(conn, source_name, start_date, end_date)
+        conn.execute(
+            UPSERT_SYNC_CHECKPOINT_SQL,
+            (source_name, actual_start, actual_end, datetime.now().isoformat()),
+        )
+
+    def _read_sync_checkpoint(self, conn, source_name):
         row = conn.execute(
             """
             SELECT sync_start_date, sync_end_date
@@ -1118,15 +1452,33 @@ class DataFetcher(object):
             """,
             (source_name,),
         ).fetchone()
-        if row is None or row["sync_start_date"] is None or row["sync_end_date"] is None:
-            return False
-        return row["sync_start_date"] <= start_date and row["sync_end_date"] >= end_date
+        return dict(row) if row is not None else None
 
-    def _update_sync_checkpoint(self, conn, source_name, start_date, end_date):
-        conn.execute(
-            UPSERT_SYNC_CHECKPOINT_SQL,
-            (source_name, start_date, end_date, datetime.now().isoformat()),
-        )
+    def _derive_source_coverage_range(self, conn, source_name, start_date, end_date):
+        query = None
+        params = ()
+        if source_name == "index_daily":
+            query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM index_daily WHERE index_code = ?"
+            params = (self.index_code,)
+        elif source_name == "etf_daily":
+            query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM etf_daily WHERE etf_code = ?"
+            params = (self.etf_code,)
+        elif source_name == "etf_nav":
+            query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM etf_nav WHERE etf_code = ?"
+            params = (self.etf_code,)
+        elif source_name == "bond_yield":
+            query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM bond_yield"
+        elif source_name == "stock_indicator":
+            query = "SELECT MIN(date) AS min_date, MAX(date) AS max_date FROM stock_indicator"
+        elif source_name == "index_weight":
+            query = "SELECT MIN(snapshot_date) AS min_date, MAX(snapshot_date) AS max_date FROM index_weight WHERE index_code = ?"
+            params = (self.index_code,)
+        if query is None:
+            return start_date, end_date
+        row = conn.execute(query, params).fetchone()
+        if row is None or row["min_date"] is None or row["max_date"] is None:
+            return None, None
+        return row["min_date"], row["max_date"]
 
     def _load_cached_stock_codes(self, conn):
         rows = conn.execute(

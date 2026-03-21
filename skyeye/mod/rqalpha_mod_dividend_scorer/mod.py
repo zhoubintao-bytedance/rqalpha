@@ -49,8 +49,7 @@ class DividendScorerMod(AbstractMod):
             self._reset_score_store()
 
     def _bootstrap(self, event):
-        self._scorer.data_fetcher.data_proxy = self._env.data_proxy
-        self._scorer.precompute(env=self._env)
+        self._scorer.prepare(env=self._env, auto_sync=True, sync_progress=None)
         self._reset_score_store()
 
     def _bind_context(self, event):

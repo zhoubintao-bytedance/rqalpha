@@ -4,6 +4,7 @@ from collections import OrderedDict
 import io
 import sqlite3
 from types import SimpleNamespace
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -66,6 +67,18 @@ def test_feature_engine_precompute_inverts_dividend_features():
         dividend_snapshot["price_percentile"]["normalized"],
         dividend_snapshot["price_percentile"]["percentile"],
     )
+
+
+def test_feature_engine_precompute_does_not_emit_pct_change_future_warning():
+    history_df = make_history_df()
+    history_df.loc[history_df.index[10], "etf_close_hfq"] = np.nan
+    engine = FeatureEngine()
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        engine.precompute(history_df)
+
+    assert not any("pct_change" in str(item.message) for item in caught)
 
 
 def test_weight_calculator_falls_back_to_domain_weights_when_signal_is_invalid():
@@ -261,6 +274,8 @@ def test_format_score_report_displays_chinese_feature_names():
     assert "msg" in report
     assert "当前评分 6.32/10" in report
     assert "处于历史中高位" in report
+    assert "单日分位仅反映当前位置" in report
+    assert "直接开平仓信号" in report
     assert "│ 指标" in report
     assert "│ 指标英文" in report
     assert "│ 原始值" in report
@@ -272,6 +287,45 @@ def test_format_score_report_displays_chinese_feature_names():
     assert "dividend_yield_pct" in report
     assert "20日平均溢价率" in report
     assert "premium_rate_ma20" in report
+
+
+def test_format_score_report_wraps_long_msg_inside_summary_box(monkeypatch):
+    monkeypatch.setattr(
+        "skyeye.dividend_scorer.main.shutil.get_terminal_size",
+        lambda fallback=(100, 20): SimpleNamespace(columns=72),
+    )
+
+    report = format_score_report(
+        {
+            "etf": "512890",
+            "date": "2026-03-19",
+            "total_score": 5.79,
+            "score_percentile": 0.406,
+            "score_percentile_window": 504,
+            "score_percentile_sample_size": 504,
+            "buy_percentile_threshold": 0.2,
+            "sell_percentile_threshold": 0.8,
+            "confidence": "normal",
+            "model_meta": {"method": "fixed_domain_prior"},
+            "features": OrderedDict(),
+            "confidence_modifiers": OrderedDict(),
+            "warnings": [],
+        }
+    )
+
+    lines = report.splitlines()
+    msg_line_index = next(idx for idx, line in enumerate(lines) if "│ msg" in line)
+    msg_block = []
+    for line in lines[msg_line_index:]:
+        if line.startswith("└"):
+            break
+        msg_block.append(line)
+
+    assert len(msg_block) >= 3
+    assert "单日分位仅反映当前位置" not in msg_block[0]
+    assert any("单日分位仅反映当前位置" in line for line in msg_block[1:])
+    assert any("直接开平仓信号" in line for line in msg_block[1:])
+    assert any(line.startswith("│           ") for line in msg_block[1:])
 
 
 def test_sync_banner_prints_logo_before_title(tmp_path, monkeypatch):
@@ -293,18 +347,42 @@ def test_sync_banner_prints_logo_before_title(tmp_path, monkeypatch):
     assert "红利低波打分器缓存同步" in output
 
 
+def test_sync_banner_prints_red_end_date_warning_when_dates_mismatch():
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return True
+
+    stream = FakeStream()
+    reporter = SyncProgressReporter(stream=stream)
+    reporter.banner(
+        title="红利低波打分器缓存同步",
+        start_date="2026-02-05",
+        end_date="2026-02-13",
+        db_path="/tmp/cache.db",
+        end_date_warning="请求的 end-date=2026-02-19，实际计算日期=2026-02-13（原因：该日期处于周末和节假日连休区间，已回退到最近交易日）",
+    )
+
+    output = stream.getvalue()
+    assert "\033[1;33m" in output
+    assert "请求的 end-date=2026-02-19，实际计算日期=2026-02-13" in output
+    assert "原因：该日期处于周末和节假日连休区间，已回退到最近交易日" in output
+
+
 def test_main_sync_only_implies_sync(monkeypatch):
     calls = []
 
     class FakeScorer(object):
-        def __init__(self, db_path=None, bundle_path=None):
+        def __init__(self, db_path=None, bundle_path=None, prior_blend=None):
             self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def _resolve_sync_range(self, start_date=None, end_date=None):
+            return ("2020-01-01", end_date or "2026-03-20")
 
         def sync_all(self, start_date, end_date, progress=None):
             calls.append(("sync_all", start_date, end_date, progress is not None))
 
-        def precompute(self, start_date=None, end_date=None):
-            calls.append(("precompute", start_date, end_date))
+        def precompute(self, start_date=None, end_date=None, progress=None):
+            calls.append(("precompute", start_date, end_date, progress is not None))
 
         def score_latest(self, date=None):
             calls.append(("score_latest", date))
@@ -330,15 +408,126 @@ def test_main_sync_only_implies_sync(monkeypatch):
     assert "sync success ✅" in stdout.getvalue()
 
 
+def test_main_defaults_to_auto_sync_before_scoring(monkeypatch):
+    calls = []
+
+    class FakeScorer(object):
+        def __init__(self, db_path=None, bundle_path=None, prior_blend=None):
+            self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def _resolve_sync_range(self, start_date=None, end_date=None):
+            return ("2020-01-01", end_date or "2026-03-20")
+
+        def sync_all(self, start_date, end_date, progress=None):
+            calls.append(("sync_all", start_date, end_date, progress is not None))
+
+        def precompute(self, start_date=None, end_date=None, progress=None):
+            calls.append(("precompute", start_date, end_date, progress is not None))
+
+        def score_latest(self, date=None):
+            calls.append(("score_latest", date))
+            return {
+                "etf": "512890",
+                "date": "2026-03-19",
+                "total_score": 6.32,
+                "score_percentile": 0.709,
+                "score_percentile_window": 504,
+                "score_percentile_sample_size": 504,
+                "buy_percentile_threshold": 0.2,
+                "sell_percentile_threshold": 0.8,
+                "confidence": "lowered",
+                "model_meta": {"method": "fixed_domain_prior"},
+                "features": OrderedDict(),
+                "confidence_modifiers": OrderedDict(),
+                "warnings": [],
+            }
+
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return False
+
+    stdout = io.StringIO()
+    stderr = FakeStream()
+    monkeypatch.setattr("skyeye.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    dividend_main([])
+
+    assert calls[0][0] == "sync_all"
+    assert calls[0][1] == "2020-01-01"
+    assert calls[1][0] == "precompute"
+    assert calls[2][0] == "score_latest"
+    assert "红利低波打分器结论" in stdout.getvalue()
+
+
+def test_main_no_sync_uses_local_cache_only(monkeypatch):
+    calls = []
+
+    class FakeScorer(object):
+        def __init__(self, db_path=None, bundle_path=None, prior_blend=None):
+            self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def _resolve_sync_range(self, start_date=None, end_date=None):
+            return ("2020-01-01", end_date or "2026-03-20")
+
+        def sync_all(self, start_date, end_date, progress=None):
+            calls.append(("sync_all", start_date, end_date, progress is not None))
+
+        def precompute(self, start_date=None, end_date=None, progress=None):
+            calls.append(("precompute", start_date, end_date, progress is not None))
+
+        def score_latest(self, date=None):
+            calls.append(("score_latest", date))
+            return {
+                "etf": "512890",
+                "date": "2026-03-19",
+                "total_score": 6.32,
+                "score_percentile": 0.709,
+                "score_percentile_window": 504,
+                "score_percentile_sample_size": 504,
+                "buy_percentile_threshold": 0.2,
+                "sell_percentile_threshold": 0.8,
+                "confidence": "lowered",
+                "model_meta": {"method": "fixed_domain_prior"},
+                "features": OrderedDict(),
+                "confidence_modifiers": OrderedDict(),
+                "warnings": [],
+            }
+
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return False
+
+    stdout = io.StringIO()
+    stderr = FakeStream()
+    monkeypatch.setattr("skyeye.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    dividend_main(["--no-sync"])
+
+    assert all(call[0] != "sync_all" for call in calls)
+    assert calls[0][0] == "precompute"
+    assert calls[1][0] == "score_latest"
+    assert "红利低波打分器结论" in stdout.getvalue()
+
+
 def test_main_scoring_prints_logo_and_runs_cli_spinner(monkeypatch):
     calls = []
 
     class FakeScorer(object):
-        def __init__(self, db_path=None, bundle_path=None):
+        def __init__(self, db_path=None, bundle_path=None, prior_blend=None):
             self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
 
-        def precompute(self, start_date=None, end_date=None):
-            calls.append(("precompute", start_date, end_date))
+        def _resolve_sync_range(self, start_date=None, end_date=None):
+            return ("2020-01-01", end_date or "2026-03-20")
+
+        def sync_all(self, start_date, end_date, progress=None):
+            calls.append(("sync_all", start_date, end_date, progress is not None))
+
+        def precompute(self, start_date=None, end_date=None, progress=None):
+            calls.append(("precompute", start_date, end_date, progress is not None))
 
         def score_latest(self, date=None):
             calls.append(("score_latest", date))
@@ -373,6 +562,9 @@ def test_main_scoring_prints_logo_and_runs_cli_spinner(monkeypatch):
         def update(self, label):
             calls.append(("indicator_update", label))
 
+        def update_progress(self, current=None, total=None, detail=None):
+            calls.append(("indicator_progress", current, total, detail))
+
         def stop(self):
             calls.append(("indicator_stop",))
 
@@ -390,11 +582,151 @@ def test_main_scoring_prints_logo_and_runs_cli_spinner(monkeypatch):
     dividend_main([])
 
     assert ("logo", True) in calls
+    assert any(call[0] == "sync_all" for call in calls)
     assert ("indicator_init", "正在预计算估值特征", True) in calls
     assert ("indicator_start",) in calls
     assert ("indicator_update", "正在生成评分报告") in calls
     assert ("indicator_stop",) in calls
     assert "红利低波打分器结论" in stdout.getvalue()
+
+
+def test_main_banner_warns_when_requested_end_date_is_clipped(monkeypatch):
+    calls = []
+
+    class FakeScorer(object):
+        def __init__(self, db_path=None, bundle_path=None, prior_blend=None):
+            self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def _resolve_sync_range(self, start_date=None, end_date=None):
+            calls.append(("resolve_sync_range", start_date, end_date))
+            return ("2026-02-05", "2026-02-13")
+
+        def sync_all(self, start_date, end_date, progress=None):
+            calls.append(("sync_all", start_date, end_date, progress is not None))
+
+        def precompute(self, start_date=None, end_date=None, progress=None):
+            calls.append(("precompute", start_date, end_date, progress is not None))
+
+        def score_latest(self, date=None):
+            calls.append(("score_latest", date))
+            return {
+                "etf": "512890",
+                "date": "2026-02-13",
+                "total_score": 6.32,
+                "score_percentile": 0.709,
+                "score_percentile_window": 504,
+                "score_percentile_sample_size": 504,
+                "buy_percentile_threshold": 0.2,
+                "sell_percentile_threshold": 0.8,
+                "confidence": "lowered",
+                "model_meta": {"method": "fixed_domain_prior"},
+                "features": OrderedDict(),
+                "confidence_modifiers": OrderedDict(),
+                "warnings": [],
+            }
+
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return True
+
+    class FakeIndicator(object):
+        def __init__(self, label, stream=None, enabled=True):
+            calls.append(("indicator_init", label, enabled))
+
+        def start(self):
+            calls.append(("indicator_start",))
+            return self
+
+        def update(self, label):
+            calls.append(("indicator_update", label))
+
+        def update_progress(self, current=None, total=None, detail=None):
+            calls.append(("indicator_progress", current, total, detail))
+
+        def stop(self):
+            calls.append(("indicator_stop",))
+
+    stdout = io.StringIO()
+    stderr = FakeStream()
+    monkeypatch.setattr("skyeye.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("skyeye.dividend_scorer.main.CliActivityIndicator", FakeIndicator)
+    monkeypatch.setattr("skyeye.dividend_scorer.main._render_gradient_logo", lambda stream, use_color: None)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    dividend_main(["--end-date", "20260219"])
+
+    assert ("resolve_sync_range", None, "20260219") in calls
+    assert "range : 2026-02-05 -> 2026-02-13" in stderr.getvalue()
+    assert "cache : /tmp/cache.db" in stderr.getvalue()
+    assert "请求的 end-date=2026-02-19，实际计算日期=2026-02-13" in stderr.getvalue()
+    assert "原因：该日期处于周末和节假日连休区间，已回退到最近交易日" in stderr.getvalue()
+    assert "\033[1;33m" in stderr.getvalue()
+    assert "红利低波打分器结论" in stdout.getvalue()
+
+
+def test_main_banner_warns_with_weekend_reason(monkeypatch):
+    class FakeScorer(object):
+        def __init__(self, db_path=None, bundle_path=None, prior_blend=None):
+            self.data_fetcher = SimpleNamespace(db_path="/tmp/cache.db")
+
+        def _resolve_sync_range(self, start_date=None, end_date=None):
+            return ("2026-03-05", "2026-03-20")
+
+        def sync_all(self, start_date, end_date, progress=None):
+            pass
+
+        def precompute(self, start_date=None, end_date=None, progress=None):
+            pass
+
+        def score_latest(self, date=None):
+            return {
+                "etf": "512890",
+                "date": "2026-03-20",
+                "total_score": 6.32,
+                "score_percentile": 0.709,
+                "score_percentile_window": 504,
+                "score_percentile_sample_size": 504,
+                "buy_percentile_threshold": 0.2,
+                "sell_percentile_threshold": 0.8,
+                "confidence": "lowered",
+                "model_meta": {"method": "fixed_domain_prior"},
+                "features": OrderedDict(),
+                "confidence_modifiers": OrderedDict(),
+                "warnings": [],
+            }
+
+    class FakeStream(io.StringIO):
+        def isatty(self):
+            return True
+
+    class FakeIndicator(object):
+        def __init__(self, label, stream=None, enabled=True):
+            pass
+
+        def start(self):
+            return self
+
+        def update(self, label):
+            pass
+
+        def update_progress(self, current=None, total=None, detail=None):
+            pass
+
+        def stop(self):
+            pass
+
+    stdout = io.StringIO()
+    stderr = FakeStream()
+    monkeypatch.setattr("skyeye.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("skyeye.dividend_scorer.main.CliActivityIndicator", FakeIndicator)
+    monkeypatch.setattr("skyeye.dividend_scorer.main._render_gradient_logo", lambda stream, use_color: None)
+    monkeypatch.setattr("sys.stdout", stdout)
+    monkeypatch.setattr("sys.stderr", stderr)
+
+    dividend_main(["--end-date", "20260321"])
+
+    assert "原因：该日期落在周末休市，已回退到最近交易日" in stderr.getvalue()
 
 
 def test_data_fetcher_load_history_aggregates_dividend_yield(tmp_path):
@@ -533,7 +865,7 @@ def test_sync_index_daily_uses_recent_pe_overlay_without_overwriting_close(tmp_p
 
     class FakeAk(object):
         @staticmethod
-        def stock_zh_index_hist_csindex(symbol):
+        def stock_zh_index_hist_csindex(symbol, start_date=None, end_date=None):
             return pd.DataFrame(
                 {
                     "日期": ["2024-06-03"],
@@ -577,6 +909,167 @@ def test_validate_trading_day_coverage_skips_without_real_calendar():
     DataFetcher.validate_trading_day_coverage(df, "2024-02-09", "2024-02-19", data_proxy=None)
 
 
+def test_sync_etf_daily_falls_back_to_bundle_history_when_akshare_fails(tmp_path):
+    raw_bars = np.array(
+        [
+            (20260302000000, 1.17, 1.184, 1.168, 1.183, 7.77e8, 9.15e8),
+            (20260303000000, 1.183, 1.203, 1.183, 1.196, 1.20e9, 1.43e9),
+        ],
+        dtype=[
+            ("datetime", "i8"),
+            ("open", "f8"),
+            ("high", "f8"),
+            ("low", "f8"),
+            ("close", "f8"),
+            ("volume", "f8"),
+            ("total_turnover", "f8"),
+        ],
+    )
+    hfq_bars = np.array(
+        [
+            (20260302000000, 2.366),
+            (20260303000000, 2.392),
+        ],
+        dtype=[
+            ("datetime", "i8"),
+            ("close", "f8"),
+        ],
+    )
+
+    class FakeDataProxy(object):
+        def instruments(self, order_book_id):
+            return object() if order_book_id == "512890.XSHG" else None
+
+        def get_trading_dates(self, start_date, end_date):
+            return pd.bdate_range(start=start_date, end=end_date)
+
+        def history_bars(
+            self,
+            order_book_id,
+            bar_count,
+            frequency,
+            field,
+            dt,
+            skip_suspended=True,
+            include_now=False,
+            adjust_type="pre",
+            adjust_orig=None,
+        ):
+            assert order_book_id == "512890.XSHG"
+            if adjust_type == "post":
+                return hfq_bars
+            if adjust_type == "none":
+                return raw_bars
+            raise AssertionError("unexpected adjust_type {}".format(adjust_type))
+
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"), data_proxy=FakeDataProxy())
+    fetcher._fetch_etf_history = (
+        lambda ak, adjust, start_date=None, end_date=None: (_ for _ in ()).throw(RuntimeError("akshare down"))
+    )
+
+    with fetcher._connect() as conn:
+        rows = fetcher._sync_etf_daily(conn, object(), "2026-03-01", "2026-03-31")
+        stored = conn.execute(
+            """
+            SELECT date, open, high, low, close, close_hfq, amount, turnover_rate
+            FROM etf_daily
+            ORDER BY date
+            """
+        ).fetchall()
+
+    assert rows == 2
+    assert len(stored) == 2
+    assert stored[0]["date"] == "2026-03-02"
+    assert np.isclose(stored[0]["close"], 1.183)
+    assert np.isclose(stored[0]["close_hfq"], 2.366)
+    assert np.isclose(stored[0]["amount"], 9.15e8)
+    assert stored[0]["turnover_rate"] is None
+
+
+def test_sync_etf_daily_uses_sina_history_to_extend_stale_bundle_tail(tmp_path):
+    raw_bars = np.array(
+        [
+            (20260302000000, 1.17, 1.184, 1.168, 1.183, 7.77e8, 9.15e8),
+            (20260303000000, 1.183, 1.203, 1.183, 1.196, 1.20e9, 1.43e9),
+        ],
+        dtype=[
+            ("datetime", "i8"),
+            ("open", "f8"),
+            ("high", "f8"),
+            ("low", "f8"),
+            ("close", "f8"),
+            ("volume", "f8"),
+            ("total_turnover", "f8"),
+        ],
+    )
+    hfq_bars = np.array(
+        [
+            (20260302000000, 2.366),
+            (20260303000000, 2.392),
+        ],
+        dtype=[
+            ("datetime", "i8"),
+            ("close", "f8"),
+        ],
+    )
+
+    class FakeDataProxy(object):
+        def instruments(self, order_book_id):
+            return object() if order_book_id == "512890.XSHG" else None
+
+        def get_trading_dates(self, start_date, end_date):
+            return pd.bdate_range(start=start_date, end=end_date)
+
+        def history_bars(
+            self,
+            order_book_id,
+            bar_count,
+            frequency,
+            field,
+            dt,
+            skip_suspended=True,
+            include_now=False,
+            adjust_type="pre",
+            adjust_orig=None,
+        ):
+            assert order_book_id == "512890.XSHG"
+            if adjust_type == "post":
+                return hfq_bars
+            if adjust_type == "none":
+                return raw_bars
+            raise AssertionError("unexpected adjust_type {}".format(adjust_type))
+
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"), data_proxy=FakeDataProxy())
+    fetcher._fetch_etf_history = (
+        lambda ak, adjust, start_date=None, end_date=None: (_ for _ in ()).throw(RuntimeError("akshare down"))
+    )
+    fetcher._fetch_etf_history_sina = lambda ak, start_date=None, end_date=None: pd.DataFrame(
+        {
+            "date": ["2026-03-18", "2026-03-19", "2026-03-20"],
+            "open": [1.210, 1.202, 1.199],
+            "high": [1.210, 1.211, 1.210],
+            "low": [1.197, 1.198, 1.196],
+            "close": [1.204, 1.201, 1.196],
+            "volume": [7.54e8, 5.87e8, 5.74e8],
+            "amount": [9.07e8, 7.07e8, 6.91e8],
+        }
+    )
+
+    with fetcher._connect() as conn:
+        rows = fetcher._sync_etf_daily(conn, object(), "2026-03-01", "2026-03-20")
+        max_date = conn.execute("SELECT MAX(date) FROM etf_daily").fetchone()[0]
+        latest = conn.execute(
+            "SELECT date, close, close_hfq FROM etf_daily WHERE date = ?",
+            ("2026-03-20",),
+        ).fetchone()
+
+    assert rows == 3
+    assert max_date == "2026-03-20"
+    assert latest["date"] == "2026-03-20"
+    assert np.isclose(latest["close"], 1.196)
+    assert latest["close_hfq"] is None
+
+
 def test_sync_all_skips_remote_calls_when_checkpoint_covers_requested_range(tmp_path, monkeypatch):
     db_path = tmp_path / "cache.db"
     fetcher = DataFetcher(db_path=str(db_path))
@@ -587,24 +1080,44 @@ def test_sync_all_skips_remote_calls_when_checkpoint_covers_requested_range(tmp_
             ("2024-01-02", "H30269", 100.0, 8.0, "2024-01-02T00:00:00"),
         )
         conn.execute(
+            "INSERT INTO index_daily (date, index_code, close, pe_ttm, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("2024-01-31", "H30269", 101.0, 8.1, "2024-01-31T00:00:00"),
+        )
+        conn.execute(
             "INSERT INTO etf_daily (date, etf_code, close, close_hfq, volume, amount, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("2024-01-02", "512890", 1.0, 1.0, 1000.0, 1000.0, "2024-01-02T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO etf_daily (date, etf_code, close, close_hfq, volume, amount, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2024-01-31", "512890", 1.1, 1.1, 1200.0, 1200.0, "2024-01-31T00:00:00"),
         )
         conn.execute(
             "INSERT INTO etf_nav (date, etf_code, nav, acc_nav, updated_at) VALUES (?, ?, ?, ?, ?)",
             ("2024-01-02", "512890", 0.99, 0.99, "2024-01-02T00:00:00"),
         )
         conn.execute(
+            "INSERT INTO etf_nav (date, etf_code, nav, acc_nav, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("2024-01-31", "512890", 1.01, 1.01, "2024-01-31T00:00:00"),
+        )
+        conn.execute(
             "INSERT INTO bond_yield (date, china_10y, updated_at) VALUES (?, ?, ?)",
             ("2024-01-02", 2.5, "2024-01-02T00:00:00"),
         )
         conn.execute(
+            "INSERT INTO bond_yield (date, china_10y, updated_at) VALUES (?, ?, ?)",
+            ("2024-01-31", 2.6, "2024-01-31T00:00:00"),
+        )
+        conn.execute(
             "INSERT INTO index_weight (index_code, stock_code, stock_name, weight, snapshot_date, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            ("H30269", "000001", "A", 100.0, "2024-01-02", "2024-01-02T00:00:00"),
+            ("H30269", "000001", "A", 100.0, "2024-01-31", "2024-01-31T00:00:00"),
         )
         conn.execute(
             "INSERT INTO stock_indicator (date, stock_code, dv_ttm, pe_ttm, pb, total_mv, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("2024-01-02", "000001", 5.0, 8.0, 1.2, 1000.0, "2024-01-02T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO stock_indicator (date, stock_code, dv_ttm, pe_ttm, pb, total_mv, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2024-01-31", "000001", 5.1, 8.1, 1.3, 1100.0, "2024-01-31T00:00:00"),
         )
         for source_name in (
             "index_daily",
@@ -626,7 +1139,106 @@ def test_sync_all_skips_remote_calls_when_checkpoint_covers_requested_range(tmp_
 
     monkeypatch.setattr(fetcher, "_require_akshare", lambda: FakeAk())
 
-    fetcher.sync_all("2024-01-01", "2024-01-31")
+    fetcher.sync_all("2024-01-31", "2024-01-31")
+
+
+def test_resolve_source_sync_range_uses_checkpoint_overlap_when_start_is_implicit(tmp_path):
+    class FakeDataProxy(object):
+        def get_trading_dates(self, start_date, end_date):
+            return pd.bdate_range(start=start_date, end=end_date)
+
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"), data_proxy=FakeDataProxy())
+
+    with fetcher._connect() as conn:
+        conn.execute(
+            "INSERT INTO etf_daily (date, etf_code, close, close_hfq, volume, amount, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2024-01-31", "512890", 1.0, 1.0, 1000.0, 1000.0, "2024-01-31T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO sync_checkpoint (source_name, sync_start_date, sync_end_date, updated_at) VALUES (?, ?, ?, ?)",
+            ("etf_daily", "2020-01-01", "2024-02-20", "2024-02-20T00:00:00"),
+        )
+        start_date, end_date = fetcher._resolve_source_sync_range(conn, "etf_daily", None, "2024-02-20")
+
+    assert start_date == "2024-01-17"
+    assert end_date == "2024-02-20"
+
+
+def test_resolve_source_sync_range_clips_weekend_end_date_for_stock_indicator(tmp_path):
+    class FakeDataProxy(object):
+        def get_trading_dates(self, start_date, end_date):
+            return pd.bdate_range(start=start_date, end=end_date)
+
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"), data_proxy=FakeDataProxy())
+
+    with fetcher._connect() as conn:
+        conn.execute(
+            "INSERT INTO stock_indicator (date, stock_code, dv_ttm, pe_ttm, pb, total_mv, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2026-03-06", "600000", 2.0, 8.0, 0.8, 1000.0, "2026-03-20T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO stock_indicator (date, stock_code, dv_ttm, pe_ttm, pb, total_mv, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2026-03-20", "600000", 2.1, 8.1, 0.81, 1010.0, "2026-03-20T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO sync_checkpoint (source_name, sync_start_date, sync_end_date, updated_at) VALUES (?, ?, ?, ?)",
+            ("stock_indicator", "2020-01-01", "2026-03-20", "2026-03-20T00:00:00"),
+        )
+
+        start_date, end_date = fetcher._resolve_source_sync_range(conn, "stock_indicator", None, "2026-03-21")
+
+        assert start_date == "2026-03-06"
+        assert end_date == "2026-03-20"
+        assert fetcher._should_skip_sync(conn, "stock_indicator", start_date, end_date) is True
+
+
+def test_update_sync_checkpoint_merges_existing_range_and_uses_actual_source_coverage(tmp_path):
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"))
+
+    with fetcher._connect() as conn:
+        conn.execute(
+            "INSERT INTO etf_daily (date, etf_code, close, close_hfq, volume, amount, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2024-01-02", "512890", 1.0, 1.0, 1000.0, 1000.0, "2024-01-02T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO etf_daily (date, etf_code, close, close_hfq, volume, amount, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2024-02-02", "512890", 1.1, 1.1, 1200.0, 1200.0, "2024-02-02T00:00:00"),
+        )
+        conn.execute(
+            "INSERT INTO sync_checkpoint (source_name, sync_start_date, sync_end_date, updated_at) VALUES (?, ?, ?, ?)",
+            ("etf_daily", "2020-01-01", "2024-01-31", "2024-01-31T00:00:00"),
+        )
+
+        fetcher._update_sync_checkpoint(conn, "etf_daily", "2024-01-20", "2024-02-15")
+        row = conn.execute(
+            "SELECT sync_start_date, sync_end_date FROM sync_checkpoint WHERE source_name = ?",
+            ("etf_daily",),
+        ).fetchone()
+
+    assert row["sync_start_date"] == "2024-01-02"
+    assert row["sync_end_date"] == "2024-02-02"
+
+
+def test_fetch_etf_history_passes_start_and_end_dates_to_akshare(tmp_path):
+    captured = []
+    fetcher = DataFetcher(db_path=str(tmp_path / "cache.db"))
+
+    class FakeAk(object):
+        @staticmethod
+        def fund_etf_hist_em(**kwargs):
+            captured.append(kwargs)
+            return pd.DataFrame()
+
+    fetcher._fetch_etf_history(FakeAk(), adjust="hfq", start_date="2024-01-02", end_date="2024-02-03")
+
+    assert captured == [
+        {
+            "symbol": "512890",
+            "start_date": "20240102",
+            "end_date": "20240203",
+            "adjust": "hfq",
+        }
+    ]
 
 
 def test_call_akshare_retries_transient_network_errors(tmp_path, monkeypatch):
@@ -673,8 +1285,11 @@ def test_dividend_scorer_precompute_reads_end_date_from_rqattrdict_env():
                 index=history_df.index,
             )
 
+        def compute_single(self, date):
+            return {}
+
     class DummyWeightCalculator(object):
-        def calculate_ic_ir_weights(self, feature_matrix, price_series):
+        def calculate_shrunk_weights(self, feature_matrix, price_series, prior_blend=None, compute_diagnostics=False):
             return {"weights": {}, "method": "test"}
 
     scorer = DividendScorer(
@@ -682,6 +1297,7 @@ def test_dividend_scorer_precompute_reads_end_date_from_rqattrdict_env():
         feature_engine=DummyFeatureEngine(),
         weight_calculator=DummyWeightCalculator(),
         score_synthesizer=ScoreSynthesizer(),
+        prior_blend=1.0,
     )
     env = SimpleNamespace(
         data_proxy="mock-data-proxy",
@@ -692,3 +1308,116 @@ def test_dividend_scorer_precompute_reads_end_date_from_rqattrdict_env():
 
     assert scorer.data_fetcher.data_proxy == "mock-data-proxy"
     assert scorer.data_fetcher.loaded == (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-15"))
+
+
+def test_dividend_scorer_score_warns_when_actual_score_date_lags_target_date():
+    class DummyFetcher(object):
+        def __init__(self):
+            self.data_proxy = None
+            self.loaded = None
+            self.freshness_reference_date = None
+
+        def get_available_range(self):
+            return "2026-03-01", "2026-03-06"
+
+        def load_history(self, start_date, end_date):
+            self.loaded = (start_date, end_date)
+            index = pd.to_datetime(["2026-03-05", "2026-03-06"])
+            return pd.DataFrame(
+                {
+                    "etf_close": [1.20, 1.19],
+                    "etf_close_hfq": [2.40, 2.38],
+                    "etf_volume": [1.0e8, 1.1e8],
+                    "etf_nav": [1.19, 1.18],
+                    "pe_ttm": [8.0, 8.1],
+                    "dividend_yield": [0.031, 0.031],
+                    "bond_10y": [0.020, 0.020],
+                    "premium_rate": [0.01, 0.01],
+                },
+                index=index,
+            )
+
+        def _latest_trading_day_on_or_before(self, date_value):
+            return pd.Timestamp(date_value).strftime("%Y-%m-%d")
+
+        def _count_trading_days(self, start_date, end_date):
+            if start_date == "2026-03-06" and end_date == "2026-03-20":
+                return 10
+            return 0
+
+        def get_data_freshness(self, reference_date=None):
+            self.freshness_reference_date = pd.Timestamp(reference_date).strftime("%Y-%m-%d")
+            return {
+                "etf_daily": {
+                    "last_update_date": "2026-03-06",
+                    "stale_trading_days": 10,
+                    "status": "expired",
+                }
+            }
+
+    class DummyFeatureEngine(object):
+        def precompute(self, history_df):
+            return pd.DataFrame(
+                {
+                    feature_name: np.linspace(0.2, 0.3, len(history_df))
+                    for feature_name in VALUATION_FEATURES
+                },
+                index=history_df.index,
+            )
+
+        def compute_single(self, date):
+            return {}
+
+    class DummyWeightCalculator(object):
+        def calculate_shrunk_weights(self, feature_matrix, price_series, prior_blend=None, compute_diagnostics=False):
+            return {"weights": {}, "method": "fixed_domain_prior", "fallback_reason": None}
+
+    class DummyScoreSynthesizer(object):
+        def synthesize(self, feature_snapshot, weight_result, freshness=None):
+            warnings = []
+            if freshness:
+                warnings.append("stale_sources: etf_daily")
+            return {
+                "total_score": 5.79,
+                "confidence": "normal",
+                "features": OrderedDict(),
+                "confidence_modifiers": OrderedDict(),
+                "warnings": warnings,
+                "model_meta": {
+                    "method": "fixed_domain_prior",
+                    "fallback_reason": None,
+                    "test_ic_avg": None,
+                    "test_ic_ir_avg": None,
+                    "label_window_n": 60,
+                    "subsample_interval": 60,
+                    "params_version": "test",
+                },
+            }
+
+    scorer = DividendScorer(
+        data_fetcher=DummyFetcher(),
+        feature_engine=DummyFeatureEngine(),
+        weight_calculator=DummyWeightCalculator(),
+        score_synthesizer=DummyScoreSynthesizer(),
+        prior_blend=1.0,
+    )
+
+    scorer.precompute(end_date="2026-03-20")
+    result = scorer.score_latest()
+    report = format_score_report(result)
+
+    assert scorer.loaded_end_date == "2026-03-06"
+    assert scorer.data_fetcher.loaded == ("2026-03-01", pd.Timestamp("2026-03-06"))
+    assert scorer.data_fetcher.freshness_reference_date == "2026-03-20"
+    assert result["requested_date"] == "2026-03-20"
+    assert result["date"] == "2026-03-06"
+    assert result["score_lag_trading_days"] == 10
+    assert result["confidence"] == "lowered"
+    assert "stale_sources: etf_daily" in result["warnings"]
+    assert any(
+        warning == "score_date_lag: requested=2026-03-20 actual=2026-03-06 trading_days=10"
+        for warning in result["warnings"]
+    )
+    assert "目标日期" in report
+    assert "评分日期" in report
+    assert "滞后 10 个交易日" in report
