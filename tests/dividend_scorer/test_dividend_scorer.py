@@ -9,16 +9,16 @@ import numpy as np
 import pandas as pd
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
-from rqalpha.dividend_scorer.config import DOMAIN_WEIGHTS
-from rqalpha.dividend_scorer.config import VALUATION_FEATURES
-from rqalpha.dividend_scorer.data_fetcher import DataFetcher
-from rqalpha.dividend_scorer.feature_engine import FeatureEngine
-from rqalpha.dividend_scorer.main import DividendScorer
-from rqalpha.dividend_scorer.main import SyncProgressReporter
-from rqalpha.dividend_scorer.main import format_score_report
-from rqalpha.dividend_scorer.main import main as dividend_main
-from rqalpha.dividend_scorer.score_synthesizer import ScoreSynthesizer
-from rqalpha.dividend_scorer.weight_calculator import WeightCalculator
+from skyeye.dividend_scorer.config import DOMAIN_WEIGHTS
+from skyeye.dividend_scorer.config import VALUATION_FEATURES
+from skyeye.dividend_scorer.data_fetcher import DataFetcher
+from skyeye.dividend_scorer.feature_engine import FeatureEngine
+from skyeye.dividend_scorer.main import DividendScorer
+from skyeye.dividend_scorer.main import SyncProgressReporter
+from skyeye.dividend_scorer.main import format_score_report
+from skyeye.dividend_scorer.main import main as dividend_main
+from skyeye.dividend_scorer.score_synthesizer import ScoreSynthesizer
+from skyeye.dividend_scorer.weight_calculator import WeightCalculator
 from rqalpha.utils import RqAttrDict
 
 
@@ -316,7 +316,7 @@ def test_main_sync_only_implies_sync(monkeypatch):
 
     stdout = io.StringIO()
     stderr = FakeStream()
-    monkeypatch.setattr("rqalpha.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("skyeye.dividend_scorer.main.DividendScorer", FakeScorer)
     monkeypatch.setattr("sys.stdout", stdout)
     monkeypatch.setattr("sys.stderr", stderr)
 
@@ -381,9 +381,9 @@ def test_main_scoring_prints_logo_and_runs_cli_spinner(monkeypatch):
 
     stdout = io.StringIO()
     stderr = FakeStream()
-    monkeypatch.setattr("rqalpha.dividend_scorer.main.DividendScorer", FakeScorer)
-    monkeypatch.setattr("rqalpha.dividend_scorer.main.CliActivityIndicator", FakeIndicator)
-    monkeypatch.setattr("rqalpha.dividend_scorer.main._render_gradient_logo", fake_render_logo)
+    monkeypatch.setattr("skyeye.dividend_scorer.main.DividendScorer", FakeScorer)
+    monkeypatch.setattr("skyeye.dividend_scorer.main.CliActivityIndicator", FakeIndicator)
+    monkeypatch.setattr("skyeye.dividend_scorer.main._render_gradient_logo", fake_render_logo)
     monkeypatch.setattr("sys.stdout", stdout)
     monkeypatch.setattr("sys.stderr", stderr)
 
@@ -449,7 +449,7 @@ def test_data_fetcher_load_history_aggregates_dividend_yield(tmp_path):
 def test_sync_stock_indicators_uses_nested_safe_transaction(tmp_path, monkeypatch):
     db_path = tmp_path / "cache.db"
     fetcher = DataFetcher(db_path=str(db_path))
-    monkeypatch.setattr("rqalpha.dividend_scorer.data_fetcher.time.sleep", lambda _: None)
+    monkeypatch.setattr("skyeye.dividend_scorer.data_fetcher.time.sleep", lambda _: None)
 
     class FakeAk(object):
         @staticmethod
@@ -639,7 +639,7 @@ def test_call_akshare_retries_transient_network_errors(tmp_path, monkeypatch):
             raise RequestsConnectionError("remote closed")
         return {"ok": True}
 
-    monkeypatch.setattr("rqalpha.dividend_scorer.data_fetcher.time.sleep", lambda _: None)
+    monkeypatch.setattr("skyeye.dividend_scorer.data_fetcher.time.sleep", lambda _: None)
 
     result = fetcher._call_akshare(flaky)
 

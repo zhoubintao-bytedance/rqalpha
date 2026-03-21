@@ -1,6 +1,6 @@
 ## Context
 
-`strategy_scorer.py` 是策略打分器的核心文件，用于对交易策略进行滚动窗口回测并综合评分。当前版本存在 10 个已知 bug，记录在 `bugs.md` 中。其中 2 个 Critical 级别 bug 导致多窗口场景直接崩溃，其余 bug 影响数据正确性和用户体验。
+`skyeye/strategy_scorer.py` 是策略打分器的核心文件，用于对交易策略进行滚动窗口回测并综合评分。当前版本存在 10 个已知 bug，记录在 `skyeye/docs/bugs.md` 中。其中 2 个 Critical 级别 bug 导致多窗口场景直接崩溃，其余 bug 影响数据正确性和用户体验。
 
 当前代码约 1175 行，所有修改都在这一个文件内完成。
 

@@ -65,7 +65,7 @@ build-backend = "setuptools.build_meta"
 zip-safe = false
 
 [tool.setuptools.packages.find]
-include = ["rqalpha", "rqalpha.*"]
+include = ["rqalpha", "rqalpha.*", "skyeye", "skyeye.*"]
 
 [tool.setuptools.package-data]
 "rqalpha" = [
@@ -76,6 +76,15 @@ include = ["rqalpha", "rqalpha.*"]
     'resource/*.*',
     'utils/translations/zh_Hans_CN/LC_MESSAGES/*',
     "mod/rqalpha_mod_sys_analyser/report/templates/*.xlsx",
+]
+"skyeye" = [
+    "*.md",
+    "examples/*.*",
+    "docs/*.*",
+    "docs/manuals/*.*",
+    "docs/rfc/*.*",
+    "docs/assets/*.*",
+    "experiments/charts/dividend_scorer/*.*",
 ]
 
 [tool.setuptools_scm]

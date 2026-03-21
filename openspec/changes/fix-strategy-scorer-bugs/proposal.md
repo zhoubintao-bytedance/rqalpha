@@ -1,6 +1,6 @@
 ## Why
 
-`strategy_scorer.py` 存在多个 bug，包括两个 Critical 级别的崩溃问题（多窗口时 `list.index()` 比较 DataFrame 导致 ValueError、窗口编号不匹配），以及 NaN 处理遗漏、多股票累计盈亏错误、排序缺失、错误处理缺失等问题。这些 bug 影响了打分器在多窗口和多股票场景下的正确性和稳定性。
+`skyeye/strategy_scorer.py` 存在多个 bug，包括两个 Critical 级别的崩溃问题（多窗口时 `list.index()` 比较 DataFrame 导致 ValueError、窗口编号不匹配），以及 NaN 处理遗漏、多股票累计盈亏错误、排序缺失、错误处理缺失等问题。这些 bug 影响了打分器在多窗口和多股票场景下的正确性和稳定性。
 
 ## What Changes
 
@@ -18,13 +18,13 @@
 ## Capabilities
 
 ### New Capabilities
-- `scorer-bug-fixes`: 修复 strategy_scorer.py 中的 10 个已知 bug，涵盖崩溃修复、数据正确性、健壮性增强和显示修正
+- `scorer-bug-fixes`: 修复 `skyeye/strategy_scorer.py` 中的 10 个已知 bug，涵盖崩溃修复、数据正确性、健壮性增强和显示修正
 
 ### Modified Capabilities
 
 ## Impact
 
-- 仅影响 `strategy_scorer.py` 单文件
+- 仅影响 `skyeye/strategy_scorer.py` 单文件
 - 不涉及 API 变更或依赖变化
 - `flatten_trades` 返回的 records 结构新增 `total_realized_pnl` 字段
 - `run_rolling_backtests` 返回的 results 新增 `idx` 字段
