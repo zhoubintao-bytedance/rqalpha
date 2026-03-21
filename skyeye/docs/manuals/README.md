@@ -44,28 +44,31 @@ uv run python -m skyeye.dividend_scorer.main --json
 默认命令会先自动检查今天这一天是否需要同步；如果缓存已覆盖，请求会直接 `skip`，然后输出当前最新可用日期的评分。
 这一步先确认评分本身能正常算出来，再进入策略和回测。
 
-## 5. 跑一遍示例策略
+## 5. 用 RQAlpha 原生回测跑单区间并保存图片
 
 ```bash
-uv run rqalpha run \
+env UV_CACHE_DIR=/tmp/uv-cache MPLCONFIGDIR=/tmp/mplconfig uv run rqalpha run \
   -f skyeye/examples/dividend_low_vol_score_strategy_history_aware.py \
-  -s 2025-01-01 \
-  -e 2025-03-31 \
+  -s 2024-05-03 \
+  -e 2025-04-20 \
   --account stock 100000 \
   -fq 1d \
   -d ~/.rqalpha/bundle \
-  -bm 000300.XSHG \
+  -bm 512890.XSHG \
+  --plot-save dividend_price_2405_2504.png \
   -mc dividend_scorer.enabled true \
   -mc dividend_scorer.db_path ~/.rqalpha/dividend_scorer/cache.db
 ```
 
-这一步主要确认三件事：
+这条路径适合做“单区间策略迭代”：
 
-- 策略能正常跑完
-- `get_dividend_score()` 能被策略读到
-- 日志里的仓位变化方向符合预期
+- 直接对比策略净值和 `512890.XSHG` 买入持有
+- 把回测图片落到本地，方便横向比较不同参数版本
+- 一边看收益/回撤，一边看日志里的仓位变化是否符合预期
 
-## 6. 给策略做回测打分
+如果你是在本地桌面环境运行，也可以去掉前面的 `UV_CACHE_DIR` 和 `MPLCONFIGDIR`。
+
+## 6. 给策略做滚动窗口打分
 
 ```bash
 uv run python skyeye/strategy_scorer.py \
@@ -78,10 +81,15 @@ uv run python skyeye/strategy_scorer.py \
 
 如果窗口 37 没问题，再逐步扩大到 `33-37` 或完整窗口。
 
+这条路径和上面的原生回测是互补关系：
+
+- `rqalpha run --plot-save`：看某一个具体区间的真实净值、基准对比和图片
+- `skyeye/strategy_scorer.py`：看多窗口稳定性，避免策略只在单一区间表现好
+
 ## 7. 接下来读什么
 
 - [红利低波打分器使用说明.md](./红利低波打分器使用说明.md)
-  适合继续看缓存同步、CLI 输出、策略调用、参数审计和画图
+  适合继续看缓存同步、CLI 输出、策略调用、参数审计和诊断工具画图
 - [策略回测打分器.md](./策略回测打分器.md)
   适合继续看滚动窗口打分、日志解释、稀疏窗口和 `--mod/-mc` 用法
 - [../rfc/dividend_scorer_iteration_directions.md](../rfc/dividend_scorer_iteration_directions.md)
