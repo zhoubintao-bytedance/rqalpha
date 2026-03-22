@@ -1,0 +1,32 @@
+strategy_id: dividend_low_vol.regime_adaptive
+name: 红利低波状态自适应策略
+family: valuation_trend_allocation
+benchmark: 512890.XSHG
+instrument: 512890.XSHG
+status: incubating
+entrypoint: strategies/regime_adaptive/strategy.py
+rolling_score_start_date: "2020-02-01"
+hypothesis: 价格趋势决定核心底仓，估值分位决定战术加减仓；过热和低置信度只限制战术层，不轻易破坏上涨行情中的核心持仓。
+signal_inputs:
+  - score_percentile
+  - confidence
+  - price_percentile
+  - premium_rate
+  - premium_rate_ma20
+  - rsi_20
+  - etf_close
+positioning_rule: 每周根据 5/15 期估值分位得到战术目标，同时用 ETF 20/60/120 日趋势强度计算核心底仓，最终仓位取更积极的一侧，并用 heat/confidence/step_limit 控制执行节奏。
+risk_controls:
+  - tactical_heat_ceiling
+  - confidence_overlay_freeze
+  - trend_breakdown_fast_cut
+rebalance_frequency: weekly
+expected_good_regimes:
+  - 长时间单边上涨且估值维持中高位
+  - 趋势上行中夹杂中等回撤的慢牛阶段
+expected_bad_regimes:
+  - 高频来回反转的震荡鞭打市
+  - 快速跳空下跌且周频调仓来不及响应的阶段
+notes:
+  - 这是独立新假设，不回写当前稳定版 history_aware
+  - 单区间原生回测看净值和基准，滚动打分看跨年份稳定性

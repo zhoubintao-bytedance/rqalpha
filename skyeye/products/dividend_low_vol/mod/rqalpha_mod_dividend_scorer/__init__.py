@@ -8,6 +8,7 @@ __config__ = {
     "priority": 60,
     "db_path": CACHE_DB_PATH,
     "bundle_path": None,
+    "auto_sync": True,
     "prior_blend": WEIGHT_PRIOR_BLEND,
     "dynamic_diagnostic": WEIGHT_DYNAMIC_DIAGNOSTIC,
 }

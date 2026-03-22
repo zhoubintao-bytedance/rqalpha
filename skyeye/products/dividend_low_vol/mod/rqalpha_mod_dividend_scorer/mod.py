@@ -30,9 +30,11 @@ class DividendScorerMod(AbstractMod):
     def __init__(self):
         self._env = None
         self._scorer = None
+        self._auto_sync = True
 
     def start_up(self, env, mod_config):
         self._env = env
+        self._auto_sync = bool(getattr(mod_config, "auto_sync", True))
         prior_blend = getattr(mod_config, "prior_blend", None)
         self._scorer = DividendScorer(
             db_path=getattr(mod_config, "db_path", None),
@@ -49,7 +51,7 @@ class DividendScorerMod(AbstractMod):
             self._reset_score_store()
 
     def _bootstrap(self, event):
-        self._scorer.prepare(env=self._env, auto_sync=True, sync_progress=None)
+        self._scorer.prepare(env=self._env, auto_sync=self._auto_sync, sync_progress=None)
         self._reset_score_store()
 
     def _bind_context(self, event):
