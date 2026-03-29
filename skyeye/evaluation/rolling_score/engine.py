@@ -26,7 +26,7 @@ from dateutil.relativedelta import relativedelta
 
 from rqalpha import run
 from skyeye.evaluation.rolling_score.report import build_strategy_card_lines, render_box
-from skyeye.products.dividend_low_vol.registry import find_strategy_spec_by_file
+from skyeye.products.registry import find_strategy_spec_by_file
 
 # ============================================================
 # 1. 常量与配置
@@ -318,18 +318,28 @@ def parse_cli_scalar(value):
 
 
 def parse_mod_config_args(items):
+    mod_configs, _ = parse_runtime_config_args(items)
+    return mod_configs
+
+
+def parse_runtime_config_args(items):
     mod_configs = OrderedDict()
+    extra_config = OrderedDict()
     for key, raw_value in items or []:
         if "." not in key:
             print("错误: --mod-config 键必须是 <mod>.<field>，例如 dividend_scorer.prior_blend")
             sys.exit(1)
-        mod_name, field_name = key.split(".", 1)
-        if not mod_name or not field_name:
+        scope_name, field_name = key.split(".", 1)
+        if not scope_name or not field_name:
             print("错误: --mod-config 键必须是 <mod>.<field>，例如 dividend_scorer.prior_blend")
             sys.exit(1)
-        mod_configs.setdefault(mod_name, OrderedDict())
-        mod_configs[mod_name][field_name] = parse_cli_scalar(raw_value)
-    return mod_configs
+        parsed_value = parse_cli_scalar(raw_value)
+        if scope_name == "extra":
+            extra_config[field_name] = parsed_value
+            continue
+        mod_configs.setdefault(scope_name, OrderedDict())
+        mod_configs[scope_name][field_name] = parsed_value
+    return mod_configs, extra_config
 
 
 def analyze_window_sample(start, trades, portfolio):
@@ -392,6 +402,8 @@ def run_rolling_backtests(
     selected_indices=None,
     extra_mods=None,
     mod_configs=None,
+    extra_config=None,
+    benchmark_id=None,
 ):
     """对策略文件执行滚动窗口回测，返回结果列表
 
@@ -401,6 +413,10 @@ def run_rolling_backtests(
     """
     with open(strategy_file) as f:
         source_code = f.read()
+
+    if benchmark_id is None:
+        strategy_spec = find_strategy_spec_by_file(strategy_file)
+        benchmark_id = getattr(strategy_spec, "benchmark", None) or BENCHMARK
 
     windows = generate_windows()
     if selected_indices is not None:
@@ -426,10 +442,11 @@ def run_rolling_backtests(
             },
             "extra": {"log_level": "error"},
             "mod": {
-                "sys_analyser": {"benchmark": BENCHMARK, "plot": False},
+                "sys_analyser": {"benchmark": benchmark_id, "plot": False},
                 "sys_progress": {"enabled": False},
             },
         }
+        config["extra"].update(extra_config or {})
         enabled_mods = []
         for mod_name in extra_mods or []:
             if mod_name not in enabled_mods:
@@ -1203,7 +1220,8 @@ HELP_TEXT = """\
                           35-37    跑第35到37窗口
                           1,10,37  跑指定的几个窗口
                         窗口不足5个时跳过综合评分，直接输出单窗口得分+交易日志
-    --log LEVEL         交易日志详细程度，可选 low/mid/high，默认 low
+    --log LEVEL         交易日志详细程度，可选 none/low/mid/high，默认 low
+                          none = 不输出交易日志
                           low  = 最近 1 个窗口
                           mid  = 最近 4 个窗口（约1年）
                           high = 全部 37 个窗口
@@ -1375,8 +1393,8 @@ def main():
     parser.add_argument("--cash", type=int, default=1000000, help="初始资金（默认100万）")
     parser.add_argument("--window", "-w", type=str, default=None,
                         help="指定窗口编号，如 37、35-37、1,10,37（默认全部）")
-    parser.add_argument("--log", choices=["low", "mid", "high"], default="low",
-                        help="交易日志详细程度（默认 low）")
+    parser.add_argument("--log", choices=["none", "low", "mid", "high"], default="low",
+                        help="交易日志详细程度（默认 low，none=不输出）")
     parser.add_argument("--help", "-h", action="store_true", help="显示帮助信息")
     parser.add_argument("--eg", action="store_true", help="显示完整使用示例")
     parser.add_argument("--plot", action="store_true", help="绘制价格走势+买卖点图表")
@@ -1414,14 +1432,14 @@ def main():
     selected_indices = None
     if args.window:
         selected_indices = parse_window_arg(args.window)
-    elif args.mod and "dividend_scorer" in args.mod:
+    else:
         strategy_floor_date = extract_strategy_floor_date(args.strategy_file)
         if strategy_floor_date is not None:
             selected_indices = [
                 i + 1 for i, (start, _) in enumerate(generate_windows()) if start >= strategy_floor_date
             ]
 
-    mod_configs = parse_mod_config_args(args.mod_config)
+    mod_configs, extra_config = parse_runtime_config_args(args.mod_config)
 
     all_windows = generate_windows()
     if selected_indices:
@@ -1434,10 +1452,11 @@ def main():
         window_desc = f"{all_windows[0][0].strftime('%Y-%m')} ~ {all_windows[-1][1].strftime('%Y-%m')}"
 
     strategy_spec = find_strategy_spec_by_file(args.strategy_file)
+    benchmark_id = getattr(strategy_spec, "benchmark", None) or BENCHMARK
 
     print(f"策略文件: {os.path.basename(args.strategy_file)}")
     print(f"初始资金: {args.cash:,}")
-    print(f"基准指数: {BENCHMARK}")
+    print(f"基准指数: {benchmark_id}")
     print(f"回测时间段: {window_desc}")
     print()
     strategy_card_lines = build_strategy_card_lines(strategy_spec)
@@ -1456,6 +1475,8 @@ def main():
         selected_indices,
         extra_mods=args.mod,
         mod_configs=mod_configs,
+        extra_config=extra_config,
+        benchmark_id=benchmark_id,
     )
 
     if not window_results:
@@ -1497,8 +1518,9 @@ def main():
         print()
         print(rating_legend(use_color))
         print("=" * 50)
-        # 少量窗口时，交易日志默认显示全部
-        build_trade_log(window_results, "high", args.cash)
+        # 少量窗口时，交易日志默认显示全部（除非 --log none）
+        if args.log != "none":
+            build_trade_log(window_results, "high", args.cash)
         if args.plot:
             plot_trades(window_results)
         elapsed = time.time() - t_start
@@ -1561,7 +1583,8 @@ def main():
     print(f"\n回测总耗时: {elapsed:.1f} 秒")
 
     # 交易日志
-    build_trade_log(window_results, args.log, args.cash)
+    if args.log != "none":
+        build_trade_log(window_results, args.log, args.cash)
 
     # 图表
     if args.plot:

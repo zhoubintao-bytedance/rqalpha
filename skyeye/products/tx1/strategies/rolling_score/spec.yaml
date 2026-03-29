@@ -1,0 +1,34 @@
+strategy_id: tx1.rolling_score
+name: 天眼TX1横截面选股策略
+family: cross_sectional_stock_selection
+benchmark: 000300.XSHG
+instrument: A股大中盘流动性股票池
+status: research
+entrypoint: strategies/rolling_score/strategy.py
+rolling_score_start_date: "2019-02-01"
+hypothesis: 横截面动量、波动率与量价特征的组合，能够在A股大中盘股票池中产生稳定的相对沪深300超额收益。
+artifact_line_id: baseline_lgbm
+signal_inputs:
+  - mom_20d
+  - mom_40d
+  - mom_60d
+  - excess_mom_20d
+  - volatility_20d
+  - volume_ratio_20d
+  - benchmark_mom_20d
+  - regime_support
+positioning_rule: Top20买入、Top30持有、跌出Top30退出，equal-weight + 约束裁剪。
+risk_controls:
+  - single_stock_cap
+  - turnover_threshold
+  - tradability_filter
+rebalance_frequency: event_driven
+expected_good_regimes:
+  - 横截面分化明显的震荡市
+  - 动量因子有效的趋势市
+expected_bad_regimes:
+  - 全面普涨或普跌的单边市
+  - 动量反转剧烈的急转市
+notes:
+  - 当前为研究阶段baseline，尚未通过Gate 2真实回测验证
+  - benchmark冻结在strategy_id + artifact_line级别，profile不允许改动

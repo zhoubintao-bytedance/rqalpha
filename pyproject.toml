@@ -39,7 +39,9 @@ dependencies = [
     "methodtools",
     "filelock",
     "typing-extensions ; python_version < '3.7'",
-    "typing-extensions >=4.5.0 ; python_version >= '3.7'"
+    "typing-extensions >=4.5.0 ; python_version >= '3.7'",
+    "pyarrow>=12.0.1",
+    "lightgbm>=4.6.0",
 ]
 dynamic = ["version"]
 

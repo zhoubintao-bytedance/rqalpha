@@ -1,0 +1,344 @@
+{
+  "version": "1.0",
+  "created_at": "2026-03-29T18:11:26.737606",
+  "experiment_name": "tx1_20260329_181126",
+  "model_kind": "lgbm",
+  "config": {
+    "dataset": {
+      "input_window": 60
+    },
+    "labels": {
+      "horizon": 20,
+      "transform": "raw"
+    },
+    "splitter": {
+      "train_years": 3,
+      "val_months": 6,
+      "test_months": 6,
+      "embargo_days": 20
+    },
+    "model": {
+      "kind": "lgbm"
+    },
+    "portfolio": {
+      "buy_top_k": 20,
+      "hold_top_k": 30
+    },
+    "evaluation": {
+      "top_k": 20
+    },
+    "costs": {
+      "enabled": true,
+      "commission_rate": 0.0008,
+      "stamp_tax_rate": 0.0005,
+      "slippage_bps": 5.0
+    },
+    "robustness": {
+      "enabled": true,
+      "stability_metric": "rank_ic_mean"
+    }
+  },
+  "aggregate_metrics": {
+    "prediction": {
+      "rank_ic_mean": 0.012785873059150363,
+      "rank_ic_ir": 0.07085510620452466,
+      "top_bucket_spread_mean": 0.0036197698768982247,
+      "top_k_hit_rate": 0.4572254255021829
+    },
+    "portfolio": {
+      "mean_return": 0.00031555919715410536,
+      "max_drawdown": 0.06589479829999731,
+      "volatility": 0.03863705391379335,
+      "information_ratio_proxy": 0.06236969271777732,
+      "mean_turnover": 0.30703008699031475,
+      "mean_overlap": 0.579287966864438,
+      "net_mean_return": -0.0006362340725158704,
+      "cost_drag_annual": 0.23985190395683387,
+      "cost_erosion_ratio": Infinity,
+      "breakeven_cost_bps": 19.051711810516377
+    },
+    "robustness": {
+      "stability": {
+        "stability_score": 14.285714285714285,
+        "cv": 4.606815102256929,
+        "worst_value": -0.09633354371054424,
+        "max_consecutive_low": 3,
+        "cv_score": 0.0,
+        "worst_score": 0.0,
+        "consecutive_score": 71.42857142857142,
+        "n_folds": 14,
+        "mean": 0.01278587305915036,
+        "std": 0.058902153104433884,
+        "metric_key": "rank_ic_mean"
+      },
+      "overfit_flags": {
+        "val_test_ic_decay": 0.0020400146470690686,
+        "val_test_spread_decay": 0.00825691177142929,
+        "val_dominant_ratio": 0.6428571428571429,
+        "flag_ic_decay": false,
+        "flag_spread_decay": true,
+        "flag_val_dominant": false,
+        "n_folds_compared": 14
+      },
+      "regime_scores": {
+        "up_regime": {
+          "n_periods": 899,
+          "mean_return": 0.002138800599676969,
+          "total_return": 1.922781739109595
+        },
+        "down_regime": {
+          "n_periods": 800,
+          "mean_return": -0.0017439059615643666,
+          "total_return": -1.3951247692514932
+        },
+        "metric_consistency": {
+          "metric_key": "rank_ic_mean",
+          "positive_folds": 9,
+          "total_folds": 14,
+          "positive_ratio": 0.6428571428571429
+        }
+      }
+    }
+  },
+  "num_folds": 14,
+  "folds": [
+    {
+      "index": 1,
+      "path": "folds/fold_001",
+      "row_counts": {
+        "train": 180893,
+        "val": 32113,
+        "test": 32398
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2018-04-06 00:00:00",
+        "val_start": "2018-05-09 00:00:00",
+        "val_end": "2018-11-08 00:00:00",
+        "test_start": "2018-12-07 00:00:00",
+        "test_end": "2019-06-06 00:00:00"
+      }
+    },
+    {
+      "index": 2,
+      "path": "folds/fold_002",
+      "row_counts": {
+        "train": 182978,
+        "val": 32158,
+        "test": 34386
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2018-10-06 00:00:00",
+        "val_start": "2018-11-05 00:00:00",
+        "val_end": "2019-05-04 00:00:00",
+        "test_start": "2019-06-03 00:00:00",
+        "test_end": "2019-12-02 00:00:00"
+      }
+    },
+    {
+      "index": 3,
+      "path": "folds/fold_003",
+      "row_counts": {
+        "train": 186276,
+        "val": 34625,
+        "test": 33740
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2019-04-06 00:00:00",
+        "val_start": "2019-05-09 00:00:00",
+        "val_end": "2019-11-08 00:00:00",
+        "test_start": "2019-12-09 00:00:00",
+        "test_end": "2020-06-08 00:00:00"
+      }
+    },
+    {
+      "index": 4,
+      "path": "folds/fold_004",
+      "row_counts": {
+        "train": 189507,
+        "val": 33619,
+        "test": 35052
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2019-10-06 00:00:00",
+        "val_start": "2019-11-05 00:00:00",
+        "val_end": "2020-05-04 00:00:00",
+        "test_start": "2020-06-03 00:00:00",
+        "test_end": "2020-12-02 00:00:00"
+      }
+    },
+    {
+      "index": 5,
+      "path": "folds/fold_005",
+      "row_counts": {
+        "train": 193478,
+        "val": 34986,
+        "test": 34440
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2020-04-06 00:00:00",
+        "val_start": "2020-05-08 00:00:00",
+        "val_end": "2020-11-07 00:00:00",
+        "test_start": "2020-12-07 00:00:00",
+        "test_end": "2021-06-06 00:00:00"
+      }
+    },
+    {
+      "index": 6,
+      "path": "folds/fold_006",
+      "row_counts": {
+        "train": 197250,
+        "val": 34153,
+        "test": 35487
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2020-10-06 00:00:00",
+        "val_start": "2020-11-06 00:00:00",
+        "val_end": "2021-05-05 00:00:00",
+        "test_start": "2021-06-03 00:00:00",
+        "test_end": "2021-12-02 00:00:00"
+      }
+    },
+    {
+      "index": 7,
+      "path": "folds/fold_007",
+      "row_counts": {
+        "train": 200588,
+        "val": 35715,
+        "test": 34497
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2021-04-06 00:00:00",
+        "val_start": "2021-05-10 00:00:00",
+        "val_end": "2021-11-09 00:00:00",
+        "test_start": "2021-12-08 00:00:00",
+        "test_end": "2022-06-07 00:00:00"
+      }
+    },
+    {
+      "index": 8,
+      "path": "folds/fold_008",
+      "row_counts": {
+        "train": 204425,
+        "val": 34416,
+        "test": 36547
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2021-10-06 00:00:00",
+        "val_start": "2021-11-05 00:00:00",
+        "val_end": "2022-05-04 00:00:00",
+        "test_start": "2022-06-02 00:00:00",
+        "test_end": "2022-12-01 00:00:00"
+      }
+    },
+    {
+      "index": 9,
+      "path": "folds/fold_009",
+      "row_counts": {
+        "train": 206907,
+        "val": 36825,
+        "test": 35477
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2022-04-06 00:00:00",
+        "val_start": "2022-05-10 00:00:00",
+        "val_end": "2022-11-09 00:00:00",
+        "test_start": "2022-12-08 00:00:00",
+        "test_end": "2023-06-07 00:00:00"
+      }
+    },
+    {
+      "index": 10,
+      "path": "folds/fold_010",
+      "row_counts": {
+        "train": 209354,
+        "val": 35431,
+        "test": 36671
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2022-10-06 00:00:00",
+        "val_start": "2022-11-07 00:00:00",
+        "val_end": "2023-05-06 00:00:00",
+        "test_start": "2023-06-05 00:00:00",
+        "test_end": "2023-12-04 00:00:00"
+      }
+    },
+    {
+      "index": 11,
+      "path": "folds/fold_011",
+      "row_counts": {
+        "train": 211259,
+        "val": 36934,
+        "test": 35628
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2023-04-06 00:00:00",
+        "val_start": "2023-05-10 00:00:00",
+        "val_end": "2023-11-09 00:00:00",
+        "test_start": "2023-12-08 00:00:00",
+        "test_end": "2024-06-07 00:00:00"
+      }
+    },
+    {
+      "index": 12,
+      "path": "folds/fold_012",
+      "row_counts": {
+        "train": 212312,
+        "val": 35304,
+        "test": 36900
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2023-10-06 00:00:00",
+        "val_start": "2023-11-06 00:00:00",
+        "val_end": "2024-05-05 00:00:00",
+        "test_start": "2024-06-03 00:00:00",
+        "test_end": "2024-12-02 00:00:00"
+      }
+    },
+    {
+      "index": 13,
+      "path": "folds/fold_013",
+      "row_counts": {
+        "train": 213790,
+        "val": 37200,
+        "test": 35396
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2024-04-06 00:00:00",
+        "val_start": "2024-05-09 00:00:00",
+        "val_end": "2024-11-08 00:00:00",
+        "test_start": "2024-12-09 00:00:00",
+        "test_end": "2025-06-08 00:00:00"
+      }
+    },
+    {
+      "index": 14,
+      "path": "folds/fold_014",
+      "row_counts": {
+        "train": 215005,
+        "val": 35700,
+        "test": 37476
+      },
+      "date_range": {
+        "train_start": null,
+        "train_end": "2024-10-06 00:00:00",
+        "val_start": "2024-11-05 00:00:00",
+        "val_end": "2025-05-04 00:00:00",
+        "test_start": "2025-06-04 00:00:00",
+        "test_end": "2025-12-03 00:00:00"
+      }
+    }
+  ]
+}

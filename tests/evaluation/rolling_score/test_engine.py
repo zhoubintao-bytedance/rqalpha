@@ -1,9 +1,11 @@
 import datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 
 from skyeye.evaluation import rolling_score as strategy_scorer
+from skyeye.evaluation.rolling_score import engine as rolling_engine
 
 
 def _trade(order_book_id, symbol, side, price, quantity, trade_dt):
@@ -107,3 +109,65 @@ def test_flatten_trades_tracks_portfolio_level_realized_pnl_across_symbols():
     assert records[2]["total_realized_pnl"] == 200.0
     assert records[3]["realized_pnl"] == -100.0
     assert records[3]["total_realized_pnl"] == 100.0
+
+
+def test_parse_runtime_config_args_splits_mod_and_extra_scopes():
+    mod_configs, extra_config = strategy_scorer.parse_runtime_config_args(
+        [
+            ("dividend_scorer.prior_blend", "0.7"),
+            ("extra.strategy_profile", "baseline"),
+            ("extra.tx1_artifact_line", "baseline_tree"),
+        ]
+    )
+
+    assert mod_configs == {"dividend_scorer": {"prior_blend": 0.7}}
+    assert extra_config == {
+        "strategy_profile": "baseline",
+        "tx1_artifact_line": "baseline_tree",
+    }
+
+
+def test_run_rolling_backtests_routes_extra_config_to_top_level_extra_and_uses_strategy_benchmark(
+    monkeypatch,
+    tmp_path,
+):
+    strategy_path = tmp_path / "strategy.py"
+    strategy_path.write_text("def init(context):\n    pass\n", encoding="utf-8")
+
+    observed = {}
+
+    def fake_run(config, source_code):
+        observed["config"] = config
+        observed["source_code"] = source_code
+        return {
+            "sys_analyser": {
+                "summary": {name: 0.0 for name in strategy_scorer.WEIGHTS},
+                "trades": pd.DataFrame(),
+                "portfolio": pd.DataFrame(
+                    {"market_value": [0.0]},
+                    index=[pd.Timestamp("2016-02-01")],
+                ),
+            }
+        }
+
+    monkeypatch.setattr(rolling_engine, "run", fake_run)
+    monkeypatch.setattr(
+        rolling_engine,
+        "find_strategy_spec_by_file",
+        lambda strategy_file: SimpleNamespace(benchmark="512890.XSHG"),
+    )
+
+    results = strategy_scorer.run_rolling_backtests(
+        str(strategy_path),
+        cash=100000,
+        selected_indices=[1],
+        mod_configs={"dividend_scorer": {"prior_blend": 0.7}},
+        extra_config={"strategy_profile": "baseline"},
+    )
+
+    assert len(results) == 1
+    assert observed["source_code"] == "def init(context):\n    pass\n"
+    assert observed["config"]["extra"]["strategy_profile"] == "baseline"
+    assert observed["config"]["mod"]["sys_analyser"]["benchmark"] == "512890.XSHG"
+    assert observed["config"]["mod"]["dividend_scorer"]["enabled"] is True
+    assert observed["config"]["mod"]["dividend_scorer"]["prior_blend"] == 0.7
