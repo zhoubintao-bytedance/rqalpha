@@ -1,0 +1,41 @@
+{
+  "fold_index": 3,
+  "prediction_metrics": {
+    "rank_ic_mean": -0.03299145483260758,
+    "rank_ic_ir": -0.1506618992325515,
+    "top_bucket_spread_mean": -0.02589316991090307,
+    "top_k_hit_rate": 0.41218487394957987
+  },
+  "validation_metrics": {
+    "rank_ic_mean": 0.01645028178567297,
+    "rank_ic_ir": 0.12317094406029588,
+    "top_bucket_spread_mean": -0.0017472519819765832,
+    "top_k_hit_rate": 0.3962809917355372
+  },
+  "portfolio_metrics": {
+    "mean_return": 0.00034242046852499546,
+    "max_drawdown": 0.0471103932792577,
+    "volatility": 0.0236583426451633,
+    "information_ratio_proxy": 0.22976066002338638,
+    "mean_turnover": 0.021728910475713546,
+    "mean_overlap": 0.9703779785187348,
+    "net_mean_return": 0.00027506084605028353,
+    "cost_drag_annual": 0.01697462486362742,
+    "cost_erosion_ratio": 0.19671610977249432,
+    "breakeven_cost_bps": 157.58750026041093
+  },
+  "stratified_metrics": {},
+  "row_counts": {
+    "train": 192541,
+    "val": 33515,
+    "test": 33441
+  },
+  "date_range": {
+    "train_start": null,
+    "train_end": "2019-03-08 00:00:00",
+    "val_start": "2019-04-09 00:00:00",
+    "val_end": "2019-10-08 00:00:00",
+    "test_start": "2019-11-06 00:00:00",
+    "test_end": "2020-05-05 00:00:00"
+  }
+}

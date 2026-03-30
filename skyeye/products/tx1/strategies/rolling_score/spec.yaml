@@ -9,20 +9,17 @@ rolling_score_start_date: "2019-02-01"
 hypothesis: 横截面动量、波动率与量价特征的组合，能够在A股大中盘股票池中产生稳定的相对沪深300超额收益。
 artifact_line_id: baseline_lgbm
 signal_inputs:
-  - mom_20d
   - mom_40d
-  - mom_60d
-  - excess_mom_20d
   - volatility_20d
-  - volume_ratio_20d
-  - benchmark_mom_20d
-  - regime_support
-positioning_rule: Top20买入、Top30持有、跌出Top30退出，equal-weight + 约束裁剪。
+  - reversal_5d
+  - amihud_20d
+positioning_rule: Top20买入、Top50持有、跌出Top50退出，equal-weight + 持仓延续加分 + 月度重平衡（20交易日）。
 risk_controls:
   - single_stock_cap
   - turnover_threshold
   - tradability_filter
-rebalance_frequency: event_driven
+  - holding_bonus
+rebalance_frequency: monthly
 expected_good_regimes:
   - 横截面分化明显的震荡市
   - 动量因子有效的趋势市

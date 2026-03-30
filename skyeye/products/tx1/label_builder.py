@@ -5,9 +5,11 @@ import pandas as pd
 
 
 class LabelBuilder(object):
-    def __init__(self, horizon=20, transform="raw"):
+    def __init__(self, horizon=20, transform="raw", winsorize=None):
         self.horizon = int(horizon)
         self.transform = transform
+        # winsorize: tuple (lower, upper) percentiles e.g. (0.01, 0.99), or None
+        self.winsorize = winsorize
 
     def build(self, dataset_df):
         if dataset_df is None or len(dataset_df) == 0:
@@ -49,7 +51,16 @@ class LabelBuilder(object):
         labeled["label_return_raw"] = labeled["asset_forward_return"] - labeled["benchmark_forward_return"]
         labeled = labeled.dropna(subset=["label_return_raw", "label_volatility_horizon", "label_max_drawdown_horizon"]).copy()
         labeled = labeled.sort_values(["date", "order_book_id"]).reset_index(drop=True)
-        labeled["target_label"] = self._transform_by_date(labeled, "label_return_raw")
+        if self.winsorize is not None:
+            lo, hi = self.winsorize
+            clipped = labeled.groupby("date")["label_return_raw"].transform(
+                lambda s: s.clip(lower=s.quantile(lo), upper=s.quantile(hi))
+            )
+            labeled["_winsorized"] = clipped
+            labeled["target_label"] = self._transform_by_date(labeled, "_winsorized")
+            labeled = labeled.drop(columns=["_winsorized"])
+        else:
+            labeled["target_label"] = self._transform_by_date(labeled, "label_return_raw")
         return labeled
 
     def _transform_by_date(self, frame, column):

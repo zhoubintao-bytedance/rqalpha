@@ -5,17 +5,10 @@ import pandas as pd
 
 
 FEATURE_COLUMNS = [
-    "mom_20d",
     "mom_40d",
-    "mom_60d",
-    "excess_mom_20d",
     "volatility_20d",
-    "volume_ratio_20d",
-    "benchmark_mom_20d",
-    "benchmark_mom_40d",
-    "benchmark_mom_60d",
-    "benchmark_volatility_20d",
-    "regime_support",
+    "reversal_5d",
+    "amihud_20d",
 ]
 
 

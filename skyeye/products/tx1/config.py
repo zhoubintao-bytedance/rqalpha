@@ -9,7 +9,8 @@ DEFAULT_CONFIG = {
     },
     "labels": {
         "horizon": 20,
-        "transform": "raw",
+        "transform": "rank",
+        "winsorize": None,
     },
     "splitter": {
         "train_years": 3,
@@ -22,7 +23,9 @@ DEFAULT_CONFIG = {
     },
     "portfolio": {
         "buy_top_k": 20,
-        "hold_top_k": 30,
+        "hold_top_k": 50,
+        "rebalance_interval": 20,
+        "holding_bonus": 0.5,
     },
     "evaluation": {
         "top_k": 20,
@@ -32,6 +35,12 @@ DEFAULT_CONFIG = {
         "commission_rate": 0.0008,
         "stamp_tax_rate": 0.0005,
         "slippage_bps": 5.0,
+    },
+    "preprocessing": {
+        "enabled": False,
+        "neutralize": True,
+        "winsorize_scale": 5.0,
+        "standardize": True,
     },
     "robustness": {
         "enabled": True,
@@ -70,7 +79,8 @@ def normalize_config(config=None):
     if cfg["dataset"]["input_window"] != FROZEN_INPUT_WINDOW:
         raise ValueError("phase-1 freezes input_window at {}".format(FROZEN_INPUT_WINDOW))
     if cfg["labels"]["horizon"] != FROZEN_HORIZON:
-        raise ValueError("phase-1 freezes horizon at {}".format(FROZEN_HORIZON))
+        if not cfg["labels"].get("allow_horizon_override", False):
+            raise ValueError("phase-1 freezes horizon at {}".format(FROZEN_HORIZON))
     if cfg["portfolio"]["buy_top_k"] <= 0 or cfg["portfolio"]["hold_top_k"] <= 0:
         raise ValueError("top-k values must be positive")
     if cfg["portfolio"]["hold_top_k"] < cfg["portfolio"]["buy_top_k"]:

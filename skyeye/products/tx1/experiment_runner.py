@@ -9,11 +9,12 @@ from skyeye.products.tx1.robustness import compute_regime_scores, compute_stabil
 
 
 class ExperimentRunner(object):
-    def __init__(self, config, dataset_builder, label_builder, splitter):
+    def __init__(self, config, dataset_builder, label_builder, splitter, preprocessor=None):
         self.config = config
         self.dataset_builder = dataset_builder
         self.label_builder = label_builder
         self.splitter = splitter
+        self.preprocessor = preprocessor
 
     def _build_cost_config(self):
         costs_cfg = self.config.get("costs", {})
@@ -34,11 +35,21 @@ class ExperimentRunner(object):
         portfolio_builder = PortfolioProxy(
             buy_top_k=self.config["portfolio"]["buy_top_k"],
             hold_top_k=self.config["portfolio"]["hold_top_k"],
+            rebalance_interval=self.config["portfolio"].get("rebalance_interval", 20),
+            holding_bonus=self.config["portfolio"].get("holding_bonus", 0.5),
         )
         for idx, fold in enumerate(folds, start=1):
             train_df = fold["train_df"].copy()
             val_df = fold["val_df"].copy()
             test_df = fold["test_df"].copy()
+
+            # Preprocessing inside fold to prevent data leakage
+            if self.preprocessor is not None:
+                feature_cols = [c for c in FEATURE_COLUMNS if c in train_df.columns]
+                train_df = self.preprocessor.transform(train_df, feature_cols)
+                val_df = self.preprocessor.transform(val_df, feature_cols)
+                test_df = self.preprocessor.transform(test_df, feature_cols)
+
             model = create_model(self.config["model"]["kind"], params=self.config["model"].get("params"))
             fit_kwargs = {}
             if hasattr(model, "fit") and "val_X" in model.fit.__code__.co_varnames:

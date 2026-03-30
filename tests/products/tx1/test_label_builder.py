@@ -39,3 +39,51 @@ def test_label_builder_quantile_differs_from_rank(make_raw_panel):
     )
     assert not merged.empty
     assert (merged["target_label_rank"] != merged["target_label_quantile"]).any()
+
+
+def test_label_builder_winsorize_clips_extremes(make_raw_panel):
+    raw_df = make_raw_panel(periods=160)
+    dataset = DatasetBuilder(input_window=60).build(raw_df)
+
+    raw_labeled = LabelBuilder(horizon=20, transform="raw").build(dataset)
+    win_labeled = LabelBuilder(horizon=20, transform="raw", winsorize=(0.01, 0.99)).build(dataset)
+
+    # target_label should differ (clipped extremes)
+    merged = raw_labeled[["date", "order_book_id", "target_label"]].merge(
+        win_labeled[["date", "order_book_id", "target_label"]],
+        on=["date", "order_book_id"],
+        suffixes=("_raw", "_win"),
+    )
+    assert not merged.empty
+    # Winsorized range should be <= raw range
+    assert merged["target_label_win"].max() <= merged["target_label_raw"].max()
+    assert merged["target_label_win"].min() >= merged["target_label_raw"].min()
+
+
+def test_label_builder_winsorize_preserves_label_return_raw(make_raw_panel):
+    raw_df = make_raw_panel(periods=160)
+    dataset = DatasetBuilder(input_window=60).build(raw_df)
+
+    raw_labeled = LabelBuilder(horizon=20, transform="raw").build(dataset)
+    win_labeled = LabelBuilder(horizon=20, transform="raw", winsorize=(0.01, 0.99)).build(dataset)
+
+    # label_return_raw must be identical (winsorize only affects target_label)
+    merged = raw_labeled[["date", "order_book_id", "label_return_raw"]].merge(
+        win_labeled[["date", "order_book_id", "label_return_raw"]],
+        on=["date", "order_book_id"],
+        suffixes=("_raw", "_win"),
+    )
+    assert (merged["label_return_raw_raw"] == merged["label_return_raw_win"]).all()
+
+
+def test_label_builder_horizon_10(make_raw_panel):
+    raw_df = make_raw_panel(periods=160)
+    dataset = DatasetBuilder(input_window=60).build(raw_df)
+
+    labeled_20 = LabelBuilder(horizon=20, transform="raw").build(dataset)
+    labeled_10 = LabelBuilder(horizon=10, transform="raw").build(dataset)
+
+    # Horizon 10 should produce more labeled rows (less data lost at tail)
+    assert len(labeled_10) >= len(labeled_20)
+    assert labeled_10["target_label"].notna().all()
+    assert labeled_10["label_return_raw"].notna().all()

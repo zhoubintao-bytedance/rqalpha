@@ -13,14 +13,14 @@ def test_runtime_builds_from_strategy_id_and_artifact_line():
     assert runtime["strategy_id"] == "tx1.rolling_score"
     assert runtime["artifact_line_id"] == "baseline_linear"
     assert runtime["benchmark"] == "000300.XSHG"
-    assert runtime["profile"]["profile"] == "baseline"
+    assert runtime["profile"]["profile"] == "smooth"
 
 
 def test_runtime_uses_spec_default_artifact_line_when_not_overridden():
     runtime = build_runtime(strategy_id="tx1.rolling_score")
 
-    assert runtime["artifact_line_id"] == "baseline_linear"
-    assert runtime["artifact"]["model_kind"] == "linear"
+    assert runtime["artifact_line_id"] == "baseline_lgbm"
+    assert runtime["artifact"]["model_kind"] == "lgbm"
 
 
 def test_runtime_allows_env_override_for_artifact_line(monkeypatch):

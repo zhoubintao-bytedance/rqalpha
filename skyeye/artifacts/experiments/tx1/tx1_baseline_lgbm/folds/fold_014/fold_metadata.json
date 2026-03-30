@@ -1,0 +1,41 @@
+{
+  "fold_index": 14,
+  "prediction_metrics": {
+    "rank_ic_mean": 0.02414171059546395,
+    "rank_ic_ir": 0.14851535846606398,
+    "top_bucket_spread_mean": -0.017565951397098895,
+    "top_k_hit_rate": 0.3635999999999999
+  },
+  "validation_metrics": {
+    "rank_ic_mean": 0.1789675892566394,
+    "rank_ic_ir": 0.750664284278153,
+    "top_bucket_spread_mean": 0.061054346610811085,
+    "top_k_hit_rate": 0.6278688524590164
+  },
+  "portfolio_metrics": {
+    "mean_return": -0.0008707416203712064,
+    "max_drawdown": 0.1351728717005748,
+    "volatility": 0.026932884170555345,
+    "information_ratio_proxy": -0.5132237087807123,
+    "mean_turnover": 0.021270949361271937,
+    "mean_overlap": 0.9693267813267812,
+    "net_mean_return": -0.0009366815633911492,
+    "cost_drag_annual": 0.016616865641025637,
+    "cost_erosion_ratio": Infinity,
+    "breakeven_cost_bps": 0.0
+  },
+  "stratified_metrics": {},
+  "row_counts": {
+    "train": 215065,
+    "val": 36600,
+    "test": 37500
+  },
+  "date_range": {
+    "train_start": null,
+    "train_end": "2024-09-08 00:00:00",
+    "val_start": "2024-10-16 00:00:00",
+    "val_end": "2025-04-15 00:00:00",
+    "test_start": "2025-05-19 00:00:00",
+    "test_end": "2025-11-18 00:00:00"
+  }
+}

@@ -93,7 +93,7 @@ class LightGBMModel(object):
         "reg_lambda": 2.0,
         "min_child_samples": 80,
         "verbose": -1,
-        "early_stopping_rounds": 0,
+        "early_stopping_rounds": 20,
     }
 
     def __init__(self, params=None):
