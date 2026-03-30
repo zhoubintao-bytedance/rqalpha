@@ -572,6 +572,23 @@ def handle_bar(context, bar_dict):
 4. **Missing bundle**: Ensure bundle is downloaded before running
 5. **Incorrect stock codes**: Use format like "000001.XSHE" (stock code + exchange)
 
+## Reference Strategy Library
+
+`skyeye/ref_src_strategy/` contains 592 curated strategies from JoinQuant (2020-2025). See `skyeye/ref_src_strategy/README.md` for full index and analysis.
+
+**Key strategies for TX1 development:**
+- XGBoost 60+ factor pipeline with preprocessing: `2021年度精选策略/28.XGBoost模型多因子策略分享.txt`
+- Northbound capital factor: `2021年度精选策略/29.北上资金因子分析与策略分享.txt`
+- CGO behavioral finance factor: `2021年度精选策略/37.处置效应的CGO因子.txt`
+- LightGBM hyperparameter tuning: `2023年度精选策略/71.lightGBM.txt`
+- XGBoost 6-month rolling window: `2024年度精选策略1/64.基于XGBoost_6m滚动选股策略.txt`
+- Alpha191 factor library: `2024年度精选策略1/33.年化46.77，alpha191因子选股.txt`
+
+**Reusable techniques:**
+- Preprocessing: `winsorize(5x MAD) -> industry impute -> neutralize(industry + mcap) -> standardize`
+- Feature engineering: turnover-weighted momentum, FF3 idiosyncratic volatility, CGO
+- Model: rolling training window, train on extreme performers only (top/bottom 30%)
+
 ## API Exploration
 
 ```bash
