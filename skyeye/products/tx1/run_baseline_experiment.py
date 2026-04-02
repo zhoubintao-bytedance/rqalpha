@@ -10,110 +10,204 @@ Usage:
 """
 
 import argparse
-import json
-import pickle
-import sys
 from pathlib import Path
 
-import h5py
-import numpy as np
 import pandas as pd
+from skyeye.data import DataFacade
 
-BUNDLE_DIR = Path.home() / ".rqalpha" / "bundle"
-BENCHMARK_ID = "000300.XSHG"   # CSI 300
+BENCHMARK_ID = "000300.XSHG"
 
-# Date range for the experiment
 TRAIN_START = "2015-01-01"
 DATA_END    = "2026-03-06"
 
-# Liquid universe: top-N stocks by median daily turnover (2015-2026)
 UNIVERSE_SIZE = 300
+DATA_FACADE = DataFacade()
+BAR_FIELDS = ["close", "volume", "total_turnover"]
 
 
-# ---------------------------------------------------------------------------
-# Data loading helpers
-# ---------------------------------------------------------------------------
+def _chunked(values: list[str], size: int):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def _normalize_multi_column_bars(
+    bars: pd.DataFrame,
+    fields: list[str],
+    single_order_book_id: str | None = None,
+) -> pd.DataFrame:
+    if single_order_book_id is not None:
+        data = {}
+        for field in fields:
+            for level in range(bars.columns.nlevels):
+                if field not in set(bars.columns.get_level_values(level)):
+                    continue
+                field_frame = bars.xs(field, axis=1, level=level, drop_level=True)
+                if isinstance(field_frame, pd.DataFrame):
+                    if single_order_book_id in field_frame.columns:
+                        data[field] = field_frame[single_order_book_id]
+                    else:
+                        data[field] = field_frame.iloc[:, 0]
+                else:
+                    data[field] = field_frame
+                break
+        df = pd.DataFrame(data, index=bars.index).reset_index()
+        df = df.rename(columns={df.columns[0]: "date"})
+        df.insert(1, "order_book_id", single_order_book_id)
+        return df
+
+    merged = None
+    for field in fields:
+        field_frame = None
+        for level in range(bars.columns.nlevels):
+            if field in set(bars.columns.get_level_values(level)):
+                field_frame = bars.xs(field, axis=1, level=level, drop_level=True)
+                break
+        if field_frame is None:
+            continue
+        if isinstance(field_frame, pd.Series):
+            part = field_frame.rename(field).reset_index()
+            part = part.rename(columns={part.columns[0]: "date"})
+            part.insert(1, "order_book_id", single_order_book_id or BENCHMARK_ID)
+        else:
+            part = field_frame.stack(dropna=False).rename(field).reset_index()
+            part = part.rename(columns={part.columns[0]: "date", part.columns[1]: "order_book_id"})
+        merged = part if merged is None else merged.merge(part, on=["date", "order_book_id"], how="outer")
+
+    if merged is None:
+        return pd.DataFrame(columns=["date", "order_book_id", *fields])
+    return merged
+
+
+def _normalize_daily_bars(
+    bars: pd.DataFrame | None,
+    fields: list[str],
+    single_order_book_id: str | None = None,
+) -> pd.DataFrame:
+    if bars is None or len(bars) == 0:
+        return pd.DataFrame(columns=["date", "order_book_id", *fields])
+
+    df = bars.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df = _normalize_multi_column_bars(df, fields, single_order_book_id)
+    elif isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index()
+    elif "date" not in df.columns and "datetime" not in df.columns:
+        df = df.reset_index()
+
+    if "date" not in df.columns:
+        if "datetime" in df.columns:
+            df = df.rename(columns={"datetime": "date"})
+        else:
+            for column in df.columns:
+                if pd.api.types.is_datetime64_any_dtype(df[column]):
+                    df = df.rename(columns={column: "date"})
+                    break
+
+    if "order_book_id" not in df.columns:
+        if single_order_book_id is not None:
+            insert_at = 1 if "date" in df.columns else 0
+            df.insert(insert_at, "order_book_id", single_order_book_id)
+        else:
+            for column in df.columns:
+                if column != "date" and df[column].dtype == object:
+                    df = df.rename(columns={column: "order_book_id"})
+                    break
+
+    keep = [column for column in ["date", "order_book_id", *fields] if column in df.columns]
+    df = df.loc[:, keep].copy()
+    if "date" not in df.columns or "order_book_id" not in df.columns:
+        return pd.DataFrame(columns=["date", "order_book_id", *fields])
+
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    for field in fields:
+        if field in df.columns:
+            df[field] = pd.to_numeric(df[field], errors="coerce")
+    return df.sort_values(["date", "order_book_id"]).reset_index(drop=True)
+
+
+def _load_stock_instruments(active_only: bool) -> pd.DataFrame:
+    instruments = DATA_FACADE.all_instruments(type="CS")
+    if instruments is None or instruments.empty:
+        raise RuntimeError("No stock instruments loaded")
+    instruments = instruments.copy()
+    if "exchange" in instruments.columns:
+        instruments = instruments[instruments["exchange"].isin(["XSHE", "XSHG"])]
+    if active_only and "status" in instruments.columns:
+        instruments = instruments[instruments["status"] == "Active"]
+    keep = [
+        "order_book_id",
+        "symbol",
+        "exchange",
+        "status",
+        "sector_code",
+        "sector_code_name",
+        "industry_code",
+        "industry_name",
+        "market_cap",
+        "market_capitalization",
+        "circulating_market_cap",
+    ]
+    keep = [c for c in keep if c in instruments.columns]
+    if keep:
+        instruments = instruments.loc[:, keep]
+    return instruments.reset_index(drop=True)
 
 def _load_benchmark_close() -> pd.DataFrame:
-    with h5py.File(BUNDLE_DIR / "indexes.h5", "r") as f:
-        if BENCHMARK_ID not in f:
-            raise KeyError(f"Benchmark {BENCHMARK_ID} not in indexes.h5")
-        ds = f[BENCHMARK_ID][:]
-    df = pd.DataFrame({
-        "date": pd.to_datetime(ds["datetime"].astype(str), format="%Y%m%d%H%M%S"),
-        "benchmark_close": ds["close"].astype(float),
-    })
-    df["date"] = df["date"].dt.normalize()
+    start_date = pd.Timestamp(TRAIN_START)
+    end_date = pd.Timestamp(DATA_END)
+    bars = DATA_FACADE.get_daily_bars(
+        BENCHMARK_ID,
+        start_date,
+        end_date,
+        fields=BAR_FIELDS,
+        adjust_type="none",
+    )
+    df = _normalize_daily_bars(bars, BAR_FIELDS, single_order_book_id=BENCHMARK_ID)
+    if df.empty or "close" not in df.columns:
+        raise RuntimeError(f"Benchmark {BENCHMARK_ID} has no daily bars")
+    df = df.loc[:, ["date", "close"]].rename(columns={"close": "benchmark_close"})
     return df.sort_values("date").reset_index(drop=True)
 
 
 def _load_all_stocks(universe: list[str], start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
-    """Batch-load all stocks from h5 in a single file open."""
-    start_dt = int(start_date.strftime("%Y%m%d")) * 1_000_000
-    end_dt = int(end_date.strftime("%Y%m%d")) * 1_000_000
-
-    rows = []
-    skipped = 0
-    with h5py.File(BUNDLE_DIR / "stocks.h5", "r") as f:
-        for i, sid in enumerate(universe):
-            if i % 50 == 0:
-                print(f"  {i}/{len(universe)}...", flush=True)
-            if sid not in f:
-                skipped += 1
-                continue
-            ds = f[sid][:]
-            mask = (ds["datetime"] >= start_dt) & (ds["datetime"] <= end_dt)
-            ds = ds[mask]
-            if len(ds) < 300:
-                skipped += 1
-                continue
-            dates = pd.to_datetime(ds["datetime"].astype(str), format="%Y%m%d%H%M%S").normalize()
-            df = pd.DataFrame({
-                "date": dates,
-                "order_book_id": sid,
-                "open": ds["open"].astype(float),
-                "high": ds["high"].astype(float),
-                "low": ds["low"].astype(float),
-                "close": ds["close"].astype(float),
-                "prev_close": ds["prev_close"].astype(float),
-                "volume": ds["volume"].astype(float),
-                "total_turnover": ds["total_turnover"].astype(float),
-            })
-            rows.append(df)
-
-    print(f"Loaded {len(rows)} stocks, skipped {skipped}")
-    if not rows:
+    bars = DATA_FACADE.get_daily_bars(
+        universe,
+        start_date,
+        end_date,
+        fields=BAR_FIELDS,
+        adjust_type="pre",
+    )
+    stocks_df = _normalize_daily_bars(bars, BAR_FIELDS)
+    if stocks_df.empty:
         raise RuntimeError("No stocks loaded")
-    return pd.concat(rows, ignore_index=True)
+    counts = stocks_df.groupby("order_book_id").size()
+    valid_ids = counts[counts >= 300].index
+    skipped = len(universe) - len(valid_ids)
+    stocks_df = stocks_df[stocks_df["order_book_id"].isin(valid_ids)].copy()
+    print(f"Loaded {len(valid_ids)} stocks, skipped {skipped}")
+    if stocks_df.empty:
+        raise RuntimeError("No stocks loaded")
+    return stocks_df.reset_index(drop=True)
 
 
 def _get_liquid_universe(n: int = UNIVERSE_SIZE) -> list[str]:
-    """Return top-N stocks by median daily turnover, filtered to active CS."""
-    with open(BUNDLE_DIR / "instruments.pk", "rb") as f:
-        instruments = pickle.load(f)
-
-    active_cs = {
-        inst["order_book_id"]
-        for inst in instruments
-        if inst["type"] == "CS"
-        and inst["exchange"] in ("XSHE", "XSHG")
-        and inst.get("status") == "Active"
-    }
-
-    start_dt = int(TRAIN_START.replace("-", "")) * 1_000_000
-    end_dt = int(DATA_END.replace("-", "")) * 1_000_000
-
+    instruments = _load_stock_instruments(active_only=True)
+    active_cs = instruments["order_book_id"].tolist()
     medians = {}
-    with h5py.File(BUNDLE_DIR / "stocks.h5", "r") as f:
-        for sid in active_cs:
-            if sid not in f:
-                continue
-            ds = f[sid][:]
-            mask = (ds["datetime"] >= start_dt) & (ds["datetime"] <= end_dt)
-            vol = ds["volume"][mask].astype(float)
-            if len(vol) < 500:          # need enough history
-                continue
-            medians[sid] = float(np.median(vol))
+    for chunk in _chunked(active_cs, 500):
+        bars = DATA_FACADE.get_daily_bars(
+            chunk,
+            pd.Timestamp(TRAIN_START),
+            pd.Timestamp(DATA_END),
+            fields=BAR_FIELDS,
+            adjust_type="pre",
+        )
+        stocks_df = _normalize_daily_bars(bars, BAR_FIELDS)
+        if stocks_df.empty or "volume" not in stocks_df.columns:
+            continue
+        grouped = stocks_df.groupby("order_book_id")["volume"].agg(["size", "median"])
+        grouped = grouped[grouped["size"] >= 500]
+        medians.update(grouped["median"].astype(float).to_dict())
 
     sorted_stocks = sorted(medians, key=lambda s: medians[s], reverse=True)
     return sorted_stocks[:n]
@@ -124,38 +218,40 @@ def _get_liquid_universe(n: int = UNIVERSE_SIZE) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _load_sector_map() -> dict:
-    """Load sector_code mapping from instruments.pk."""
-    with open(BUNDLE_DIR / "instruments.pk", "rb") as f:
-        instruments = pickle.load(f)
+    instruments = _load_stock_instruments(active_only=False)
+    sector_field = next(
+        (
+            field
+            for field in ["sector_code", "industry_code", "sector_code_name", "industry_name"]
+            if field in instruments.columns
+        ),
+        None,
+    )
+    if sector_field is None:
+        return {}
     return {
-        inst["order_book_id"]: inst.get("sector_code", "Unknown")
-        for inst in instruments
-        if inst.get("type") == "CS"
+        row["order_book_id"]: row.get(sector_field) or "Unknown"
+        for _, row in instruments.iterrows()
     }
 
 
 def _load_northbound_flow() -> pd.DataFrame:
-    """Load daily northbound net flow from akshare (沪股通+深股通 combined)."""
+    """Load daily northbound net flow (沪股通+深股通 combined)."""
     try:
-        import akshare as ak
-        parts = []
-        for symbol in ("沪股通", "深股通"):
-            df = ak.stock_hsgt_hist_em(symbol=symbol)
-            date_col = [c for c in df.columns if "日期" in c]
-            flow_col = [c for c in df.columns if "当日成交净买额" in c or "当日净流入" in c]
-            if not date_col or not flow_col:
-                continue
-            part = pd.DataFrame({
-                "date": pd.to_datetime(df[date_col[0]], errors="coerce"),
-                "flow": pd.to_numeric(df[flow_col[0]], errors="coerce"),
-            }).dropna()
-            parts.append(part)
-        if not parts:
-            return pd.DataFrame(columns=["date", "north_net_flow"])
-        combined = pd.concat(parts, ignore_index=True)
-        result = combined.groupby("date", as_index=False)["flow"].sum()
-        result.columns = ["date", "north_net_flow"]
-        return result.sort_values("date").reset_index(drop=True)
+        from skyeye.data.provider import RQDataProvider
+        provider = RQDataProvider()
+        df = provider.get_northbound_flow(TRAIN_START, DATA_END)
+        if df is not None and not df.empty:
+            # Normalize column names
+            date_col = [c for c in df.columns if "date" in c.lower()]
+            flow_col = [c for c in df.columns if "flow" in c.lower() or "net" in c.lower()]
+            if date_col and flow_col:
+                result = pd.DataFrame({
+                    "date": pd.to_datetime(df[date_col[0]], errors="coerce"),
+                    "north_net_flow": pd.to_numeric(df[flow_col[0]], errors="coerce"),
+                }).dropna()
+                return result.sort_values("date").reset_index(drop=True)
+        return pd.DataFrame(columns=["date", "north_net_flow"])
     except Exception as e:
         print(f"Warning: northbound data unavailable ({e}), skipping")
         return pd.DataFrame(columns=["date", "north_net_flow"])

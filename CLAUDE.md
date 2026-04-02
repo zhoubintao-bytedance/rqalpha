@@ -589,6 +589,36 @@ def handle_bar(context, bar_dict):
 - Feature engineering: turnover-weighted momentum, FF3 idiosyncratic volatility, CGO
 - Model: rolling training window, train on extreme performers only (top/bottom 30%)
 
+## RQData API Reference
+
+Full RQData Python API reference for A-share stock data is at [`docs/rqdata-api-reference.md`](docs/rqdata-api-reference.md).
+
+**Quick overview (~72 APIs across 14 categories)**:
+
+| Category | Key APIs |
+|----------|----------|
+| Instrument & Calendar | `all_instruments`, `instruments`, `id_convert`, `get_trading_dates`, `get_previous/next_trading_date` |
+| Market Data | `get_price`(core: OHLCV bars+tick, all frequencies), `current_snapshot`, `get_ticks`, `get_vwap`, `get_yield_curve` |
+| Index Data | `index_components`, `index_weights`, `index_indicator`(PE/PB/div yield) |
+| Financial Statements | `get_pit_financials_ex`(PIT三大表), `current_performance`(快报), `performance_forecast`(业绩预告) |
+| Factor Data | `get_factor`(200+ factors), `get_all_factor_names` — categories: valuation, operating, cashflow, financial, growth, alpha101, technical |
+| Share Capital | `get_shares`, `get_main_shareholder`, `get_holder_number`, `get_restricted_shares` |
+| Dividend & Split | `get_dividend`, `get_split`, `get_ex_factor` |
+| Industry & Concept | `get_instrument_industry`(CITIC/Gildata), `get_industry`, `get_concept`, `sector`(GICS) |
+| Turnover/ST/Suspension | `get_turnover_rate`, `is_suspended`, `is_st_stock` |
+| Capital Flow | `get_capital_flow`(daily/minute/tick) |
+| Margin Trading | `get_securities_margin`, `get_margin_stocks` |
+| Stock Connect | `get_stock_connect`(北向持股), `current_stock_connect_quota` |
+| Corporate Actions | `get_private_placement`, `get_buy_back`, `get_block_trade`, `get_announcement` |
+| Dragon & Tiger Board | `get_abnormal_stocks`, `get_abnormal_stocks_detail` |
+
+**Common patterns**:
+- `import rqdatac; rqdatac.init(username, password)` — must init before use
+- Date params: `int`(20230101), `str`('2023-01-01'), `datetime.date`, `pd.Timestamp`
+- order_book_id: `'000001.XSHE'`(SZSE), `'600000.XSHG'`(SSE)
+- Quarter: `'2015q1'`~`'2015q4'`
+- `market='cn'`(default) or `'hk'`
+
 ## API Exploration
 
 ```bash

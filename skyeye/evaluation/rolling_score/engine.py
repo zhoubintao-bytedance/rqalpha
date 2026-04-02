@@ -19,7 +19,6 @@ import warnings
 import unicodedata
 from collections import OrderedDict
 
-import h5py
 import numpy as np
 import pandas as pd
 from dateutil.relativedelta import relativedelta
@@ -27,6 +26,7 @@ from dateutil.relativedelta import relativedelta
 from rqalpha import run
 from skyeye.evaluation.rolling_score.report import build_strategy_card_lines, render_box
 from skyeye.products.registry import find_strategy_spec_by_file
+from skyeye.data import DataFacade
 
 # ============================================================
 # 1. 常量与配置
@@ -944,20 +944,12 @@ def compute_stability_score(quarterly_scores):
 # ============================================================
 
 def read_daily_bars(order_book_id, start_date, end_date):
-    """从 bundle 读取指定股票的日线数据"""
-    bundle_path = os.path.expanduser("~/.rqalpha/bundle")
-    for filename in ["stocks.h5", "indexes.h5", "funds.h5"]:
-        filepath = os.path.join(bundle_path, filename)
-        if not os.path.exists(filepath):
-            continue
-        with h5py.File(filepath, "r") as h5:
-            if order_book_id in h5:
-                bars = h5[order_book_id][:]
-                df = pd.DataFrame(bars)
-                df["date"] = pd.to_datetime(df["datetime"].astype(str).str[:8], format="%Y%m%d")
-                df = df.set_index("date").sort_index()
-                return df.loc[str(start_date):str(end_date)]
-    return None
+    df = DataFacade().get_daily_bars(order_book_id, start_date, end_date, fields=["close"], adjust_type="none")
+    if df is None or df.empty:
+        return None
+    if "order_book_id" in df.columns:
+        df = df.drop(columns=["order_book_id"])
+    return df
 
 
 def plot_trades(window_results):
@@ -1032,23 +1024,14 @@ def plot_trades(window_results):
 
 
 def get_benchmark_quarterly_returns():
-    """从 bundle 读取沪深300季度涨跌幅"""
-    bundle_path = os.path.expanduser("~/.rqalpha/bundle")
-    filepath = os.path.join(bundle_path, "indexes.h5")
-    if not os.path.exists(filepath):
+    df = DataFacade().get_daily_bars("000300.XSHG", "2000-01-01", "2999-12-31", fields=["close"], adjust_type="none")
+    if df is None or df.empty:
         return {}
-    with h5py.File(filepath, "r") as h5:
-        if "000300.XSHG" not in h5:
-            return {}
-        bars = h5["000300.XSHG"][:]
-
-    df = pd.DataFrame(bars)
-    df["date"] = pd.to_datetime(df["datetime"].astype(str), format="%Y%m%d%H%M%S")
-    df = df.set_index("date").sort_index()
-
+    if "order_book_id" in df.columns:
+        df = df.drop(columns=["order_book_id"])
+    df = df.sort_index()
     quarterly_close = df["close"].resample("QE").last()
     quarterly_returns = quarterly_close.pct_change().dropna()
-
     result = {}
     for date, ret in quarterly_returns.items():
         result[(date.year, (date.month - 1) // 3 + 1)] = ret
@@ -1135,31 +1118,33 @@ TYPE_LABELS = {"CS": "股票", "ETF": "ETF", "LOF": "LOF", "INDX": "指数"}
 EXCHANGE_LABELS = {"XSHE": "深交所", "XSHG": "上交所"}
 
 def search_instruments(pattern):
-    """从 bundle 的 instruments.pk 中搜索匹配的证券"""
-    pkl_path = os.path.join(os.path.expanduser("~/.rqalpha/bundle"), "instruments.pk")
-    if not os.path.exists(pkl_path):
-        print("错误: instruments.pk 不存在，请先运行 rqalpha download-bundle")
-        sys.exit(1)
-
     try:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         print(f"错误: 无效的正则表达式 '{pattern}': {e}")
         sys.exit(1)
-
-    with open(pkl_path, "rb") as f:
-        instruments = pickle.load(f)
-
+    facade = DataFacade()
+    frames = []
+    for t in ["CS", "ETF", "LOF", "INDX"]:
+        df = facade.all_instruments(type=t)
+        if df is None or df.empty:
+            continue
+        frames.append(df)
+    if not frames:
+        print(f'搜索: "{pattern}" — 未找到匹配项')
+        return
+    ins_df = pd.concat(frames, axis=0, ignore_index=True, sort=False)
+    ins_df = ins_df[ins_df.get("status") == "Active"]
     matches = []
-    for ins in instruments:
-        if ins.get("type") not in SEARCH_TYPES:
-            continue
-        if ins.get("status") != "Active":
-            continue
+    for _, ins in ins_df.iterrows():
         ob_id = ins.get("order_book_id", "")
         symbol = ins.get("symbol", "")
-        if regex.search(ob_id) or regex.search(symbol):
-            matches.append(ins)
+        if pd.isna(ob_id):
+            ob_id = ""
+        if pd.isna(symbol):
+            symbol = ""
+        if regex.search(str(ob_id)) or regex.search(str(symbol)):
+            matches.append(ins.to_dict())
 
     matches.sort(key=lambda x: x.get("order_book_id", ""))
 

@@ -4,23 +4,18 @@ import os
 import re
 import sqlite3
 import time
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime
-from http.client import RemoteDisconnected
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from requests.exceptions import RequestException
-from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from rqalpha.data.data_proxy import DataProxy
 from rqalpha.data.base_data_source.data_source import BaseDataSource
 from rqalpha.utils import RqAttrDict
-from rqalpha.utils.datetime_func import convert_int_to_date
 
+from skyeye.data import DataFacade
+from skyeye.data.provider import RQDataProvider
 from skyeye.products.dividend_low_vol.scorer.config import (
-    API_CALL_INTERVAL,
     CACHE_DB_PATH,
     CACHE_EXPIRED_DAYS,
     CACHE_STALE_DAYS,
@@ -31,14 +26,6 @@ from skyeye.products.dividend_low_vol.scorer.config import (
     SYNC_OVERLAP_TRADING_DAYS,
 )
 
-AKSHARE_MAX_RETRIES = 3
-AKSHARE_RETRY_BASE_DELAY = 1.0
-AKSHARE_RETRIABLE_EXCEPTIONS = (
-    RequestException,
-    RemoteDisconnected,
-    Urllib3HTTPError,
-    TimeoutError,
-)
 SQLITE_CONNECT_TIMEOUT = 30
 SQLITE_BUSY_TIMEOUT_MS = 30000
 SQLITE_INIT_RETRIES = 3
@@ -257,10 +244,19 @@ class DataFetcher(object):
         self.data_proxy = data_proxy
         self.bundle_path = os.path.expanduser(bundle_path) if bundle_path else None
         self._bundle_proxy = None
+        self.facade = DataFacade()
+        self.provider = RQDataProvider()
+        self._etf_order_book_id = self._to_order_book_id(etf_code, "XSHG")
+        self._index_order_book_id = self._to_order_book_id(index_code, "XSHG")
         self._init_db()
 
+    @staticmethod
+    def _to_order_book_id(code, default_exchange):
+        if "." in code:
+            return code
+        return "{}.{}".format(code, default_exchange)
+
     def sync_all(self, start_date=None, end_date=None, progress=None):
-        ak = self._require_akshare()
         start_date = self._normalize_date(start_date) if start_date is not None else None
         end_date = self._normalize_date(end_date or datetime.now().date())
         progress = progress or NullSyncProgress()
@@ -275,7 +271,7 @@ class DataFetcher(object):
                     label="指数估值",
                     start_date=index_start,
                     end_date=index_end,
-                    runner=lambda: self._sync_index_daily(conn, ak, index_start, index_end),
+                    runner=lambda: self._sync_index_daily(conn, index_start, index_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "index_daily", rows),
                 )
 
@@ -287,7 +283,7 @@ class DataFetcher(object):
                     label="ETF行情",
                     start_date=etf_daily_start,
                     end_date=etf_daily_end,
-                    runner=lambda: self._sync_etf_daily(conn, ak, etf_daily_start, etf_daily_end),
+                    runner=lambda: self._sync_etf_daily(conn, etf_daily_start, etf_daily_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "etf_daily", rows),
                 )
 
@@ -299,7 +295,7 @@ class DataFetcher(object):
                     label="ETF净值",
                     start_date=etf_nav_start,
                     end_date=etf_nav_end,
-                    runner=lambda: self._sync_etf_nav(conn, ak, etf_nav_start, etf_nav_end),
+                    runner=lambda: self._sync_etf_nav(conn, etf_nav_start, etf_nav_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "etf_nav", rows),
                 )
 
@@ -311,7 +307,7 @@ class DataFetcher(object):
                     label="国债利率",
                     start_date=bond_start,
                     end_date=bond_end,
-                    runner=lambda: self._sync_bond_yield(conn, ak, bond_start, bond_end),
+                    runner=lambda: self._sync_bond_yield(conn, bond_start, bond_end),
                     detail_formatter=lambda rows: self._format_done_detail(conn, "bond_yield", rows),
                 )
 
@@ -323,7 +319,7 @@ class DataFetcher(object):
                     label="指数权重",
                     start_date=weight_start,
                     end_date=weight_end,
-                    runner=lambda: self._sync_index_weights(conn, ak),
+                    runner=lambda: self._sync_index_weights(conn),
                     detail_formatter=lambda codes: self._format_done_detail(conn, "index_weight", len(codes)),
                     skip_value_factory=lambda: self._load_cached_stock_codes(conn),
                 )
@@ -337,7 +333,7 @@ class DataFetcher(object):
                     start_date=stock_start,
                     end_date=stock_end,
                     runner=lambda: self._sync_stock_indicators(
-                        conn, ak, stock_codes, stock_start, stock_end,
+                        conn, stock_codes, stock_start, stock_end,
                         name_map=self._load_stock_name_map(conn),
                         progress=progress,
                     ),
@@ -632,34 +628,33 @@ class DataFetcher(object):
         if last_exc is not None:
             raise last_exc
 
-    def _sync_index_daily(self, conn, ak, start_date, end_date):
+    def _sync_index_daily(self, conn, start_date, end_date):
         inserted_rows = 0
-        range_start = self._normalize_date(start_date).replace("-", "")
-        range_end = self._normalize_date(end_date).replace("-", "")
-        df = self._call_akshare(
-            ak.stock_zh_index_hist_csindex,
-            symbol=self.index_code,
-            start_date=range_start,
-            end_date=range_end,
-        )
-        if df is None or df.empty:
-            df = pd.DataFrame()
-        df = self._filter_date_range(df, start_date, end_date)
         now = datetime.now().isoformat()
-        if not df.empty:
-            date_col = self._find_column(df, ("date", "日期", "trade_date"))
-            close_col = self._find_column(df, ("close", "收盘", "收盘价"))
-            pe_col = self._find_column(df, ("pe_ttm", "滚动市盈率", "市盈率ttm", "滚动市盈率ttm"))
-            volume_col = self._find_column(df, ("volume", "成交量"))
-            amount_col = self._find_column(df, ("amount", "成交额", "成交金额"))
+
+        # Index OHLCV from rqdatac
+        df = self.provider.get_index_price(
+            self._index_order_book_id, start_date, end_date,
+            fields=["close", "volume", "total_turnover"],
+        )
+        if df is not None and not df.empty:
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index()
+            else:
+                df = df.reset_index().rename(columns={"index": "date"})
+            if "date" not in df.columns:
+                for col in df.columns:
+                    if "date" in str(col).lower() or "trading_date" in str(col).lower():
+                        df = df.rename(columns={col: "date"})
+                        break
             rows = [
                 (
-                    self._normalize_date(row[date_col]),
+                    self._normalize_date(row.get("date")),
                     self.index_code,
-                    self._maybe_float(row.get(close_col)),
-                    self._maybe_float(row.get(pe_col)),
-                    self._maybe_float(row.get(volume_col)),
-                    self._maybe_float(row.get(amount_col)),
+                    self._maybe_float(row.get("close")),
+                    None,  # pe_ttm filled below
+                    self._maybe_float(row.get("volume")),
+                    self._maybe_float(row.get("total_turnover")),
                     now,
                 )
                 for _, row in df.iterrows()
@@ -668,173 +663,114 @@ class DataFetcher(object):
                 conn.executemany(UPSERT_INDEX_DAILY_SQL, rows)
                 inserted_rows += len(rows)
 
-        valuation_df = self._fetch_index_value_csindex(ak)
-        valuation_df = self._filter_date_range(valuation_df, start_date, end_date)
+        # Index valuation (PE) from rqdatac
+        valuation_df = self.provider.get_index_indicator(
+            self._index_order_book_id, start_date, end_date,
+        )
         if valuation_df is not None and not valuation_df.empty:
-            date_col = self._find_column(valuation_df, ("date", "日期", "trade_date"))
-            pe_col = self._find_column(valuation_df, ("pe_ttm", "市盈率1"))
-            pe_rows = [
-                (
-                    self._normalize_date(row[date_col]),
-                    self.index_code,
-                    self._maybe_float(row.get(pe_col)),
-                    now,
-                )
-                for _, row in valuation_df.iterrows()
-                if date_col is not None and pe_col is not None
-            ]
-            if pe_rows:
-                conn.executemany(UPSERT_INDEX_PE_SQL, pe_rows)
-                inserted_rows += len(pe_rows)
+            if isinstance(valuation_df.index, pd.MultiIndex):
+                valuation_df = valuation_df.reset_index()
+            else:
+                valuation_df = valuation_df.reset_index().rename(columns={"index": "date"})
+            if "date" not in valuation_df.columns:
+                for col in valuation_df.columns:
+                    if "date" in str(col).lower():
+                        valuation_df = valuation_df.rename(columns={col: "date"})
+                        break
+            pe_col = self._find_column(valuation_df, ("pe_ttm", "pe_ratio_ttm", "pe"))
+            if pe_col is not None:
+                pe_rows = [
+                    (
+                        self._normalize_date(row.get("date")),
+                        self.index_code,
+                        self._maybe_float(row.get(pe_col)),
+                        now,
+                    )
+                    for _, row in valuation_df.iterrows()
+                ]
+                if pe_rows:
+                    conn.executemany(UPSERT_INDEX_PE_SQL, pe_rows)
+                    inserted_rows += len(pe_rows)
 
         if inserted_rows == 0:
             return 0
         self._update_meta(conn, "index_daily", "index_daily", self.index_code)
         return inserted_rows
 
-    def _sync_etf_daily(self, conn, ak, start_date, end_date):
-        target_end = self._resolve_source_sync_end_date("etf_daily", end_date)
-        raw_df = pd.DataFrame()
-        hfq_df = pd.DataFrame()
-        primary_error = None
-        try:
-            raw_df = self._fetch_etf_history(ak, adjust="", start_date=start_date, end_date=end_date)
-            hfq_df = self._fetch_etf_history(ak, adjust="hfq", start_date=start_date, end_date=end_date)
-        except RuntimeError as exc:
-            primary_error = exc
-        raw_df = self._filter_date_range(raw_df, start_date, end_date)
-        hfq_df = self._filter_date_range(hfq_df, start_date, end_date) if hfq_df is not None else pd.DataFrame()
-
-        raw_latest = self._frame_latest_date(raw_df)
-        hfq_latest = self._frame_latest_date(hfq_df)
-
-        if raw_latest is None or raw_latest < target_end:
-            raw_df = self._merge_etf_history_frames(
-                raw_df,
-                self._fetch_etf_history_sina(ak, start_date=start_date, end_date=end_date),
-            )
-            raw_latest = self._frame_latest_date(raw_df)
-
-        if raw_latest is None or raw_latest < target_end or hfq_latest is None:
-            bundle_raw, bundle_hfq = self._load_etf_history_from_bundle(start_date, end_date)
-            if raw_latest is None or raw_latest < target_end:
-                raw_df = self._merge_etf_history_frames(raw_df, bundle_raw)
-                raw_latest = self._frame_latest_date(raw_df)
-            hfq_df = self._merge_etf_history_frames(hfq_df, bundle_hfq)
-
+    def _sync_etf_daily(self, conn, start_date, end_date):
+        # Raw (unadjusted) ETF price
+        raw_df = self.provider.get_price(
+            self._etf_order_book_id, start_date, end_date,
+            frequency="1d", adjust_type="none",
+        )
         if raw_df is None or raw_df.empty:
-            if primary_error is not None:
-                raise RuntimeError(
-                    "ETF daily sync failed from AKShare, and no fallback history is available: {}".format(primary_error)
-                ) from primary_error
             return 0
-        raw_df = self._filter_date_range(raw_df, start_date, end_date)
-        if raw_df.empty:
-            return 0
-        hfq_df = self._filter_date_range(hfq_df, start_date, end_date) if hfq_df is not None else pd.DataFrame()
-        raw_date_col = self._find_column(raw_df, ("date", "日期", "trade_date"))
+
+        # Post-adjusted close for close_hfq
+        hfq_df = self.provider.get_price(
+            self._etf_order_book_id, start_date, end_date,
+            frequency="1d", adjust_type="post", fields=["close"],
+        )
         hfq_close_map = {}
         if hfq_df is not None and not hfq_df.empty:
-            hfq_date_col = self._find_column(hfq_df, ("date", "日期", "trade_date"))
-            hfq_close_col = self._find_column(hfq_df, ("close", "收盘", "收盘价"))
-            hfq_close_map = {
-                self._normalize_date(date): self._maybe_float(value)
-                for date, value in zip(hfq_df[hfq_date_col], hfq_df[hfq_close_col])
-            }
+            hfq_reset = hfq_df.reset_index()
+            if "date" not in hfq_reset.columns:
+                for col in hfq_reset.columns:
+                    if "date" in str(col).lower():
+                        hfq_reset = hfq_reset.rename(columns={col: "date"})
+                        break
+            for _, row in hfq_reset.iterrows():
+                hfq_close_map[self._normalize_date(row.get("date"))] = self._maybe_float(row.get("close"))
+
+        raw_reset = raw_df.reset_index()
+        if "date" not in raw_reset.columns:
+            for col in raw_reset.columns:
+                if "date" in str(col).lower():
+                    raw_reset = raw_reset.rename(columns={col: "date"})
+                    break
+
         now = datetime.now().isoformat()
         rows = []
-        for _, row in raw_df.iterrows():
-            date_value = self._normalize_date(row[raw_date_col])
+        for _, row in raw_reset.iterrows():
+            date_value = self._normalize_date(row.get("date"))
             rows.append((
                 date_value,
                 self.etf_code,
-                self._maybe_float(row.get(self._find_column(raw_df, ("open", "开盘")))),
-                self._maybe_float(row.get(self._find_column(raw_df, ("high", "最高")))),
-                self._maybe_float(row.get(self._find_column(raw_df, ("low", "最低")))),
-                self._maybe_float(row.get(self._find_column(raw_df, ("close", "收盘", "收盘价")))),
+                self._maybe_float(row.get("open")),
+                self._maybe_float(row.get("high")),
+                self._maybe_float(row.get("low")),
+                self._maybe_float(row.get("close")),
                 hfq_close_map.get(date_value),
-                self._maybe_float(row.get(self._find_column(raw_df, ("volume", "成交量")))),
-                self._maybe_float(row.get(self._find_column(raw_df, ("amount", "成交额", "成交金额")))),
-                self._maybe_float(row.get(self._find_column(raw_df, ("turnover_rate", "换手率")))),
+                self._maybe_float(row.get("volume")),
+                self._maybe_float(row.get("total_turnover")),
+                None,  # turnover_rate not in get_price; will be filled if needed
                 now,
             ))
         conn.executemany(UPSERT_ETF_DAILY_SQL, rows)
         self._update_meta(conn, "etf_daily", "etf_daily", self.etf_code)
         return len(rows)
 
-    def _fetch_etf_history_sina(self, ak, start_date=None, end_date=None):
-        func = getattr(ak, "fund_etf_hist_sina", None)
-        if func is None:
-            return pd.DataFrame()
-        for symbol in self._candidate_etf_sina_symbols():
-            try:
-                df = self._call_akshare(func, symbol=symbol)
-            except RuntimeError:
-                continue
-            df = self._filter_date_range(df, start_date, end_date)
-            if df is not None and not df.empty:
-                return df
-        return pd.DataFrame()
-
-    def _load_etf_history_from_bundle(self, start_date, end_date):
-        data_proxy = self.data_proxy or self._bundle_data_proxy()
-        if data_proxy is None:
-            return pd.DataFrame(), pd.DataFrame()
-
-        order_book_id = self._resolve_etf_order_book_id(data_proxy)
-        if order_book_id is None:
-            return pd.DataFrame(), pd.DataFrame()
-
-        end_dt = pd.Timestamp(end_date).to_pydatetime()
-        raw_bars = data_proxy.history_bars(
-            order_book_id,
-            None,
-            "1d",
-            ["datetime", "open", "high", "low", "close", "volume", "total_turnover"],
-            end_dt,
-            skip_suspended=False,
-            include_now=True,
-            adjust_type="none",
-        )
-        hfq_bars = data_proxy.history_bars(
-            order_book_id,
-            None,
-            "1d",
-            ["datetime", "close"],
-            end_dt,
-            skip_suspended=False,
-            include_now=True,
-            adjust_type="post",
-        )
-
-        raw_df = self._bars_to_etf_daily_frame(raw_bars, start_date, end_date)
-        hfq_df = self._bars_to_hfq_close_frame(hfq_bars, start_date, end_date)
-        return raw_df, hfq_df
-
-    def _sync_etf_nav(self, conn, ak, start_date, end_date, progress=None):
-        range_start = self._normalize_date(start_date).replace("-", "")
-        range_end = self._normalize_date(end_date).replace("-", "")
-        df = self._call_akshare(
-            ak.fund_etf_fund_info_em,
-            fund=self.etf_code,
-            start_date=range_start,
-            end_date=range_end,
+    def _sync_etf_nav(self, conn, start_date, end_date, progress=None):
+        # rqdatac ETF price includes 'iopv' field as NAV proxy
+        df = self.provider.get_price(
+            self._etf_order_book_id, start_date, end_date,
+            frequency="1d", adjust_type="none", fields=["iopv", "close"],
         )
         if df is None or df.empty:
             return 0
-        df = self._filter_date_range(df, start_date, end_date)
-        if df.empty:
-            return 0
-        date_col = self._find_column(df, ("date", "净值日期", "日期"))
-        nav_col = self._find_column(df, ("nav", "单位净值"))
-        acc_nav_col = self._find_column(df, ("acc_nav", "累计净值"))
+        df = df.reset_index()
+        if "date" not in df.columns:
+            for col in df.columns:
+                if "date" in str(col).lower():
+                    df = df.rename(columns={col: "date"})
+                    break
         now = datetime.now().isoformat()
         rows = [
             (
-                self._normalize_date(row[date_col]),
+                self._normalize_date(row.get("date")),
                 self.etf_code,
-                self._maybe_float(row.get(nav_col)),
-                self._maybe_float(row.get(acc_nav_col)),
+                self._maybe_float(row.get("iopv")),
+                None,  # acc_nav not available from rqdatac
                 now,
             )
             for _, row in df.iterrows()
@@ -843,21 +779,25 @@ class DataFetcher(object):
         self._update_meta(conn, "etf_nav", "etf_nav", self.etf_code)
         return len(rows)
 
-    def _sync_bond_yield(self, conn, ak, start_date, end_date):
-        start_key = self._normalize_date(start_date).replace("-", "")
-        df = self._call_akshare(ak.bond_zh_us_rate, start_date=start_key)
+    def _sync_bond_yield(self, conn, start_date, end_date):
+        df = self.provider.get_bond_yield(start_date, end_date, tenor="10Y")
         if df is None or df.empty:
             return 0
-        df = self._filter_date_range(df, start_date, end_date)
-        if df.empty:
+        df = df.reset_index()
+        if "date" not in df.columns:
+            for col in df.columns:
+                if "date" in str(col).lower() or "trading" in str(col).lower():
+                    df = df.rename(columns={col: "date"})
+                    break
+        yield_col = self._find_column(df, ("10Y", "china_10y"))
+        if yield_col is None:
             return 0
-        date_col = self._find_column(df, ("date", "日期"))
-        yield_col = self._find_column(df, ("china_10y", "中国国债收益率10年"))
         now = datetime.now().isoformat()
         rows = [
             (
-                self._normalize_date(row[date_col]),
-                self._maybe_float(row.get(yield_col)),
+                self._normalize_date(row.get("date")),
+                # rqdatac returns decimal (0.025 = 2.5%), convert to percentage for SQLite schema
+                self._maybe_float(row.get(yield_col)) * 100.0 if self._maybe_float(row.get(yield_col)) is not np.nan else np.nan,
                 now,
             )
             for _, row in df.iterrows()
@@ -866,28 +806,33 @@ class DataFetcher(object):
         self._update_meta(conn, "bond_yield", "bond_yield", None)
         return len(rows)
 
-    def _sync_index_weights(self, conn, ak):
-        df = self._call_akshare(ak.index_stock_cons_weight_csindex, symbol=self.index_code)
-        if df is None or df.empty:
+    def _sync_index_weights(self, conn):
+        weights = self.provider.get_index_weights(self._index_order_book_id)
+        if weights is None or weights.empty:
             return []
-        date_col = self._find_column(df, ("snapshot_date", "日期", "调整日期"))
-        code_col = self._find_column(df, ("stock_code", "成分券代码", "证券代码"))
-        name_col = self._find_column(df, ("stock_name", "成分券名称", "证券简称"))
-        weight_col = self._find_column(df, ("weight", "权重"))
-        snapshot_date = self._normalize_date(df[date_col].iloc[0]) if date_col else datetime.now().strftime("%Y-%m-%d")
+        # weights is a Series: index=order_book_id, value=weight
+        snapshot_date = datetime.now().strftime("%Y-%m-%d")
         now = datetime.now().isoformat()
         rows = []
         stock_codes = []
-        for _, row in df.iterrows():
-            stock_code = self._normalize_stock_code(row.get(code_col))
+        # Get instrument names in batch
+        instruments = self.provider.get_instruments(type="CS")
+        name_map = {}
+        if instruments is not None and not instruments.empty:
+            if "order_book_id" in instruments.columns and "symbol" in instruments.columns:
+                name_map = dict(zip(instruments["order_book_id"], instruments["symbol"]))
+
+        for order_book_id, weight in weights.items():
+            stock_code = self._normalize_stock_code(order_book_id)
             if stock_code is None:
                 continue
             stock_codes.append(stock_code)
+            stock_name = name_map.get(order_book_id, "")
             rows.append((
                 self.index_code,
                 stock_code,
-                str(row.get(name_col, "")) if name_col else "",
-                self._maybe_float(row.get(weight_col)),
+                str(stock_name),
+                self._maybe_float(weight),
                 snapshot_date,
                 now,
             ))
@@ -895,7 +840,7 @@ class DataFetcher(object):
         self._update_meta(conn, "index_weight", "index_weight", self.index_code)
         return stock_codes
 
-    def _sync_stock_indicators(self, conn, ak, stock_codes, start_date, end_date, name_map=None, progress=None):
+    def _sync_stock_indicators(self, conn, stock_codes, start_date, end_date, name_map=None, progress=None):
         if not stock_codes:
             return {
                 "total_stocks": 0,
@@ -905,184 +850,80 @@ class DataFetcher(object):
                 "invalid_rows": 0,
                 "rows": 0,
             }
+        # Convert 6-digit codes to order_book_id format for rqdatac
+        code_to_obid = {}
+        for code in stock_codes:
+            if code.startswith(("6", "9", "5")):
+                code_to_obid[code] = "{}.XSHG".format(code)
+            else:
+                code_to_obid[code] = "{}.XSHE".format(code)
+        order_book_ids = list(code_to_obid.values())
+
+        if progress is not None:
+            progress.update_step(current=0, total=len(stock_codes), detail="批量获取因子数据...")
+
+        # Single batch call replaces 300+ serial AKShare calls
+        factors_df = self.provider.get_factors(
+            order_book_ids,
+            ["pe_ratio_ttm", "pb_ratio", "dividend_yield_ttm", "market_cap"],
+            start_date, end_date,
+        )
+        if factors_df is None or factors_df.empty:
+            raise RuntimeError("stock_indicator sync produced no rows from rqdatac get_factor")
+
         now = datetime.now().isoformat()
         savepoint_name = "stock_indicator_sync"
-        inserted_rows = 0
-        synced_stocks = 0
-        empty_fetches = 0
-        out_of_range = 0
-        invalid_rows = 0
-        name_map = name_map or {}
         conn.execute("SAVEPOINT {}".format(savepoint_name))
         try:
+            # factors_df has MultiIndex (order_book_id, date)
+            factors_df = factors_df.reset_index()
+            inserted_rows = 0
+            synced_stocks = set()
             total = len(stock_codes)
-            for index, stock_code in enumerate(stock_codes, start=1):
-                stock_name = name_map.get(stock_code, "")
-                stock_label = "{} {}".format(stock_code, stock_name).strip()
-                df = self._fetch_stock_indicator(ak, stock_code)
-                if df is None or df.empty:
-                    empty_fetches += 1
-                    if progress is not None:
-                        progress.update_step(
-                            current=index,
-                            total=total,
-                            detail="{} 无数据".format(stock_label),
-                        )
-                    time.sleep(API_CALL_INTERVAL)
+
+            for _, row in factors_df.iterrows():
+                obid = row.get("order_book_id", "")
+                stock_code = self._normalize_stock_code(obid)
+                if stock_code is None or stock_code not in code_to_obid:
                     continue
-                df = self._filter_date_range(df, start_date, end_date)
-                if df.empty:
-                    out_of_range += 1
-                    if progress is not None:
-                        progress.update_step(
-                            current=index,
-                            total=total,
-                            detail="{} 超出范围".format(stock_label),
-                        )
-                    time.sleep(API_CALL_INTERVAL)
+                date_value = self._normalize_date(row.get("date"))
+                if date_value is None:
                     continue
-                date_col = self._find_column(df, ("date", "trade_date", "日期"))
-                dv_col = self._find_column(df, ("dv_ttm",))
-                pe_col = self._find_column(df, ("pe_ttm",))
-                pb_col = self._find_column(df, ("pb",))
-                mv_col = self._find_column(df, ("total_mv", "总市值"))
-                rows = [
+                conn.execute(
+                    UPSERT_STOCK_INDICATOR_SQL,
                     (
-                        self._normalize_date(row[date_col]),
+                        date_value,
                         stock_code,
-                        self._maybe_float(row.get(dv_col)),
-                        self._maybe_float(row.get(pe_col)),
-                        self._maybe_float(row.get(pb_col)),
-                        self._maybe_float(row.get(mv_col)),
+                        self._maybe_float(row.get("dividend_yield_ttm")),
+                        self._maybe_float(row.get("pe_ratio_ttm")),
+                        self._maybe_float(row.get("pb_ratio")),
+                        self._maybe_float(row.get("market_cap")),
                         now,
-                    )
-                    for _, row in df.iterrows()
-                ]
-                if not rows:
-                    invalid_rows += 1
-                    if progress is not None:
-                        progress.update_step(
-                            current=index,
-                            total=total,
-                            detail="{} 无有效行".format(stock_label),
-                        )
-                    time.sleep(API_CALL_INTERVAL)
-                    continue
-                conn.executemany(UPSERT_STOCK_INDICATOR_SQL, rows)
-                inserted_rows += len(rows)
-                synced_stocks += 1
-                if progress is not None:
-                    progress.update_step(
-                        current=index,
-                        total=total,
-                        detail="{} +{}行".format(stock_label, len(rows)),
-                    )
-                time.sleep(API_CALL_INTERVAL)
+                    ),
+                )
+                inserted_rows += 1
+                synced_stocks.add(stock_code)
+
             conn.execute("RELEASE SAVEPOINT {}".format(savepoint_name))
         except Exception:
             conn.execute("ROLLBACK TO SAVEPOINT {}".format(savepoint_name))
             conn.execute("RELEASE SAVEPOINT {}".format(savepoint_name))
             raise
+
+        if progress is not None:
+            progress.update_step(current=total, total=total, detail="批量写入完成 +{}行".format(inserted_rows))
+
         if inserted_rows == 0:
             raise RuntimeError("stock_indicator sync produced no rows")
         self._update_meta(conn, "stock_indicator", "stock_indicator", None)
         return {
             "total_stocks": total,
-            "synced_stocks": synced_stocks,
-            "empty_fetches": empty_fetches,
-            "out_of_range": out_of_range,
-            "invalid_rows": invalid_rows,
+            "synced_stocks": len(synced_stocks),
+            "empty_fetches": total - len(synced_stocks),
+            "out_of_range": 0,
+            "invalid_rows": 0,
             "rows": inserted_rows,
         }
-
-    def _fetch_stock_indicator(self, ak, stock_code):
-        for func_name in ("stock_a_indicator_lg", "stock_a_lg_indicator"):
-            func = getattr(ak, func_name, None)
-            if func is None:
-                continue
-            return self._call_akshare(func, symbol=stock_code)
-        return self._build_stock_indicator_from_em_data(ak, stock_code)
-
-    def _build_stock_indicator_from_em_data(self, ak, stock_code):
-        stock_value = self._fetch_stock_value_em(ak, stock_code)
-        if stock_value is None or stock_value.empty:
-            return pd.DataFrame()
-
-        date_col = self._find_column(stock_value, ("数据日期", "date", "trade_date"))
-        pe_col = self._find_column(stock_value, ("PE(TTM)", "pe_ttm"))
-        pb_col = self._find_column(stock_value, ("市净率", "pb"))
-        mv_col = self._find_column(stock_value, ("总市值", "total_mv"))
-
-        if date_col is None or mv_col is None:
-            return pd.DataFrame()
-
-        base = pd.DataFrame({
-            "trade_date": pd.to_datetime(stock_value[date_col], errors="coerce"),
-            "pe_ttm": pd.to_numeric(stock_value[pe_col], errors="coerce") if pe_col else np.nan,
-            "pb": pd.to_numeric(stock_value[pb_col], errors="coerce") if pb_col else np.nan,
-            "total_mv": pd.to_numeric(stock_value[mv_col], errors="coerce"),
-        })
-        base = base.dropna(subset=["trade_date"]).sort_values("trade_date").reset_index(drop=True)
-        if base.empty:
-            return pd.DataFrame()
-
-        dividend_detail = self._fetch_stock_dividend_detail_em(ak, stock_code)
-        base["dv_ttm"] = self._build_dividend_ttm_series(base["trade_date"], base["total_mv"], dividend_detail)
-        return base
-
-    def _fetch_stock_value_em(self, ak, stock_code):
-        func = getattr(ak, "stock_value_em", None)
-        if func is None:
-            return pd.DataFrame()
-        return self._call_akshare(func, symbol=stock_code)
-
-    def _fetch_stock_dividend_detail_em(self, ak, stock_code):
-        func = getattr(ak, "stock_fhps_detail_em", None)
-        if func is None:
-            return pd.DataFrame()
-        return self._call_akshare(func, symbol=stock_code)
-
-    def _build_dividend_ttm_series(self, trade_dates, total_mv, dividend_detail):
-        series = pd.Series(index=pd.to_datetime(trade_dates), dtype="float64")
-        if dividend_detail is None or dividend_detail.empty:
-            return series.values
-
-        ex_date_col = self._find_column(dividend_detail, ("除权除息日",))
-        cash_ratio_col = self._find_column(dividend_detail, ("现金分红-现金分红比例",))
-        total_shares_col = self._find_column(dividend_detail, ("总股本",))
-        progress_col = self._find_column(dividend_detail, ("方案进度",))
-        if ex_date_col is None or cash_ratio_col is None or total_shares_col is None:
-            return series.values
-
-        events = pd.DataFrame({
-            "ex_date": pd.to_datetime(dividend_detail[ex_date_col], errors="coerce"),
-            "cash_ratio": pd.to_numeric(dividend_detail[cash_ratio_col], errors="coerce"),
-            "total_shares": pd.to_numeric(dividend_detail[total_shares_col], errors="coerce"),
-        })
-        if progress_col is not None:
-            events["progress"] = dividend_detail[progress_col].astype(str)
-            events = events[events["progress"].str.contains("实施", na=False)]
-        events = events.dropna(subset=["ex_date", "cash_ratio", "total_shares"])
-        if events.empty:
-            return series.values
-
-        events["cash_amount"] = events["cash_ratio"] / 10.0 * events["total_shares"]
-        events = events.groupby("ex_date", as_index=False)["cash_amount"].sum().sort_values("ex_date")
-
-        event_dates = pd.to_datetime(events["ex_date"]).to_numpy()
-        event_cash = pd.to_numeric(events["cash_amount"], errors="coerce").to_numpy(dtype="float64")
-        mv_series = pd.to_numeric(total_mv, errors="coerce").to_numpy(dtype="float64")
-        result = []
-
-        for trade_date, market_value in zip(pd.to_datetime(trade_dates), mv_series):
-            if pd.isna(trade_date) or pd.isna(market_value) or market_value <= 0:
-                result.append(np.nan)
-                continue
-            window_start = trade_date - pd.Timedelta(days=365)
-            mask = (event_dates > window_start.to_datetime64()) & (event_dates <= trade_date.to_datetime64())
-            cash_ttm = float(event_cash[mask].sum()) if mask.any() else 0.0
-            result.append(cash_ttm / market_value * 100.0)
-        return result
 
     def _load_dividend_yield_series(self, conn, start_date, end_date):
         weights = self._read_sql(
@@ -1151,108 +992,6 @@ class DataFetcher(object):
             (source_name, row["last_update_date"], now, row["record_count"]),
         )
 
-    def _fetch_etf_history(self, ak, adjust, start_date=None, end_date=None):
-        params = {
-            "symbol": self.etf_code,
-            "start_date": self._normalize_date(start_date or SYNC_DEFAULT_START_DATE).replace("-", ""),
-            "end_date": self._normalize_date(end_date or datetime.now().date()).replace("-", ""),
-        }
-        try:
-            if adjust:
-                params["adjust"] = adjust
-            return self._call_akshare(ak.fund_etf_hist_em, **params)
-        except TypeError:
-            if adjust:
-                return self._call_akshare(
-                    ak.fund_etf_hist_em,
-                    symbol=self.etf_code,
-                    start_date=params["start_date"],
-                    end_date=params["end_date"],
-                    adjust=adjust,
-                )
-            return self._call_akshare(
-                ak.fund_etf_hist_em,
-                symbol=self.etf_code,
-                start_date=params["start_date"],
-                end_date=params["end_date"],
-            )
-
-    def _fetch_index_value_csindex(self, ak):
-        func = getattr(ak, "stock_zh_index_value_csindex", None)
-        if func is None:
-            return pd.DataFrame()
-        return self._call_akshare(func, symbol=self.index_code)
-
-    def _candidate_etf_sina_symbols(self):
-        code = str(self.etf_code)
-        preferred_prefixes = []
-        data_proxy = self.data_proxy or self._bundle_data_proxy()
-        order_book_id = self._resolve_etf_order_book_id(data_proxy) if data_proxy is not None else None
-        if order_book_id and order_book_id.endswith("XSHG"):
-            preferred_prefixes = ["sh", "sz"]
-        elif order_book_id and order_book_id.endswith("XSHE"):
-            preferred_prefixes = ["sz", "sh"]
-        elif code.startswith(("5", "6", "9")):
-            preferred_prefixes = ["sh", "sz"]
-        else:
-            preferred_prefixes = ["sz", "sh"]
-        return ["{}{}".format(prefix, code) for prefix in preferred_prefixes]
-
-    def _resolve_etf_order_book_id(self, data_proxy):
-        candidates = [self.etf_code]
-        if "." not in self.etf_code:
-            candidates.extend([
-                "{}.XSHG".format(self.etf_code),
-                "{}.XSHE".format(self.etf_code),
-            ])
-        for order_book_id in candidates:
-            try:
-                instrument = data_proxy.instruments(order_book_id)
-            except Exception:
-                instrument = None
-            if instrument is not None:
-                return order_book_id
-        return None
-
-    @classmethod
-    def _bars_to_etf_daily_frame(cls, bars, start_date, end_date):
-        if bars is None or len(bars) == 0:
-            return pd.DataFrame()
-        df = pd.DataFrame(bars)
-        if df.empty or "datetime" not in df.columns:
-            return pd.DataFrame()
-        df["date"] = [
-            convert_int_to_date(int(value)).strftime("%Y-%m-%d")
-            for value in df["datetime"]
-        ]
-        renamed = df.rename(
-            columns={
-                "open": "开盘",
-                "high": "最高",
-                "low": "最低",
-                "close": "收盘",
-                "volume": "成交量",
-                "total_turnover": "成交额",
-                "turnover_rate": "换手率",
-            }
-        )
-        columns = [col for col in ("date", "开盘", "最高", "最低", "收盘", "成交量", "成交额", "换手率") if col in renamed.columns]
-        return cls._filter_date_range(renamed.loc[:, columns], start_date, end_date)
-
-    @classmethod
-    def _bars_to_hfq_close_frame(cls, bars, start_date, end_date):
-        if bars is None or len(bars) == 0:
-            return pd.DataFrame()
-        df = pd.DataFrame(bars)
-        if df.empty or "datetime" not in df.columns or "close" not in df.columns:
-            return pd.DataFrame()
-        df["date"] = [
-            convert_int_to_date(int(value)).strftime("%Y-%m-%d")
-            for value in df["datetime"]
-        ]
-        renamed = df.rename(columns={"close": "收盘"})
-        return cls._filter_date_range(renamed.loc[:, ["date", "收盘"]], start_date, end_date)
-
     def _bundle_data_proxy(self):
         if self._bundle_proxy is not None:
             return self._bundle_proxy
@@ -1268,6 +1007,12 @@ class DataFetcher(object):
 
     @classmethod
     def _get_trading_dates(cls, start_date, end_date, data_proxy=None):
+        try:
+            dates = DataFacade().get_trading_dates(start_date, end_date)
+            if dates is not None and len(dates) > 0:
+                return pd.DatetimeIndex(dates).normalize()
+        except Exception:
+            pass
         if data_proxy is not None:
             return data_proxy.get_trading_dates(start_date, end_date)
         return pd.bdate_range(start=start_date, end=end_date)
@@ -1327,46 +1072,6 @@ class DataFetcher(object):
         normalized_dates = pd.to_datetime(df[date_col], errors="coerce")
         mask = (normalized_dates >= pd.Timestamp(start_date)) & (normalized_dates <= pd.Timestamp(end_date))
         return df.loc[mask].copy()
-
-    @classmethod
-    def _frame_latest_date(cls, df):
-        if df is None or df.empty:
-            return None
-        date_col = cls._find_column(df, ("date", "日期", "trade_date", "净值日期", "调整日期"))
-        if date_col is None:
-            return None
-        normalized_dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
-        if normalized_dates.empty:
-            return None
-        return normalized_dates.max().strftime("%Y-%m-%d")
-
-    @classmethod
-    def _merge_etf_history_frames(cls, *frames):
-        merged_frames = []
-        seen_dates = set()
-        for frame in frames:
-            if frame is None or frame.empty:
-                continue
-            current = frame.copy()
-            date_col = cls._find_column(current, ("date", "日期", "trade_date", "净值日期", "调整日期"))
-            if date_col is None:
-                continue
-            current["_merge_date"] = pd.to_datetime(current[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
-            current = current.dropna(subset=["_merge_date"])
-            if current.empty:
-                continue
-            current = current.sort_values("_merge_date").drop_duplicates(subset=["_merge_date"], keep="last")
-            if seen_dates:
-                current = current[~current["_merge_date"].isin(seen_dates)]
-            if current.empty:
-                continue
-            merged_frames.append(current)
-            seen_dates.update(current["_merge_date"].tolist())
-        if not merged_frames:
-            return pd.DataFrame()
-        merged = pd.concat(merged_frames, ignore_index=True, sort=False)
-        merged = merged.sort_values("_merge_date").drop(columns=["_merge_date"])
-        return merged.reset_index(drop=True)
 
     @staticmethod
     def _maybe_float(value):
@@ -1571,39 +1276,6 @@ class DataFetcher(object):
             (source_name,),
         ).fetchone()
         return dict(row) if row is not None else None
-
-    @contextmanager
-    def _suppress_akshare_output(self):
-        with open(os.devnull, "w") as devnull:
-            with redirect_stdout(devnull), redirect_stderr(devnull):
-                yield
-
-    def _call_akshare(self, func, *args, **kwargs):
-        last_exc = None
-        func_name = getattr(func, "__name__", repr(func))
-        for attempt in range(1, AKSHARE_MAX_RETRIES + 1):
-            try:
-                with self._suppress_akshare_output():
-                    return func(*args, **kwargs)
-            except AKSHARE_RETRIABLE_EXCEPTIONS as exc:
-                last_exc = exc
-                if attempt >= AKSHARE_MAX_RETRIES:
-                    break
-                delay = AKSHARE_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                time.sleep(delay)
-        raise RuntimeError(
-            "akshare call {} failed after {} attempts: {}".format(
-                func_name, AKSHARE_MAX_RETRIES, last_exc
-            )
-        ) from last_exc
-
-    @staticmethod
-    def _require_akshare():
-        try:
-            import akshare as ak
-        except ImportError:
-            raise RuntimeError("akshare is required for sync_all, install it first")
-        return ak
 
 
 class NullSyncProgress(object):

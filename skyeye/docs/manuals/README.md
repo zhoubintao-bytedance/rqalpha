@@ -71,7 +71,7 @@ uv run python -m skyeye.evaluation.rolling_score.cli \
 
 ```bash
 env UV_CACHE_DIR=/tmp/uv-cache PYTHONPATH="$PWD" MPLCONFIGDIR=/tmp/mplconfig uv run pytest -q \
-  tests/dividend_scorer \
+  tests/products/dividend_low_vol/scorer \
   tests/unittest \
   tests/evaluation \
   tests/products

@@ -43,9 +43,11 @@ class ExperimentRunner(object):
             val_df = fold["val_df"].copy()
             test_df = fold["test_df"].copy()
 
+            # Derive feature columns from what the dataset actually contains
+            feature_cols = [c for c in FEATURE_COLUMNS if c in train_df.columns]
+
             # Preprocessing inside fold to prevent data leakage
             if self.preprocessor is not None:
-                feature_cols = [c for c in FEATURE_COLUMNS if c in train_df.columns]
                 train_df = self.preprocessor.transform(train_df, feature_cols)
                 val_df = self.preprocessor.transform(val_df, feature_cols)
                 test_df = self.preprocessor.transform(test_df, feature_cols)
@@ -53,11 +55,11 @@ class ExperimentRunner(object):
             model = create_model(self.config["model"]["kind"], params=self.config["model"].get("params"))
             fit_kwargs = {}
             if hasattr(model, "fit") and "val_X" in model.fit.__code__.co_varnames:
-                fit_kwargs["val_X"] = val_df[FEATURE_COLUMNS]
+                fit_kwargs["val_X"] = val_df[feature_cols]
                 fit_kwargs["val_y"] = val_df["target_label"]
-            model.fit(train_df[FEATURE_COLUMNS], train_df["target_label"], **fit_kwargs)
-            val_df["prediction"] = model.predict(val_df[FEATURE_COLUMNS])
-            test_df["prediction"] = model.predict(test_df[FEATURE_COLUMNS])
+            model.fit(train_df[feature_cols], train_df["target_label"], **fit_kwargs)
+            val_df["prediction"] = model.predict(val_df[feature_cols])
+            test_df["prediction"] = model.predict(test_df[feature_cols])
             prediction_metrics = evaluate_predictions(test_df, top_k=self.config["evaluation"]["top_k"])
             validation_metrics = evaluate_predictions(val_df, top_k=self.config["evaluation"]["top_k"])
             weights_df = portfolio_builder.build(test_df[["date", "order_book_id", "prediction"]])
