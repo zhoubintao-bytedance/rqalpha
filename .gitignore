@@ -27,3 +27,10 @@ rqalpha/_version.py
 
 .claude/*
 uv.lock
+
+# Skyeye experiment artifacts and large assets
+__MACOSX/
+**/artifacts/
+**/reports/
+skyeye/ref_src_strategy/
+skyeye/skyeye/
