@@ -947,9 +947,7 @@ def read_daily_bars(order_book_id, start_date, end_date):
     df = DataFacade().get_daily_bars(order_book_id, start_date, end_date, fields=["close"], adjust_type="none")
     if df is None or df.empty:
         return None
-    if "order_book_id" in df.columns:
-        df = df.drop(columns=["order_book_id"])
-    return df
+    return _normalize_single_instrument_bars(df, order_book_id)
 
 
 def plot_trades(window_results):
@@ -1023,13 +1021,46 @@ def plot_trades(window_results):
             print(f"  图表已保存: {os.path.basename(filename)}")
 
 
-def get_benchmark_quarterly_returns():
-    df = DataFacade().get_daily_bars("000300.XSHG", "2000-01-01", "2999-12-31", fields=["close"], adjust_type="none")
+def _normalize_single_instrument_bars(df, order_book_id=None):
     if df is None or df.empty:
-        return {}
+        return df
+    if isinstance(df.index, pd.MultiIndex):
+        if order_book_id is not None and "order_book_id" in df.index.names:
+            try:
+                df = df.xs(order_book_id, level="order_book_id")
+            except KeyError:
+                pass
+        if isinstance(df.index, pd.MultiIndex):
+            if "date" in df.index.names:
+                levels_to_drop = [level for level in df.index.names if level != "date"]
+                if levels_to_drop:
+                    df = df.reset_index(level=levels_to_drop, drop=True)
+            else:
+                df = df.reset_index(level=list(range(df.index.nlevels - 1)), drop=True)
     if "order_book_id" in df.columns:
         df = df.drop(columns=["order_book_id"])
+    if not isinstance(df.index, (pd.DatetimeIndex, pd.PeriodIndex, pd.TimedeltaIndex)):
+        df.index = pd.to_datetime(df.index)
     df = df.sort_index()
+    df.index.name = "date"
+    return df
+
+
+def get_benchmark_quarterly_returns():
+    # Keep the benchmark slice inside pandas' timestamp bounds. The scoring
+    # windows are historical, so using today's date as the upper bound is
+    # sufficient and avoids out-of-bounds datetime parsing.
+    benchmark_end = datetime.date.today().strftime("%Y-%m-%d")
+    df = DataFacade().get_daily_bars(
+        "000300.XSHG",
+        "2000-01-01",
+        benchmark_end,
+        fields=["close"],
+        adjust_type="none",
+    )
+    if df is None or df.empty:
+        return {}
+    df = _normalize_single_instrument_bars(df, "000300.XSHG")
     quarterly_close = df["close"].resample("QE").last()
     quarterly_returns = quarterly_close.pct_change().dropna()
     result = {}

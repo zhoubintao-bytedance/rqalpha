@@ -1,7 +1,7 @@
 profile: baseline
 benchmark: 000300.XSHG
 buy_top_k: 20
-hold_top_k: 30
+hold_top_k: 50
 single_stock_cap: 0.10
 turnover_threshold: 0.30
 rebalance_check_frequency: daily

@@ -3,8 +3,8 @@
 TX1 Feature Preprocessor
 
 Cross-sectional feature preprocessing pipeline:
-  1. Winsorize (5x MAD per date)
-  2. Sector + market-cap neutralization (OLS residuals per date)
+  1. Winsorize (MAD-based clipping per date)
+  2. Sector + size neutralization (OLS residuals per date)
   3. Z-score standardization (per date)
 
 All operations are per-date cross-sectional, so no information leaks
@@ -19,15 +19,17 @@ class FeaturePreprocessor(object):
     """Cross-sectional feature preprocessor.
 
     Args:
-        neutralize: If True, regress out sector dummies + ln(close) per date.
+        neutralize: If True, regress out sector dummies and/or ln(close) per date.
         winsorize_scale: MAD multiplier for winsorization. None to skip.
         standardize: If True, z-score standardize per date after neutralization.
+        min_obs: Minimum valid cross-sectional observations required for OLS neutralization.
     """
 
-    def __init__(self, neutralize=True, winsorize_scale=5.0, standardize=True):
+    def __init__(self, neutralize=True, winsorize_scale=5.0, standardize=True, min_obs=5):
         self.neutralize = neutralize
         self.winsorize_scale = winsorize_scale
         self.standardize = standardize
+        self.min_obs = int(min_obs)
 
     def transform(self, df, feature_columns):
         """Apply preprocessing pipeline to feature columns.
@@ -46,63 +48,82 @@ class FeaturePreprocessor(object):
             if col not in result.columns:
                 continue
 
-            # Step 1: Winsorize (5x MAD per date)
             if self.winsorize_scale is not None:
-                result[col] = result.groupby("date")[col].transform(
-                    self._winsorize_series
-                )
+                result[col] = result.groupby("date")[col].transform(self._winsorize_series)
 
-            # Step 2: Sector + market-cap neutralization
-            if self.neutralize and "sector" in result.columns and "close" in result.columns:
+            if self.neutralize and ("sector" in result.columns or "close" in result.columns):
                 result[col] = self._neutralize_column(result, col)
 
-            # Step 3: Cross-sectional z-score
             if self.standardize:
-                cs_mean = result.groupby("date")[col].transform("mean")
-                cs_std = result.groupby("date")[col].transform("std")
-                result[col] = (result[col] - cs_mean) / cs_std.replace(0, np.nan)
+                result[col] = result.groupby("date")[col].transform(self._standardize_series)
 
         return result
 
     def _winsorize_series(self, series):
         """Winsorize a single cross-section using MAD."""
-        median = series.median()
-        mad = (series - median).abs().median()
-        if mad < 1e-12:
-            return series
+        result = series.astype(float).copy()
+        valid = result[np.isfinite(result)]
+        if valid.empty:
+            return result
+        median = valid.median()
+        mad = (valid - median).abs().median()
+        if not np.isfinite(mad) or mad < 1e-12:
+            return result
         lower = median - self.winsorize_scale * mad
         upper = median + self.winsorize_scale * mad
-        return series.clip(lower=lower, upper=upper)
+        result.loc[valid.index] = valid.clip(lower=lower, upper=upper)
+        return result
+
+    def _standardize_series(self, series):
+        result = series.astype(float).copy()
+        valid = result[np.isfinite(result)]
+        if valid.empty:
+            return result
+        mean = valid.mean()
+        std = valid.std()
+        if not np.isfinite(std) or std < 1e-12:
+            result.loc[valid.index] = 0.0
+            return result
+        result.loc[valid.index] = (valid - mean) / std
+        return result
 
     def _neutralize_column(self, df, col):
         """Per-date OLS neutralization: col ~ sector_dummies + ln(close)."""
         residuals = pd.Series(index=df.index, dtype=float)
 
-        for date, day_df in df.groupby("date"):
-            y = day_df[col].values
-            valid_mask = np.isfinite(y)
-            if valid_mask.sum() < 5:
-                residuals.loc[day_df.index] = y
+        for _, day_df in df.groupby("date"):
+            y = pd.to_numeric(day_df[col], errors="coerce")
+            valid_mask = np.isfinite(y.to_numpy(dtype=float))
+
+            design_parts = [np.ones((len(day_df), 1), dtype=float)]
+
+            if "sector" in day_df.columns:
+                sectors = day_df["sector"].fillna("Unknown").astype(str)
+                sector_dummies = pd.get_dummies(sectors, drop_first=True, dtype=float)
+                if not sector_dummies.empty:
+                    design_parts.append(sector_dummies.to_numpy(dtype=float))
+
+            if "close" in day_df.columns:
+                ln_close = np.log(pd.to_numeric(day_df["close"], errors="coerce").clip(lower=0.01))
+                close_values = ln_close.to_numpy(dtype=float).reshape(-1, 1)
+                design_parts.append(close_values)
+                valid_mask &= np.isfinite(close_values[:, 0])
+
+            X = np.column_stack(design_parts)
+            min_required = max(self.min_obs, X.shape[1] + 1)
+            if valid_mask.sum() < min_required:
+                residuals.loc[day_df.index] = y.to_numpy(dtype=float)
                 continue
 
-            # Build design matrix: sector dummies + ln(close)
-            sector_dummies = pd.get_dummies(day_df["sector"], drop_first=True, dtype=float)
-            ln_close = np.log(day_df["close"].clip(lower=0.01)).values.reshape(-1, 1)
-            X = np.column_stack([
-                np.ones(len(day_df)),
-                sector_dummies.values,
-                ln_close,
-            ])
-
-            # Handle NaN in y: set residual = NaN for those rows
-            y_clean = np.where(valid_mask, y, 0.0)
+            y_values = y.to_numpy(dtype=float)
             try:
-                coef, _, _, _ = np.linalg.lstsq(X[valid_mask], y_clean[valid_mask], rcond=None)
+                coef, _, _, _ = np.linalg.lstsq(X[valid_mask], y_values[valid_mask], rcond=None)
                 predicted = X @ coef
-                res = y - predicted
+                resid = y_values - predicted
+                resid[~valid_mask] = np.nan
             except np.linalg.LinAlgError:
-                res = y
+                resid = y_values
 
-            residuals.loc[day_df.index] = res
+            residuals.loc[day_df.index] = resid
 
         return residuals

@@ -257,6 +257,44 @@ def _load_northbound_flow() -> pd.DataFrame:
         return pd.DataFrame(columns=["date", "north_net_flow"])
 
 
+FUNDAMENTAL_FACTORS = [
+    "ep_ratio_ttm",
+    "return_on_equity_ttm",
+    "operating_revenue_growth_ratio_ttm",
+    "net_profit_growth_ratio_ttm",
+    "pcf_ratio_ttm",
+]
+
+
+def _load_fundamental_factors(
+    universe: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """Load daily fundamental factors via rqdatac for the given universe."""
+    try:
+        factor_df = DATA_FACADE.get_factor(
+            universe, FUNDAMENTAL_FACTORS, start_date, end_date
+        )
+    except Exception as exc:
+        print(f"Warning: fundamental factors unavailable ({exc}), skipping")
+        return pd.DataFrame(columns=["date", "order_book_id"] + FUNDAMENTAL_FACTORS)
+
+    if factor_df is None or factor_df.empty:
+        print("Warning: fundamental factors returned empty, skipping")
+        return pd.DataFrame(columns=["date", "order_book_id"] + FUNDAMENTAL_FACTORS)
+
+    result = factor_df.reset_index()
+    if "date" not in result.columns:
+        for col in result.columns:
+            if pd.api.types.is_datetime64_any_dtype(result[col]):
+                result = result.rename(columns={col: "date"})
+                break
+    if "date" in result.columns:
+        result["date"] = pd.to_datetime(result["date"]).dt.normalize()
+    return result.sort_values(["date", "order_book_id"]).reset_index(drop=True)
+
+
 def build_raw_df(universe: list[str]) -> pd.DataFrame:
     print(f"Loading benchmark ({BENCHMARK_ID})...")
     benchmark = _load_benchmark_close()
@@ -285,6 +323,19 @@ def build_raw_df(universe: list[str]) -> pd.DataFrame:
         print(f"  Northbound data: {len(north_df)} days")
     else:
         print("  Northbound data: unavailable, skipping")
+
+    # Add fundamental factors (daily, via rqdatac)
+    print("Loading fundamental factors...")
+    fund_df = _load_fundamental_factors(universe, start_date, end_date)
+    if not fund_df.empty and len(fund_df) > 0:
+        raw_df = raw_df.merge(fund_df, on=["date", "order_book_id"], how="left")
+        loaded = [c for c in FUNDAMENTAL_FACTORS if c in raw_df.columns]
+        coverage = raw_df[loaded].notna().mean()
+        print(f"  Fundamental factors loaded: {loaded}")
+        for col in loaded:
+            print(f"    {col}: {coverage[col]:.1%} coverage")
+    else:
+        print("  Fundamental factors: unavailable, skipping")
 
     raw_df = raw_df.sort_values(["date", "order_book_id"]).reset_index(drop=True)
     print(f"raw_df shape: {raw_df.shape}  date range: {raw_df['date'].min().date()} – {raw_df['date'].max().date()}")

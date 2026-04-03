@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from skyeye.evaluation import rolling_score as strategy_scorer
 from skyeye.evaluation.rolling_score import engine as rolling_engine
@@ -125,6 +126,29 @@ def test_parse_runtime_config_args_splits_mod_and_extra_scopes():
         "strategy_profile": "baseline",
         "tx1_artifact_line": "baseline_tree",
     }
+
+
+def test_get_benchmark_quarterly_returns_handles_multiindex_daily_bars(monkeypatch):
+    index = pd.MultiIndex.from_tuples(
+        [
+            ("000300.XSHG", pd.Timestamp("2024-03-29")),
+            ("000300.XSHG", pd.Timestamp("2024-06-28")),
+            ("000300.XSHG", pd.Timestamp("2024-09-30")),
+        ],
+        names=["order_book_id", "date"],
+    )
+    bars = pd.DataFrame({"close": [100.0, 110.0, 99.0]}, index=index)
+
+    class FakeFacade:
+        def get_daily_bars(self, *args, **kwargs):
+            return bars
+
+    monkeypatch.setattr(rolling_engine, "DataFacade", lambda: FakeFacade())
+
+    result = strategy_scorer.get_benchmark_quarterly_returns()
+
+    assert result[(2024, 2)] == pytest.approx(0.10)
+    assert result[(2024, 3)] == pytest.approx(-0.10)
 
 
 def test_run_rolling_backtests_routes_extra_config_to_top_level_extra_and_uses_strategy_benchmark(

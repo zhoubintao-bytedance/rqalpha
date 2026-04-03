@@ -1,15 +1,28 @@
 # -*- coding: utf-8 -*-
 
+from copy import deepcopy
+
 import numpy as np
 import pandas as pd
 
 
+DEFAULT_TARGET_CONFIG = {
+    "volatility": {
+        "transform": "rank",
+    },
+    "max_drawdown": {
+        "transform": "rank",
+    },
+}
+
+
 class LabelBuilder(object):
-    def __init__(self, horizon=20, transform="raw", winsorize=None):
+    def __init__(self, horizon=20, transform="raw", winsorize=None, target_config=None):
         self.horizon = int(horizon)
         self.transform = transform
         # winsorize: tuple (lower, upper) percentiles e.g. (0.01, 0.99), or None
         self.winsorize = winsorize
+        self.target_config = self._normalize_target_config(target_config)
 
     def build(self, dataset_df):
         if dataset_df is None or len(dataset_df) == 0:
@@ -51,26 +64,60 @@ class LabelBuilder(object):
         labeled["label_return_raw"] = labeled["asset_forward_return"] - labeled["benchmark_forward_return"]
         labeled = labeled.dropna(subset=["label_return_raw", "label_volatility_horizon", "label_max_drawdown_horizon"]).copy()
         labeled = labeled.sort_values(["date", "order_book_id"]).reset_index(drop=True)
+
+        return_base_column = "label_return_raw"
         if self.winsorize is not None:
             lo, hi = self.winsorize
-            clipped = labeled.groupby("date")["label_return_raw"].transform(
+            labeled["_winsorized_return"] = labeled.groupby("date")["label_return_raw"].transform(
                 lambda s: s.clip(lower=s.quantile(lo), upper=s.quantile(hi))
             )
-            labeled["_winsorized"] = clipped
-            labeled["target_label"] = self._transform_by_date(labeled, "_winsorized")
-            labeled = labeled.drop(columns=["_winsorized"])
-        else:
-            labeled["target_label"] = self._transform_by_date(labeled, "label_return_raw")
+            return_base_column = "_winsorized_return"
+
+        labeled["target_return"] = self._transform_by_date(
+            labeled,
+            return_base_column,
+            transform=self.transform,
+        )
+        labeled["target_label"] = labeled["target_return"]
+        labeled["target_volatility"] = self._transform_by_date(
+            labeled,
+            "label_volatility_horizon",
+            transform=self.target_config["volatility"]["transform"],
+        )
+        labeled["target_max_drawdown"] = self._transform_by_date(
+            labeled,
+            "label_max_drawdown_horizon",
+            transform=self.target_config["max_drawdown"]["transform"],
+        )
+
+        if "_winsorized_return" in labeled.columns:
+            labeled = labeled.drop(columns=["_winsorized_return"])
         return labeled
 
-    def _transform_by_date(self, frame, column):
-        if self.transform == "raw":
+    @classmethod
+    def _normalize_target_config(cls, target_config):
+        normalized = deepcopy(DEFAULT_TARGET_CONFIG)
+        if not target_config:
+            return normalized
+        for target_name, overrides in target_config.items():
+            if target_name not in normalized or not isinstance(overrides, dict):
+                continue
+            normalized[target_name].update(overrides)
+        return normalized
+
+    def _transform_by_date(self, frame, column, transform=None):
+        transform = transform or self.transform
+        if transform == "raw":
             return frame[column]
-        if self.transform == "rank":
+        if transform == "rank":
             return frame.groupby("date")[column].rank(method="average", pct=True)
-        if self.transform == "quantile":
+        if transform == "quantile":
             return frame.groupby("date")[column].transform(self._quantile_transform)
-        raise ValueError("unsupported transform: {}".format(self.transform))
+        if transform == "log1p":
+            return frame.groupby("date")[column].transform(self._log1p_transform)
+        if transform == "robust":
+            return frame.groupby("date")[column].transform(self._robust_transform)
+        raise ValueError("unsupported transform: {}".format(transform))
 
     @staticmethod
     def _quantile_transform(series):
@@ -83,4 +130,31 @@ class LabelBuilder(object):
         scaled = (quantized.astype(float) + 0.5) / float(int(quantized.max()) + 1)
         result = pd.Series(index=series.index, dtype=float)
         result.loc[valid.index] = scaled.to_numpy()
+        return result
+
+    @staticmethod
+    def _log1p_transform(series):
+        valid = series.dropna().astype(float)
+        result = pd.Series(index=series.index, dtype=float)
+        if valid.empty:
+            return result
+        result.loc[valid.index] = np.log1p(valid.clip(lower=0.0))
+        return result
+
+    @staticmethod
+    def _robust_transform(series):
+        valid = series.dropna().astype(float)
+        result = pd.Series(index=series.index, dtype=float)
+        if valid.empty:
+            return result
+        median = float(valid.median())
+        q1 = float(valid.quantile(0.25))
+        q3 = float(valid.quantile(0.75))
+        scale = q3 - q1
+        if scale <= 0:
+            scale = float((valid - median).abs().median() * 1.4826)
+        if scale <= 0:
+            result.loc[valid.index] = valid - median
+            return result
+        result.loc[valid.index] = (valid - median) / scale
         return result

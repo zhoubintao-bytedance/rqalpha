@@ -141,11 +141,18 @@ class ExperimentStore:
                 fold_result["validation_metrics"] = fold_metadata.get("validation_metrics", {})
                 fold_result["portfolio_metrics"] = fold_metadata.get("portfolio_metrics", {})
                 fold_result["stratified_metrics"] = fold_metadata.get("stratified_metrics", {})
+                fold_result["head_metrics"] = fold_metadata.get("head_metrics", {})
+                fold_result["head_validation_metrics"] = fold_metadata.get("head_validation_metrics", {})
+                fold_result["prediction_blend_metrics"] = fold_metadata.get("prediction_blend_metrics", {})
+                fold_result["selection_metrics"] = fold_metadata.get("selection_metrics", {})
+                fold_result["model_heads"] = fold_metadata.get("model_heads", [])
 
             fold_results.append(fold_result)
 
         return {
             "model_kind": metadata.get("model_kind"),
+            "model_heads": metadata.get("model_heads", ["return"] if metadata.get("model_kind") else []),
+            "prediction_columns": metadata.get("prediction_columns", ["prediction"]),
             "config": metadata.get("config"),
             "experiment_name": metadata.get("experiment_name"),
             "created_at": metadata.get("created_at"),
@@ -167,10 +174,12 @@ class ExperimentStore:
     ) -> dict:
         """Build experiment metadata dict."""
         return {
-            "version": "1.0",
+            "version": "1.1",
             "created_at": datetime.now().isoformat(),
             "experiment_name": experiment_name or f"tx1_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             "model_kind": result.get("model_kind"),
+            "model_heads": result.get("model_heads", []),
+            "prediction_columns": result.get("prediction_columns", ["prediction"]),
             "config": config or {},
             "aggregate_metrics": result.get("aggregate_metrics", {}),
             "num_folds": len(result.get("fold_results", [])),
@@ -207,8 +216,13 @@ class ExperimentStore:
             "validation_metrics": fold_result.get("validation_metrics", {}),
             "portfolio_metrics": fold_result.get("portfolio_metrics", {}),
             "stratified_metrics": fold_result.get("stratified_metrics", {}),
+            "head_metrics": fold_result.get("head_metrics", {}),
+            "head_validation_metrics": fold_result.get("head_validation_metrics", {}),
+            "prediction_blend_metrics": fold_result.get("prediction_blend_metrics", {}),
+            "selection_metrics": fold_result.get("selection_metrics", {}),
             "row_counts": fold_result.get("row_counts", {}),
             "date_range": fold_result.get("date_range", {}),
+            "model_heads": fold_result.get("model_heads", []),
         }
         with open(fold_dir / "fold_metadata.json", "w", encoding="utf-8") as f:
             json.dump(fold_metadata, f, indent=2, default=str)

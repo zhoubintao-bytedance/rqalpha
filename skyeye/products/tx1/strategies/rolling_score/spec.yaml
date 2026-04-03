@@ -6,13 +6,14 @@ instrument: A股大中盘流动性股票池
 status: research
 entrypoint: strategies/rolling_score/strategy.py
 rolling_score_start_date: "2019-02-01"
-hypothesis: 横截面动量、波动率与量价特征的组合，能够在A股大中盘股票池中产生稳定的相对沪深300超额收益。
+hypothesis: 横截面动量、波动率、反转、流动性与换手稳定性的组合，能够在A股大中盘股票池中产生更稳健的相对沪深300超额收益。
 artifact_line_id: baseline_lgbm
 signal_inputs:
   - mom_40d
   - volatility_20d
   - reversal_5d
   - amihud_20d
+  - turnover_stability_20d
 positioning_rule: Top20买入、Top50持有、跌出Top50退出，equal-weight + 持仓延续加分 + 月度重平衡（20交易日）。
 risk_controls:
   - single_stock_cap
@@ -27,5 +28,5 @@ expected_bad_regimes:
   - 全面普涨或普跌的单边市
   - 动量反转剧烈的急转市
 notes:
-  - 当前为研究阶段baseline，尚未通过Gate 2真实回测验证
+  - 当前默认 baseline 为 baseline_5f（5 因子）+ rank label + 月度调仓
   - benchmark冻结在strategy_id + artifact_line级别，profile不允许改动

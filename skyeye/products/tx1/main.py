@@ -34,6 +34,14 @@ def main(config=None, raw_df=None, output_dir=None):
             horizon=cfg["labels"]["horizon"],
             transform=cfg["labels"]["transform"],
             winsorize=cfg["labels"].get("winsorize"),
+            target_config={
+                "volatility": {
+                    "transform": cfg["multi_output"]["volatility"]["transform"],
+                },
+                "max_drawdown": {
+                    "transform": cfg["multi_output"]["max_drawdown"]["transform"],
+                },
+            },
         ),
         splitter=WalkForwardSplitter(
             train_years=cfg["splitter"]["train_years"],

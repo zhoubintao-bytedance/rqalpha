@@ -4,12 +4,136 @@ import numpy as np
 import pandas as pd
 
 
-FEATURE_COLUMNS = [
+BASELINE_4F_COLUMNS = [
     "mom_40d",
     "volatility_20d",
     "reversal_5d",
     "amihud_20d",
 ]
+
+MOMENTUM_FEATURE_COLUMNS = [
+    "mom_20d",
+    "mom_60d",
+    "excess_mom_20d",
+    "excess_mom_60d",
+]
+
+TREND_FEATURE_COLUMNS = [
+    "ma_gap_20d",
+    "ma_gap_60d",
+    "ma_crossover_10_40d",
+    "price_position_20d",
+    "price_position_60d",
+    "distance_to_high_60d",
+]
+
+LIQUIDITY_FEATURE_COLUMNS = [
+    "volume_ratio_20d",
+    "volume_trend_5_20d",
+    "turnover_ratio_20d",
+    "turnover_stability_20d",
+    "dollar_volume_20d_log",
+    "vol_adj_turnover_20d",
+]
+
+RISK_FEATURE_COLUMNS = [
+    "downside_volatility_20d",
+    "return_skew_20d",
+    "beta_60d",
+    "max_drawdown_20d",
+]
+
+ELITE_OHLCV_COLUMNS = [
+    "mom_40d",
+    "volatility_20d",
+    "turnover_stability_20d",
+]
+
+BASELINE_5F_COLUMNS = [
+    "mom_40d",
+    "volatility_20d",
+    "reversal_5d",
+    "amihud_20d",
+    "turnover_stability_20d",
+]
+
+# Default TX1 baseline: promote the validated 5-factor set to the shared alias
+# used by the training/evaluation pipeline. Keep the 4-factor set as an
+# explicit legacy comparison baseline for feature experiments.
+BASELINE_FEATURE_COLUMNS = list(BASELINE_5F_COLUMNS)
+FEATURE_COLUMNS = list(BASELINE_FEATURE_COLUMNS)
+
+FUNDAMENTAL_FEATURE_COLUMNS = [
+    "ep_ratio_ttm",
+    "return_on_equity_ttm",
+    "operating_revenue_growth_ratio_ttm",
+    "net_profit_growth_ratio_ttm",
+    "pcf_ratio_ttm",
+]
+
+FEATURE_GROUPS = {
+    "baseline_4f": list(BASELINE_4F_COLUMNS),
+    "baseline": list(BASELINE_FEATURE_COLUMNS),
+    "momentum": list(MOMENTUM_FEATURE_COLUMNS),
+    "trend": list(TREND_FEATURE_COLUMNS),
+    "liquidity": list(LIQUIDITY_FEATURE_COLUMNS),
+    "risk": list(RISK_FEATURE_COLUMNS),
+    "baseline_5f": list(BASELINE_5F_COLUMNS),
+    "elite_ohlcv": list(ELITE_OHLCV_COLUMNS),
+    "fundamental": list(FUNDAMENTAL_FEATURE_COLUMNS),
+}
+
+FEATURE_LIBRARY = {
+    "mom_40d": "40-day price momentum; the current baseline trend signal.",
+    "volatility_20d": "20-day annualized realized volatility from daily returns.",
+    "reversal_5d": "Negative 5-day return; short-term mean-reversion proxy.",
+    "amihud_20d": "20-day average Amihud illiquidity using absolute return over turnover.",
+    "mom_20d": "20-day price momentum for a shorter relative-strength horizon.",
+    "mom_60d": "60-day price momentum to capture slower medium-term trend persistence.",
+    "excess_mom_20d": "20-day asset return minus benchmark return; benchmark-relative momentum.",
+    "excess_mom_60d": "60-day asset return minus benchmark return; slower benchmark-relative momentum.",
+    "ma_gap_20d": "Distance between price and the 20-day moving average.",
+    "ma_gap_60d": "Distance between price and the 60-day moving average.",
+    "ma_crossover_10_40d": "10-day versus 40-day moving-average spread; compact trend-structure proxy.",
+    "price_position_20d": "Position of price within the trailing 20-day high-low range.",
+    "price_position_60d": "Position of price within the trailing 60-day high-low range.",
+    "distance_to_high_60d": "Distance from the trailing 60-day high; current drawdown-from-peak proxy.",
+    "volume_ratio_20d": "Current volume divided by trailing 20-day average volume.",
+    "volume_trend_5_20d": "5-day average volume relative to the 20-day average volume.",
+    "turnover_ratio_20d": "Current turnover proxy divided by trailing 20-day average turnover proxy.",
+    "turnover_stability_20d": "20-day turnover mean divided by turnover volatility; crowding/liquidity stability proxy.",
+    "dollar_volume_20d_log": "Log of 20-day average turnover proxy; robust scale-stabilized trading activity.",
+    "vol_adj_turnover_20d": "20-day average turnover proxy scaled by trailing volatility; volatility-adjusted liquidity.",
+    "downside_volatility_20d": "20-day downside volatility using only negative-return magnitude.",
+    "return_skew_20d": "20-day return skewness; tail-asymmetry proxy.",
+    "beta_60d": "60-day rolling beta to the benchmark from daily returns.",
+    "max_drawdown_20d": "Worst drawdown observed over the trailing 20-day drawdown path.",
+    "ep_ratio_ttm": "Earnings-to-price ratio (TTM); inverse of P/E, higher = cheaper valuation.",
+    "return_on_equity_ttm": "Return on equity (TTM); profitability quality measure.",
+    "operating_revenue_growth_ratio_ttm": "Operating revenue YoY growth (TTM); top-line growth signal.",
+    "net_profit_growth_ratio_ttm": "Net profit YoY growth (TTM); bottom-line growth signal.",
+    "pcf_ratio_ttm": "Price-to-cash-flow ratio (TTM); cash-flow-based valuation.",
+}
+
+CANDIDATE_FEATURE_COLUMNS = []
+for _feature_group in FEATURE_GROUPS.values():
+    for _feature_name in _feature_group:
+        if _feature_name not in CANDIDATE_FEATURE_COLUMNS:
+            CANDIDATE_FEATURE_COLUMNS.append(_feature_name)
+
+
+def collect_feature_columns(*group_names):
+    features = []
+    for group_name in group_names:
+        for feature_name in FEATURE_GROUPS.get(group_name, []):
+            if feature_name not in features:
+                features.append(feature_name)
+    return features
+
+
+def get_available_feature_columns(columns, requested_features):
+    available = set(columns)
+    return [feature for feature in requested_features if feature in available]
 
 
 def evaluate_predictions(prediction_df, top_k=20):

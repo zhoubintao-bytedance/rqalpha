@@ -9,11 +9,23 @@ def test_label_builder_adds_forward_labels_without_nans(make_raw_panel):
     labeled = LabelBuilder(horizon=20, transform="raw").build(dataset)
 
     assert not labeled.empty
-    assert {"label_return_raw", "label_volatility_horizon", "label_max_drawdown_horizon", "target_label"}.issubset(labeled.columns)
+    assert {
+        "label_return_raw",
+        "label_volatility_horizon",
+        "label_max_drawdown_horizon",
+        "target_label",
+        "target_return",
+        "target_volatility",
+        "target_max_drawdown",
+    }.issubset(labeled.columns)
     assert labeled["target_label"].notna().all()
+    assert labeled["target_return"].notna().all()
+    assert labeled["target_volatility"].notna().all()
+    assert labeled["target_max_drawdown"].notna().all()
     assert labeled["label_return_raw"].notna().all()
     assert labeled["label_volatility_horizon"].notna().all()
     assert labeled["label_max_drawdown_horizon"].notna().all()
+    assert (labeled["target_label"] == labeled["target_return"]).all()
 
 
 def test_label_builder_supports_rank_transform(make_raw_panel):
@@ -87,3 +99,22 @@ def test_label_builder_horizon_10(make_raw_panel):
     assert len(labeled_10) >= len(labeled_20)
     assert labeled_10["target_label"].notna().all()
     assert labeled_10["label_return_raw"].notna().all()
+
+
+def test_label_builder_supports_auxiliary_target_transforms(make_raw_panel):
+    raw_df = make_raw_panel(periods=160)
+    dataset = DatasetBuilder(input_window=60).build(raw_df)
+
+    labeled = LabelBuilder(
+        horizon=20,
+        transform="rank",
+        target_config={
+            "volatility": {"transform": "log1p"},
+            "max_drawdown": {"transform": "robust"},
+        },
+    ).build(dataset)
+
+    assert labeled["target_volatility"].ge(0.0).all()
+    assert labeled["target_max_drawdown"].notna().all()
+    assert not labeled["target_volatility"].equals(labeled["label_volatility_horizon"])
+    assert not labeled["target_max_drawdown"].equals(labeled["label_max_drawdown_horizon"])

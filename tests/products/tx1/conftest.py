@@ -45,6 +45,13 @@ def make_raw_panel():
                     row["sector"] = SECTORS.get(asset, "Unknown")
                     # Simulated northbound net flow (market-level, same for all assets)
                     row["north_net_flow"] = float(5.0 * np.sin(i / 10.0) + np.random.default_rng(i).normal(0, 2))
+                    # Simulated fundamental factors
+                    rng = np.random.default_rng(i + asset_idx * 1000)
+                    row["ep_ratio_ttm"] = float(0.04 + 0.02 * rng.normal())
+                    row["return_on_equity_ttm"] = float(0.10 + 0.05 * rng.normal())
+                    row["operating_revenue_growth_ratio_ttm"] = float(0.08 + 0.15 * rng.normal())
+                    row["net_profit_growth_ratio_ttm"] = float(0.06 + 0.20 * rng.normal())
+                    row["pcf_ratio_ttm"] = float(15.0 + 10.0 * rng.normal())
                 rows.append(row)
         return pd.DataFrame(rows)
 

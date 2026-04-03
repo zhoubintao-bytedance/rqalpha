@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+from copy import deepcopy
+
 import numpy as np
 import lightgbm as lgb
 
@@ -143,6 +145,52 @@ class LightGBMModel(object):
         return self._model.predict(X)
 
 
+class IndependentMultiHeadModel(object):
+    def __init__(self, kind, head_configs, params=None):
+        self.kind = kind
+        self.head_configs = deepcopy(head_configs or {})
+        self.params = deepcopy(params or {})
+        self.models_ = {}
+
+    def fit(self, train_X, train_targets, val_X=None, val_targets=None):
+        if train_targets is None or len(train_targets) == 0:
+            raise ValueError("train_targets must not be empty")
+        for head_name, head_config in self.head_configs.items():
+            target_column = head_config["target_column"]
+            if target_column not in train_targets.columns:
+                raise ValueError("missing target column for {}: {}".format(head_name, target_column))
+            head_params = dict(self.params)
+            head_params.update(head_config.get("params", {}))
+            model = create_model(self.kind, params=head_params)
+            fit_kwargs = {}
+            if (
+                supports_validation(model)
+                and val_X is not None
+                and val_targets is not None
+                and target_column in val_targets.columns
+            ):
+                fit_kwargs["val_X"] = val_X
+                fit_kwargs["val_y"] = val_targets[target_column]
+            model.fit(train_X, train_targets[target_column], **fit_kwargs)
+            self.models_[head_name] = {
+                "model": model,
+                "target_column": target_column,
+            }
+        return self
+
+    def predict(self, test_X):
+        if not self.models_:
+            raise RuntimeError("model must be fit before predict")
+        return {
+            head_name: head_state["model"].predict(test_X)
+            for head_name, head_state in self.models_.items()
+        }
+
+
+def supports_validation(model):
+    return hasattr(model, "fit") and "val_X" in model.fit.__code__.co_varnames
+
+
 def create_model(kind, params=None):
     if kind == "linear":
         return LinearBaselineModel()
@@ -151,3 +199,7 @@ def create_model(kind, params=None):
     if kind == "lgbm":
         return LightGBMModel(params=params)
     raise ValueError("unsupported model kind: {}".format(kind))
+
+
+def create_multi_head_model(kind, head_configs, params=None):
+    return IndependentMultiHeadModel(kind=kind, head_configs=head_configs, params=params)
