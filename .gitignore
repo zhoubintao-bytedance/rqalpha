@@ -36,3 +36,4 @@ __MACOSX/
 **/folds/**/*.parquet
 skyeye/ref_src_strategy/
 skyeye/skyeye/
+.worktrees/
