@@ -1098,6 +1098,8 @@ def summarize_window_results(window_results, benchmark_quarterly_returns=None):
     if benchmark_returns is None:
         benchmark_returns = get_benchmark_quarterly_returns()
     market_env = compute_market_env_scores(quarterly_scores, benchmark_returns)
+    risk_alerts = detect_risk_alerts(quarterly_scores)
+    risk_flags = [format_risk_alert(alert) for alert in risk_alerts]
     return {
         "quarterly_scores": quarterly_scores,
         "quarterly_raw_indicators": quarterly_raw_indicators,
@@ -1105,39 +1107,117 @@ def summarize_window_results(window_results, benchmark_quarterly_returns=None):
         "core_indicators": core_indicators,
         "stability": stability,
         "market_env": market_env,
-        "overfit_flags": detect_overfit_flags(quarterly_scores),
+        "risk_alerts": risk_alerts,
+        "risk_flags": risk_flags,
+        # Backward compatibility for older callers.
+        "overfit_flags": risk_flags,
     }
 
-def detect_overfit_flags(quarterly_scores):
-    """检测过拟合迹象，返回警告列表
 
-    基于滚动窗口的时间序列特征判断，而非简单的绝对值阈值。
-    检测维度:
-      1. 前后半段衰减: 前半段季度得分均值显著高于后半段（≥15分），说明策略在近期失效
-      2. 最佳-中位差距: 最佳季度远超中位数（≥30分），说明收益集中在少数时段，可能是偶然
+def detect_risk_alerts(quarterly_scores):
+    """检测季度分布中的稳定性与阶段性风险。
+
+    这些信号是启发式风险提示，不等同于严格的“过拟合”判定。
     """
     scores = list(quarterly_scores.values())
     if len(scores) < 4:
         return []
 
-    flags = []
+    alerts = []
 
-    # 1. 前后半段衰减
+    # 1. 近期衰退风险
     mid = len(scores) // 2
-    first_half = np.mean(scores[:mid])
-    second_half = np.mean(scores[mid:])
+    first_half = float(np.mean(scores[:mid]))
+    second_half = float(np.mean(scores[mid:]))
     decay = first_half - second_half
     if decay >= 15:
-        flags.append(f"前半段均分 {first_half:.0f} → 后半段 {second_half:.0f}，近期表现衰退")
+        alerts.append({
+            "code": "performance_decay",
+            "title": "近期衰退风险",
+            "severity": "high" if decay >= 25 else "medium",
+            "detail": "前半段均分 {:.0f} → 后半段 {:.0f}，近期表现明显转弱".format(
+                first_half, second_half
+            ),
+        })
 
-    # 2. 最佳-中位差距
-    best = max(scores)
+    # 2. 收益集中风险
+    best = float(max(scores))
     median = float(np.median(scores))
     gap = best - median
-    if gap >= 30:
-        flags.append(f"最佳季度 {best:.0f} 远超中位数 {median:.0f}，收益集中在少数时段")
+    top_n = min(max(3, len(scores) // 5), len(scores))
+    top_mean = float(np.mean(sorted(scores, reverse=True)[:top_n]))
+    top_gap = top_mean - median
+    if gap >= 45 or (gap >= 30 and top_gap >= 20):
+        alerts.append({
+            "code": "return_concentration",
+            "title": "收益集中风险",
+            "severity": "high" if gap >= 60 or top_gap >= 35 else "medium",
+            "detail": (
+                "最佳季度 {:.0f}，中位数 {:.0f}，头部{}季度均分 {:.0f}，高分主要集中在少数时段"
+            ).format(best, median, top_n, top_mean),
+        })
 
-    return flags
+    # 3. 波动过大风险
+    mean_s = float(np.mean(scores))
+    std_s = float(np.std(scores, ddof=0))
+    if abs(mean_s) < 1e-6:
+        cv = float("inf")
+    else:
+        cv = std_s / abs(mean_s)
+    if cv >= 0.55:
+        alerts.append({
+            "code": "score_volatility",
+            "title": "波动过大风险",
+            "severity": "high" if cv >= 0.8 else "medium",
+            "detail": "季度得分 CV {:.2f}，波动幅度显著高于均值".format(cv),
+        })
+
+    # 4. 连续低迷风险
+    low_threshold = 30
+    max_consec = 0
+    cur_consec = 0
+    for score in scores:
+        if score < low_threshold:
+            cur_consec += 1
+            max_consec = max(max_consec, cur_consec)
+        else:
+            cur_consec = 0
+    if max_consec >= 3:
+        alerts.append({
+            "code": "prolonged_slump",
+            "title": "连续低迷风险",
+            "severity": "high" if max_consec >= 5 else "medium",
+            "detail": "存在连续 {} 个季度得分低于 {} 分，弱势阶段偏长".format(
+                max_consec, low_threshold
+            ),
+        })
+
+    # 5. 尾部脆弱风险
+    worst = float(min(scores))
+    if worst <= 10:
+        alerts.append({
+            "code": "weak_tail",
+            "title": "尾部脆弱风险",
+            "severity": "high" if worst <= 0 else "medium",
+            "detail": "最差季度得分 {:.0f}，尾部表现偏弱".format(worst),
+        })
+
+    priority = {
+        "high": 0,
+        "medium": 1,
+        "low": 2,
+    }
+    alerts.sort(key=lambda item: (priority.get(item["severity"], 99), item["title"]))
+    return alerts
+
+
+def format_risk_alert(alert):
+    return "{}：{}".format(alert["title"], alert["detail"])
+
+
+def detect_overfit_flags(quarterly_scores):
+    """Backward-compatible alias for older callers."""
+    return [format_risk_alert(alert) for alert in detect_risk_alerts(quarterly_scores)]
 
 
 # ============================================================
@@ -1573,11 +1653,11 @@ def main():
     shc = indicator_color("sharpe", sharpe_val, use_color)
     wc = indicator_color("win_rate", win_rate_val / 100, use_color)
     summary_lines.append(f"【核心指标】年化 {ac}{ann_ret:.1f}%{RST} | 回撤 {dc}{max_dd:.1f}%{RST} | 夏普 {shc}{sharpe_val:.2f}{RST} | 胜率 {wc}{win_rate_val:.1f}%{RST}")
-    overfit_flags = summary["overfit_flags"]
-    if overfit_flags:
+    risk_flags = summary.get("risk_flags") or summary.get("overfit_flags") or []
+    if risk_flags:
         warn_color = "\033[41;97m" if use_color else ""
-        summary_lines.append(f"{warn_color}提示: ⚑过拟合风险{RST}")
-        for f in overfit_flags:
+        summary_lines.append(f"{warn_color}提示: ⚑风险提示{RST}")
+        for f in risk_flags:
             summary_lines.append(f"  - {f}")
 
     env_parts = []

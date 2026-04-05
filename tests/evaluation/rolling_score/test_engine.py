@@ -195,3 +195,144 @@ def test_run_rolling_backtests_routes_extra_config_to_top_level_extra_and_uses_s
     assert observed["config"]["mod"]["sys_analyser"]["benchmark"] == "512890.XSHG"
     assert observed["config"]["mod"]["dividend_scorer"]["enabled"] is True
     assert observed["config"]["mod"]["dividend_scorer"]["prior_blend"] == 0.7
+
+
+def test_detect_risk_alerts_returns_empty_for_stable_scores():
+    quarterly_scores = {
+        (2023, 1): 42.0,
+        (2023, 2): 44.0,
+        (2023, 3): 43.0,
+        (2023, 4): 45.0,
+        (2024, 1): 41.0,
+        (2024, 2): 44.0,
+    }
+
+    alerts = rolling_engine.detect_risk_alerts(quarterly_scores)
+
+    assert alerts == []
+    assert rolling_engine.detect_overfit_flags(quarterly_scores) == []
+
+
+def test_detect_risk_alerts_classifies_decay_rather_than_overfit():
+    quarterly_scores = {
+        (2023, 1): 82.0,
+        (2023, 2): 79.0,
+        (2023, 3): 75.0,
+        (2023, 4): 70.0,
+        (2024, 1): 52.0,
+        (2024, 2): 45.0,
+        (2024, 3): 41.0,
+        (2024, 4): 38.0,
+    }
+
+    alerts = rolling_engine.detect_risk_alerts(quarterly_scores)
+    titles = {item["title"] for item in alerts}
+    formatted = rolling_engine.detect_overfit_flags(quarterly_scores)
+
+    assert "近期衰退风险" in titles
+    assert all("过拟合" not in item for item in formatted)
+
+
+def test_detect_risk_alerts_distinguishes_multiple_risk_types():
+    quarterly_scores = {
+        (2019, 1): 84.532,
+        (2019, 2): 58.812,
+        (2019, 3): 51.345,
+        (2019, 4): 46.204,
+        (2020, 1): 46.645,
+        (2020, 2): 45.116,
+        (2020, 3): 43.681,
+        (2020, 4): 42.079,
+        (2021, 1): 37.478,
+        (2021, 2): 21.564,
+        (2021, 3): 10.527,
+        (2021, 4): 5.187,
+        (2022, 1): 0.083,
+        (2022, 2): 11.008,
+        (2022, 3): 26.539,
+        (2022, 4): 31.439,
+        (2023, 1): 33.967,
+        (2023, 2): 31.221,
+        (2023, 3): 12.789,
+        (2023, 4): 15.428,
+        (2024, 1): 30.012,
+        (2024, 2): 52.859,
+        (2024, 3): 93.307,
+        (2024, 4): 113.918,
+        (2025, 1): 111.405,
+        (2025, 2): 109.477,
+        (2025, 3): 103.937,
+        (2025, 4): 60.213,
+        (2026, 1): 47.118,
+    }
+
+    alerts = rolling_engine.detect_risk_alerts(quarterly_scores)
+    titles = {item["title"] for item in alerts}
+
+    assert "收益集中风险" in titles
+    assert "波动过大风险" in titles
+    assert "连续低迷风险" in titles
+    assert "尾部脆弱风险" in titles
+    assert "近期衰退风险" not in titles
+
+
+def test_summarize_window_results_exposes_risk_flags_and_legacy_alias():
+    window_results = [
+        {
+            "idx": 1,
+            "start": datetime.date(2023, 1, 1),
+            "end": datetime.date(2023, 3, 31),
+            "score": 80.0,
+            "summary": {
+                "annualized_returns": 0.20,
+                "max_drawdown": -0.10,
+                "sharpe": 1.0,
+                "win_rate": 0.55,
+            },
+        },
+        {
+            "idx": 2,
+            "start": datetime.date(2023, 4, 1),
+            "end": datetime.date(2023, 6, 30),
+            "score": 74.0,
+            "summary": {
+                "annualized_returns": 0.18,
+                "max_drawdown": -0.11,
+                "sharpe": 0.95,
+                "win_rate": 0.54,
+            },
+        },
+        {
+            "idx": 3,
+            "start": datetime.date(2023, 7, 1),
+            "end": datetime.date(2023, 9, 30),
+            "score": 41.0,
+            "summary": {
+                "annualized_returns": 0.09,
+                "max_drawdown": -0.16,
+                "sharpe": 0.45,
+                "win_rate": 0.50,
+            },
+        },
+        {
+            "idx": 4,
+            "start": datetime.date(2023, 10, 1),
+            "end": datetime.date(2023, 12, 31),
+            "score": 35.0,
+            "summary": {
+                "annualized_returns": 0.06,
+                "max_drawdown": -0.18,
+                "sharpe": 0.30,
+                "win_rate": 0.48,
+            },
+        },
+    ]
+
+    summary = strategy_scorer.summarize_window_results(
+        window_results,
+        benchmark_quarterly_returns={(2023, 1): 0.01, (2023, 2): 0.01, (2023, 3): 0.01, (2023, 4): 0.01},
+    )
+
+    assert summary["risk_flags"] == summary["overfit_flags"]
+    assert summary["risk_alerts"]
+    assert all("过拟合" not in item for item in summary["risk_flags"])

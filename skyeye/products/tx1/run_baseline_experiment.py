@@ -23,6 +23,7 @@ DATA_END    = "2026-03-06"
 UNIVERSE_SIZE = 300
 DATA_FACADE = DataFacade()
 BAR_FIELDS = ["close", "volume", "total_turnover"]
+MARKET_CAP_COLUMNS = ("circulating_market_cap", "market_capitalization", "market_cap")
 
 
 def _chunked(values: list[str], size: int):
@@ -213,6 +214,146 @@ def _get_liquid_universe(n: int = UNIVERSE_SIZE) -> list[str]:
     return sorted_stocks[:n]
 
 
+def _resolve_market_cap_column(
+    instruments: pd.DataFrame,
+    preferred_column: str | None = None,
+) -> str | None:
+    candidates = []
+    if preferred_column:
+        candidates.append(preferred_column)
+    candidates.extend([column for column in MARKET_CAP_COLUMNS if column not in candidates])
+    for column in candidates:
+        if column not in instruments.columns:
+            continue
+        values = pd.to_numeric(instruments[column], errors="coerce")
+        if values.notna().any():
+            return column
+    return None
+
+
+def _load_market_cap_snapshot(
+    order_book_ids: list[str],
+    preferred_column: str | None = None,
+    lookback_days: int = 90,
+) -> tuple[str | None, pd.Series | None]:
+    if not order_book_ids:
+        return None, None
+
+    end_date = pd.Timestamp(DATA_END)
+    start_date = end_date - pd.Timedelta(days=int(lookback_days))
+    candidates = []
+    if preferred_column:
+        candidates.append(preferred_column)
+    candidates.extend([column for column in MARKET_CAP_COLUMNS if column not in candidates])
+
+    for column in candidates:
+        try:
+            factor_df = DATA_FACADE.get_factor(order_book_ids, [column], start_date, end_date)
+        except Exception:
+            continue
+        if factor_df is None or factor_df.empty:
+            continue
+        values = factor_df.reset_index()
+        if "date" not in values.columns:
+            for candidate in values.columns:
+                if pd.api.types.is_datetime64_any_dtype(values[candidate]):
+                    values = values.rename(columns={candidate: "date"})
+                    break
+        if column not in values.columns or "order_book_id" not in values.columns:
+            continue
+        values["date"] = pd.to_datetime(values["date"], errors="coerce")
+        values[column] = pd.to_numeric(values[column], errors="coerce")
+        values = values.dropna(subset=["date", column]).sort_values(["order_book_id", "date"])
+        if values.empty:
+            continue
+        snapshot = values.groupby("order_book_id", sort=False)[column].last()
+        if snapshot.notna().any():
+            return column, snapshot.astype(float)
+    return None, None
+
+
+def _apply_market_cap_floor(
+    instruments: pd.DataFrame,
+    market_cap_floor_quantile: float | None = None,
+    market_cap_column: str | None = None,
+) -> tuple[pd.DataFrame, dict | None]:
+    if market_cap_floor_quantile is None:
+        return instruments.reset_index(drop=True), None
+
+    quantile = float(market_cap_floor_quantile)
+    if quantile < 0.0 or quantile >= 1.0:
+        raise ValueError("market_cap_floor_quantile must be in [0, 1)")
+
+    resolved_column = _resolve_market_cap_column(instruments, preferred_column=market_cap_column)
+    source = "instrument"
+    if resolved_column is not None:
+        values = pd.to_numeric(instruments[resolved_column], errors="coerce")
+    else:
+        resolved_column, snapshot = _load_market_cap_snapshot(
+            instruments["order_book_id"].tolist(),
+            preferred_column=market_cap_column,
+        )
+        if resolved_column is None or snapshot is None:
+            raise ValueError("no market cap column available for market_cap floor")
+        values = instruments["order_book_id"].map(snapshot)
+        source = "factor_snapshot"
+
+    threshold = float(values.dropna().quantile(quantile))
+    filtered = instruments.loc[values >= threshold].copy().reset_index(drop=True)
+    summary = {
+        "column": resolved_column,
+        "source": source,
+        "quantile": quantile,
+        "threshold": threshold,
+        "kept": int(len(filtered)),
+        "total": int(len(instruments)),
+    }
+    return filtered, summary
+
+
+def get_liquid_universe(
+    n: int = UNIVERSE_SIZE,
+    market_cap_floor_quantile: float | None = None,
+    market_cap_column: str | None = None,
+) -> list[str]:
+    instruments = _load_stock_instruments(active_only=True)
+    filtered, floor_summary = _apply_market_cap_floor(
+        instruments,
+        market_cap_floor_quantile=market_cap_floor_quantile,
+        market_cap_column=market_cap_column,
+    )
+    if floor_summary:
+        print(
+            "Market-cap floor applied: source={} column={} quantile={:.0%} threshold={:.4g} kept={}/{}".format(
+                floor_summary["source"],
+                floor_summary["column"],
+                floor_summary["quantile"],
+                floor_summary["threshold"],
+                floor_summary["kept"],
+                floor_summary["total"],
+            )
+        )
+    active_cs = filtered["order_book_id"].tolist()
+    medians = {}
+    for chunk in _chunked(active_cs, 500):
+        bars = DATA_FACADE.get_daily_bars(
+            chunk,
+            pd.Timestamp(TRAIN_START),
+            pd.Timestamp(DATA_END),
+            fields=BAR_FIELDS,
+            adjust_type="pre",
+        )
+        stocks_df = _normalize_daily_bars(bars, BAR_FIELDS)
+        if stocks_df.empty or "volume" not in stocks_df.columns:
+            continue
+        grouped = stocks_df.groupby("order_book_id")["volume"].agg(["size", "median"])
+        grouped = grouped[grouped["size"] >= 500]
+        medians.update(grouped["median"].astype(float).to_dict())
+
+    sorted_stocks = sorted(medians, key=lambda s: medians[s], reverse=True)
+    return sorted_stocks[:n]
+
+
 # ---------------------------------------------------------------------------
 # Build raw_df
 # ---------------------------------------------------------------------------
@@ -346,11 +487,23 @@ def build_raw_df(universe: list[str]) -> pd.DataFrame:
 # Main
 # ---------------------------------------------------------------------------
 
-def run_experiment(model_kind: str, output_base: str, universe_size: int = UNIVERSE_SIZE) -> dict:
-    from skyeye.products.tx1.main import main as tx1_main
-
-    output_dir = str(Path(output_base) / f"tx1_baseline_{model_kind}")
-
+def build_experiment_config(
+    model_kind: str,
+    *,
+    experiment_name: str | None = None,
+    multi_output_enabled: bool = False,
+    volatility_weight: float = 0.0,
+    max_drawdown_weight: float = 0.0,
+    enable_reliability_score: bool = False,
+    holding_bonus: float = 0.5,
+    rebalance_interval: int = 20,
+) -> dict:
+    multi_output_enabled = bool(
+        multi_output_enabled
+        or volatility_weight > 0
+        or max_drawdown_weight > 0
+        or enable_reliability_score
+    )
     config = {
         "model": {"kind": model_kind},
         "labels": {"transform": "rank"},
@@ -361,12 +514,78 @@ def run_experiment(model_kind: str, output_base: str, universe_size: int = UNIVE
             "stamp_tax_rate": 0.0005,
             "slippage_bps": 5.0,
         },
+        "portfolio": {
+            "rebalance_interval": int(rebalance_interval),
+            "holding_bonus": float(holding_bonus),
+        },
     }
+    if experiment_name:
+        config["experiment_name"] = experiment_name
+    if multi_output_enabled:
+        config["multi_output"] = {
+            "enabled": True,
+            "volatility": {"enabled": True, "transform": "rank"},
+            "max_drawdown": {"enabled": True, "transform": "rank"},
+            "prediction": {
+                "combine_auxiliary": True,
+                "volatility_weight": float(volatility_weight),
+                "max_drawdown_weight": float(max_drawdown_weight),
+            },
+            "reliability_score": {"enabled": bool(enable_reliability_score)},
+        }
+    return config
 
-    universe = _get_liquid_universe(universe_size)
+
+def _resolve_output_dir_name(experiment_name: str | None, model_kind: str) -> str:
+    suffix = experiment_name or f"baseline_{model_kind}"
+    return suffix if suffix.startswith("tx1_") else f"tx1_{suffix}"
+
+
+def run_experiment(
+    model_kind: str,
+    output_base: str,
+    universe_size: int = UNIVERSE_SIZE,
+    *,
+    experiment_name: str | None = None,
+    market_cap_floor_quantile: float | None = None,
+    market_cap_column: str | None = None,
+    multi_output_enabled: bool = False,
+    volatility_weight: float = 0.0,
+    max_drawdown_weight: float = 0.0,
+    enable_reliability_score: bool = False,
+    holding_bonus: float = 0.5,
+    rebalance_interval: int = 20,
+) -> dict:
+    from skyeye.products.tx1.main import main as tx1_main
+
+    output_dir_name = _resolve_output_dir_name(experiment_name, model_kind)
+    output_dir = str(Path(output_base) / output_dir_name)
+    config = build_experiment_config(
+        model_kind,
+        experiment_name=output_dir_name,
+        multi_output_enabled=multi_output_enabled,
+        volatility_weight=volatility_weight,
+        max_drawdown_weight=max_drawdown_weight,
+        enable_reliability_score=enable_reliability_score,
+        holding_bonus=holding_bonus,
+        rebalance_interval=rebalance_interval,
+    )
+
+    universe = get_liquid_universe(
+        universe_size,
+        market_cap_floor_quantile=market_cap_floor_quantile,
+        market_cap_column=market_cap_column,
+    )
     raw_df = build_raw_df(universe)
 
-    print(f"\nRunning TX1 experiment: model={model_kind}")
+    print(
+        "\nRunning TX1 experiment: model={} experiment={} multi_output={} market_cap_floor={}".format(
+            model_kind,
+            output_dir_name,
+            bool(config.get("multi_output", {}).get("enabled", False)),
+            market_cap_floor_quantile,
+        )
+    )
     result = tx1_main(config=config, raw_df=raw_df, output_dir=output_dir)
     return result
 
@@ -407,6 +626,15 @@ def main():
     parser.add_argument("--model", choices=["linear", "tree", "lgbm", "both", "all"], default="both")
     parser.add_argument("--output-dir", default="skyeye/artifacts/experiments/tx1")
     parser.add_argument("--universe-size", type=int, default=UNIVERSE_SIZE)
+    parser.add_argument("--experiment-name")
+    parser.add_argument("--market-cap-floor-quantile", type=float)
+    parser.add_argument("--market-cap-column")
+    parser.add_argument("--enable-multi-output", action="store_true")
+    parser.add_argument("--volatility-weight", type=float, default=0.0)
+    parser.add_argument("--max-drawdown-weight", type=float, default=0.0)
+    parser.add_argument("--enable-reliability-score", action="store_true")
+    parser.add_argument("--holding-bonus", type=float, default=0.5)
+    parser.add_argument("--rebalance-interval", type=int, default=20)
     args = parser.parse_args()
 
     universe_size = args.universe_size
@@ -418,7 +646,23 @@ def main():
         models = [args.model]
     results = {}
     for model_kind in models:
-        result = run_experiment(model_kind, args.output_dir, universe_size=universe_size)
+        experiment_name = args.experiment_name
+        if experiment_name and len(models) > 1:
+            experiment_name = f"{experiment_name}_{model_kind}"
+        result = run_experiment(
+            model_kind,
+            args.output_dir,
+            universe_size=universe_size,
+            experiment_name=experiment_name,
+            market_cap_floor_quantile=args.market_cap_floor_quantile,
+            market_cap_column=args.market_cap_column,
+            multi_output_enabled=args.enable_multi_output,
+            volatility_weight=args.volatility_weight,
+            max_drawdown_weight=args.max_drawdown_weight,
+            enable_reliability_score=args.enable_reliability_score,
+            holding_bonus=args.holding_bonus,
+            rebalance_interval=args.rebalance_interval,
+        )
         print_summary(result)
         results[model_kind] = result
 

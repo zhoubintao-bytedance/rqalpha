@@ -72,6 +72,7 @@ def _format_metric(value, pattern="{:.2f}", scale=1.0):
 def _build_result_row(prior_blend, window_results, summary):
     market_env = summary["market_env"]
     core_indicators = summary["core_indicators"]
+    risk_flags = list(summary.get("risk_flags") or summary.get("overfit_flags") or [])
     return OrderedDict([
         ("prior_blend", float(prior_blend)),
         ("window_count", int(len(window_results))),
@@ -84,7 +85,8 @@ def _build_result_row(prior_blend, window_results, summary):
         ("max_drawdown", float(core_indicators["max_drawdown"])),
         ("sharpe", float(core_indicators["sharpe"])),
         ("win_rate", float(core_indicators["win_rate"])),
-        ("overfit_flags", list(summary["overfit_flags"])),
+        ("risk_flags", risk_flags),
+        ("overfit_flags", risk_flags),
     ])
 
 
@@ -221,8 +223,8 @@ def main(argv=None):
             **rows[0]
         )
     )
-    if rows[0]["overfit_flags"]:
-        print("过拟合提示: {}".format("；".join(rows[0]["overfit_flags"])))
+    if rows[0]["risk_flags"]:
+        print("风险提示: {}".format("；".join(rows[0]["risk_flags"])))
 
 
 if __name__ == "__main__":

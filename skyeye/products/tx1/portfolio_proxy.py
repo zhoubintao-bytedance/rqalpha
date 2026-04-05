@@ -4,7 +4,7 @@ import pandas as pd
 
 
 class PortfolioProxy(object):
-    def __init__(self, buy_top_k=20, hold_top_k=50, rebalance_interval=20, holding_bonus=0.5):
+    def __init__(self, buy_top_k=25, hold_top_k=45, rebalance_interval=20, holding_bonus=0.5):
         self.buy_top_k = int(buy_top_k)
         self.hold_top_k = int(hold_top_k)
         self.rebalance_interval = int(rebalance_interval)

@@ -7,14 +7,14 @@ status: research
 entrypoint: strategies/rolling_score/strategy.py
 rolling_score_start_date: "2019-02-01"
 hypothesis: 横截面动量、波动率、反转、流动性与换手稳定性的组合，能够在A股大中盘股票池中产生更稳健的相对沪深300超额收益。
-artifact_line_id: baseline_lgbm
+artifact_line_id: combo_b25_h45
 signal_inputs:
   - mom_40d
   - volatility_20d
   - reversal_5d
   - amihud_20d
   - turnover_stability_20d
-positioning_rule: Top20买入、Top50持有、跌出Top50退出，equal-weight + 持仓延续加分 + 月度重平衡（20交易日）。
+positioning_rule: Top25买入、Top45持有、跌出Top45退出，equal-weight + 持仓延续加分 + 月度重平衡（20交易日）。
 risk_controls:
   - single_stock_cap
   - turnover_threshold
@@ -28,5 +28,6 @@ expected_bad_regimes:
   - 全面普涨或普跌的单边市
   - 动量反转剧烈的急转市
 notes:
-  - 当前默认 baseline 为 baseline_5f（5 因子）+ rank label + 月度调仓
+  - 当前默认 baseline 为 baseline_5f（5 因子）+ rank label + Top25/Top45 月度调仓
+  - 2026-04-05 组合层迭代将默认 artifact line 提升为 combo_b25_h45，rolling-score 全量得分 50.5
   - benchmark冻结在strategy_id + artifact_line级别，profile不允许改动

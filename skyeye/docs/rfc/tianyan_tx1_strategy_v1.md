@@ -1,14 +1,32 @@
 # 天眼 TX1 正式方案 V1
 
-> 状态：V1 / 立项与研究设计文档
+> 状态：历史立项 RFC / 研究设计文档
 >
 > 日期：2026-03-28
 >
 > 定位：本文档用于策略立项、研究设计与评审，不构成已验证上线结论。
+>
+> 2026-04-05 当前默认实现已经收敛到 `baseline_5f + lgbm + frozen OOS replay + Top25/Top45`。本文中凡是 `Transformer`、`Top20/Top30`、事件驱动调仓等表述，默认都指当时的研究假设，不代表当前默认策略口径。当前执行说明请以 [TX1 PLAYBOOK](../../products/tx1/PLAYBOOK.md) 和 [rolling_score 策略说明](../../products/tx1/strategies/rolling_score/README.md) 为准。
 
 ---
 
 ## 0. 审核结论
+
+### 0.1 当前落地状态（2026-04-05）
+
+这份 V1 文档仍然保留为立项 RFC，但当前仓库里已经有更明确的默认实现：
+
+| 维度 | 当前默认实现 |
+| --- | --- |
+| 信号 | `baseline_5f` |
+| 模型 | `lgbm` |
+| 标签 | `20d horizon + rank transform` |
+| 组合层 | `Top25 买入 / Top45 持有 / 20 交易日重平衡 / holding_bonus=0.5` |
+| 执行方式 | `tx1.rolling_score` 回放冻结样本外目标权重 |
+| 默认 artifact line | `combo_b25_h45` |
+| 当前非默认试验线 | `combo_guarded_b25_h45`，保留为研究分支 |
+
+如果你在读这份 RFC，是为了理解“为什么 TX1 最初这样设计”；如果你要跑当前策略或继续迭代默认线，请回到上面的运行文档。
 
 **结论：有条件批准。**
 

@@ -95,3 +95,26 @@ env UV_CACHE_DIR=/tmp/uv-cache PYTHONPATH="$PWD" MPLCONFIGDIR=/tmp/mplconfig uv 
   适合看滚动窗口打分、策略卡片、窗口选择和 `--mod/-mc`。
 - [../rfc/dividend_scorer_iteration_directions.md](../rfc/dividend_scorer_iteration_directions.md)
   适合看设计讨论和迭代优先级，不是使用手册。
+
+## 9. 如果你在看 TX1
+
+TX1 当前不是 `dividend_scorer` 那条产品线，它的默认入口在：
+
+- [../../products/tx1/README.md](../../products/tx1/README.md)
+- [../../products/tx1/PLAYBOOK.md](../../products/tx1/PLAYBOOK.md)
+- [../../products/tx1/strategies/rolling_score/README.md](../../products/tx1/strategies/rolling_score/README.md)
+- [../rfc/tianyan_tx1_strategy_v1.md](../rfc/tianyan_tx1_strategy_v1.md)
+- [../rfc/tianyan_tx1_research_design_v1_1.md](../rfc/tianyan_tx1_research_design_v1_1.md)
+
+TX1 最常用的两条命令：
+
+```bash
+uv run python -m skyeye.products.tx1.run_baseline_experiment \
+  --model lgbm \
+  --output-dir skyeye/artifacts/experiments/tx1
+```
+
+```bash
+uv run python -m skyeye.evaluation.rolling_score.cli \
+  skyeye/products/tx1/strategies/rolling_score/strategy.py
+```

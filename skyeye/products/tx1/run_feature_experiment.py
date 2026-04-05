@@ -337,8 +337,8 @@ def run_variant(
     preprocessor = _make_preprocessor(variant.get("preprocess"))
     portfolio_config = variant.get("portfolio_config") or {}
     portfolio_builder = PortfolioProxy(
-        buy_top_k=portfolio_config.get("buy_top_k", 20),
-        hold_top_k=portfolio_config.get("hold_top_k", 50),
+        buy_top_k=portfolio_config.get("buy_top_k", 25),
+        hold_top_k=portfolio_config.get("hold_top_k", 45),
         rebalance_interval=portfolio_config.get("rebalance_interval", 20),
         holding_bonus=portfolio_config.get("holding_bonus", 0.5),
     )

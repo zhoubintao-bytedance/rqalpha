@@ -191,7 +191,12 @@ class ExperimentRunner(object):
 
         # Persist to disk if output_dir is provided
         if output_dir is not None:
-            saved_path = save_experiment(result, output_dir, config=self.config)
+            saved_path = save_experiment(
+                result,
+                output_dir,
+                config=self.config,
+                experiment_name=self.config.get("experiment_name"),
+            )
             result["output_dir"] = saved_path
 
         return result

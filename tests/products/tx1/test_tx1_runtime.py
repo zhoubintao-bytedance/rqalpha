@@ -19,7 +19,7 @@ def test_runtime_builds_from_strategy_id_and_artifact_line():
 def test_runtime_uses_spec_default_artifact_line_when_not_overridden():
     runtime = build_runtime(strategy_id="tx1.rolling_score")
 
-    assert runtime["artifact_line_id"] == "baseline_lgbm"
+    assert runtime["artifact_line_id"] == "combo_b25_h45"
     assert runtime["artifact"]["model_kind"] == "lgbm"
 
 

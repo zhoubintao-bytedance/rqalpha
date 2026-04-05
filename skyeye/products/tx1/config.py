@@ -42,8 +42,8 @@ DEFAULT_CONFIG = {
         },
     },
     "portfolio": {
-        "buy_top_k": 20,
-        "hold_top_k": 50,
+        "buy_top_k": 25,
+        "hold_top_k": 45,
         "rebalance_interval": 20,
         "holding_bonus": 0.5,
     },

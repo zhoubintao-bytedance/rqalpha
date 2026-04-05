@@ -81,7 +81,7 @@ def run_variant(dataset_df, variant):
     folds = splitter.split(labeled)
     print(f"  Folds: {len(folds)}")
 
-    portfolio_builder = PortfolioProxy(buy_top_k=20, hold_top_k=50)
+    portfolio_builder = PortfolioProxy(buy_top_k=25, hold_top_k=45)
     fold_results = []
 
     for idx, fold in enumerate(folds, start=1):
