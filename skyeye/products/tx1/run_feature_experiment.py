@@ -123,6 +123,12 @@ def build_variants():
             "preprocess": None,
         },
         {
+            "name": "baseline_5f_roe",
+            "purpose": "Minimal fundamental additive check: baseline_5f plus return_on_equity_ttm.",
+            "features": _dedupe(list(BASELINE_5F_COLUMNS) + ["return_on_equity_ttm"]),
+            "preprocess": None,
+        },
+        {
             "name": "baseline_4f",
             "purpose": "Legacy 4-factor baseline kept only as a historical reference line.",
             "features": list(BASELINE_4F_COLUMNS),
@@ -500,6 +506,7 @@ def _variant_metric_row(result):
     portfolio = result.get("portfolio", {})
     stability = result.get("stability", {})
     delta = result.get("delta_vs_baseline", {})
+    # 导出 spread / 稳定性 delta，便于后续脚本直接筛选“值得继续推进”的候选。
     return {
         "variant": result["name"],
         "n_features": len(result.get("features", [])),
@@ -513,8 +520,10 @@ def _variant_metric_row(result):
         "fold_rank_ic_std": stability.get("fold_rank_ic_std"),
         "fold_net_return_std": stability.get("fold_net_return_std"),
         "delta_rank_ic_mean": delta.get("prediction", {}).get("rank_ic_mean"),
+        "delta_top_bucket_spread_mean": delta.get("prediction", {}).get("top_bucket_spread_mean"),
         "delta_net_mean_return": delta.get("portfolio", {}).get("net_mean_return"),
         "delta_fold_rank_ic_std": delta.get("stability", {}).get("fold_rank_ic_std"),
+        "delta_fold_net_return_std": delta.get("stability", {}).get("fold_net_return_std"),
         "features": ",".join(result.get("features", [])),
     }
 
@@ -604,10 +613,13 @@ def format_results(payload, output_dir):
         if result.get("n_folds", 0) > 0:
             delta = result.get("delta_vs_baseline", {})
             lines.append(
-                "  delta_vs_baseline: rank_ic_mean={:+.4f}, net_mean_return={:+.6f}, fold_rank_ic_std={:+.4f}".format(
+                # 显式写出 spread 与稳定性 delta，避免只看 aggregate 收益后误判候选质量。
+                "  delta_vs_baseline: rank_ic_mean={:+.4f}, top_bucket_spread_mean={:+.4f}, net_mean_return={:+.6f}, fold_rank_ic_std={:+.4f}, fold_net_return_std={:+.6f}".format(
                     delta.get("prediction", {}).get("rank_ic_mean", 0.0),
+                    delta.get("prediction", {}).get("top_bucket_spread_mean", 0.0),
                     delta.get("portfolio", {}).get("net_mean_return", 0.0),
                     delta.get("stability", {}).get("fold_rank_ic_std", 0.0),
+                    delta.get("stability", {}).get("fold_net_return_std", 0.0),
                 )
             )
 

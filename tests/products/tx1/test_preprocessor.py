@@ -102,3 +102,18 @@ def test_standardize_zero_variance_maps_to_zero():
     result = preprocessor.transform(frame, ["mom_40d"])
 
     assert (result["mom_40d"] == 0.0).all()
+
+
+def test_preprocessor_bundle_round_trip_preserves_config():
+    """验证 preprocessor bundle 可以完整保存和恢复口径。"""
+    preprocessor = FeaturePreprocessor(neutralize=True, winsorize_scale=5.0, standardize=False, min_obs=7)
+
+    bundle = preprocessor.to_bundle(feature_columns=["mom_40d", "reversal_5d"])
+    restored = FeaturePreprocessor.from_bundle(bundle)
+
+    assert bundle["feature_columns"] == ["mom_40d", "reversal_5d"]
+    assert bundle["required_columns"] == ["date", "order_book_id", "close", "sector", "mom_40d", "reversal_5d"]
+    assert restored.neutralize is True
+    assert restored.winsorize_scale == 5.0
+    assert restored.standardize is False
+    assert restored.min_obs == 7

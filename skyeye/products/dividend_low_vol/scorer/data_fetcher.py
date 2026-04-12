@@ -229,6 +229,21 @@ class DataGapError(RuntimeError):
     pass
 
 
+class _UnavailableRQDataProvider(object):
+    """当 rqdatac 初始化失败时，延迟到真正访问在线数据时再抛出明确错误。"""
+
+    def __init__(self, init_error):
+        self.init_error = init_error
+
+    def __getattr__(self, name):
+        """任意在线数据方法被调用时，都抛出统一的不可用错误。"""
+
+        def _raise_unavailable(*args, **kwargs):
+            raise RuntimeError("rqdatac provider unavailable during DataFetcher initialization") from self.init_error
+
+        return _raise_unavailable
+
+
 class DataFetcher(object):
     def __init__(
         self,
@@ -245,7 +260,11 @@ class DataFetcher(object):
         self.bundle_path = os.path.expanduser(bundle_path) if bundle_path else None
         self._bundle_proxy = None
         self.facade = DataFacade()
-        self.provider = RQDataProvider()
+        try:
+            self.provider = RQDataProvider()
+        except Exception as exc:
+            # 某些只读/离线测试只需要本地缓存能力，不应在构造阶段被在线 DNS 或配额问题阻断。
+            self.provider = _UnavailableRQDataProvider(exc)
         self._etf_order_book_id = self._to_order_book_id(etf_code, "XSHG")
         self._index_order_book_id = self._to_order_book_id(index_code, "XSHG")
         self._init_db()

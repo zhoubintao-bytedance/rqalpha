@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -18,7 +19,7 @@ from skyeye.data import DataFacade
 BENCHMARK_ID = "000300.XSHG"
 
 TRAIN_START = "2015-01-01"
-DATA_END    = "2026-03-06"
+DEFAULT_DATA_END = "2026-03-06"
 
 UNIVERSE_SIZE = 300
 DATA_FACADE = DataFacade()
@@ -126,6 +127,31 @@ def _normalize_daily_bars(
     return df.sort_values(["date", "order_book_id"]).reset_index(drop=True)
 
 
+def resolve_data_end() -> pd.Timestamp:
+    """解析 TX1 当前可用的数据终点。
+
+    优先允许用环境变量显式覆盖，便于临时补跑指定日期；
+    否则直接读取基准指数真实可用的最后一个交易日，避免依赖手写常量。
+    """
+    override = os.environ.get("SKYEYE_TX1_DATA_END")
+    if override:
+        return pd.Timestamp(override).normalize()
+
+    probe_end = pd.Timestamp.today().normalize()
+    bars = DATA_FACADE.get_daily_bars(
+        BENCHMARK_ID,
+        pd.Timestamp(TRAIN_START),
+        probe_end,
+        fields=["close"],
+        adjust_type="none",
+    )
+    benchmark_df = _normalize_daily_bars(bars, ["close"], single_order_book_id=BENCHMARK_ID)
+    if not benchmark_df.empty:
+        return pd.Timestamp(benchmark_df["date"].max()).normalize()
+
+    return pd.Timestamp(DEFAULT_DATA_END)
+
+
 def _load_stock_instruments(active_only: bool) -> pd.DataFrame:
     instruments = DATA_FACADE.all_instruments(type="CS")
     if instruments is None or instruments.empty:
@@ -153,9 +179,9 @@ def _load_stock_instruments(active_only: bool) -> pd.DataFrame:
         instruments = instruments.loc[:, keep]
     return instruments.reset_index(drop=True)
 
-def _load_benchmark_close() -> pd.DataFrame:
+def _load_benchmark_close(end_date: pd.Timestamp | None = None) -> pd.DataFrame:
     start_date = pd.Timestamp(TRAIN_START)
-    end_date = pd.Timestamp(DATA_END)
+    end_date = pd.Timestamp(end_date).normalize() if end_date is not None else resolve_data_end()
     bars = DATA_FACADE.get_daily_bars(
         BENCHMARK_ID,
         start_date,
@@ -191,15 +217,20 @@ def _load_all_stocks(universe: list[str], start_date: pd.Timestamp, end_date: pd
     return stocks_df.reset_index(drop=True)
 
 
-def _get_liquid_universe(n: int = UNIVERSE_SIZE) -> list[str]:
+def _get_liquid_universe(
+    n: int = UNIVERSE_SIZE,
+    *,
+    data_end: pd.Timestamp | None = None,
+) -> list[str]:
     instruments = _load_stock_instruments(active_only=True)
     active_cs = instruments["order_book_id"].tolist()
+    data_end = pd.Timestamp(data_end).normalize() if data_end is not None else resolve_data_end()
     medians = {}
     for chunk in _chunked(active_cs, 500):
         bars = DATA_FACADE.get_daily_bars(
             chunk,
             pd.Timestamp(TRAIN_START),
-            pd.Timestamp(DATA_END),
+            data_end,
             fields=BAR_FIELDS,
             adjust_type="pre",
         )
@@ -235,11 +266,12 @@ def _load_market_cap_snapshot(
     order_book_ids: list[str],
     preferred_column: str | None = None,
     lookback_days: int = 90,
+    data_end: pd.Timestamp | None = None,
 ) -> tuple[str | None, pd.Series | None]:
     if not order_book_ids:
         return None, None
 
-    end_date = pd.Timestamp(DATA_END)
+    end_date = pd.Timestamp(data_end).normalize() if data_end is not None else resolve_data_end()
     start_date = end_date - pd.Timedelta(days=int(lookback_days))
     candidates = []
     if preferred_column:
@@ -276,6 +308,7 @@ def _apply_market_cap_floor(
     instruments: pd.DataFrame,
     market_cap_floor_quantile: float | None = None,
     market_cap_column: str | None = None,
+    data_end: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, dict | None]:
     if market_cap_floor_quantile is None:
         return instruments.reset_index(drop=True), None
@@ -292,6 +325,7 @@ def _apply_market_cap_floor(
         resolved_column, snapshot = _load_market_cap_snapshot(
             instruments["order_book_id"].tolist(),
             preferred_column=market_cap_column,
+            data_end=data_end,
         )
         if resolved_column is None or snapshot is None:
             raise ValueError("no market cap column available for market_cap floor")
@@ -315,12 +349,15 @@ def get_liquid_universe(
     n: int = UNIVERSE_SIZE,
     market_cap_floor_quantile: float | None = None,
     market_cap_column: str | None = None,
+    data_end: pd.Timestamp | None = None,
 ) -> list[str]:
+    data_end = pd.Timestamp(data_end).normalize() if data_end is not None else resolve_data_end()
     instruments = _load_stock_instruments(active_only=True)
     filtered, floor_summary = _apply_market_cap_floor(
         instruments,
         market_cap_floor_quantile=market_cap_floor_quantile,
         market_cap_column=market_cap_column,
+        data_end=data_end,
     )
     if floor_summary:
         print(
@@ -339,7 +376,7 @@ def get_liquid_universe(
         bars = DATA_FACADE.get_daily_bars(
             chunk,
             pd.Timestamp(TRAIN_START),
-            pd.Timestamp(DATA_END),
+            data_end,
             fields=BAR_FIELDS,
             adjust_type="pre",
         )
@@ -376,12 +413,12 @@ def _load_sector_map() -> dict:
     }
 
 
-def _load_northbound_flow() -> pd.DataFrame:
+def _load_northbound_flow(data_end: pd.Timestamp) -> pd.DataFrame:
     """Load daily northbound net flow (沪股通+深股通 combined)."""
     try:
         from skyeye.data.provider import RQDataProvider
         provider = RQDataProvider()
-        df = provider.get_northbound_flow(TRAIN_START, DATA_END)
+        df = provider.get_northbound_flow(TRAIN_START, data_end.strftime("%Y-%m-%d"))
         if df is not None and not df.empty:
             # Normalize column names
             date_col = [c for c in df.columns if "date" in c.lower()]
@@ -436,12 +473,17 @@ def _load_fundamental_factors(
     return result.sort_values(["date", "order_book_id"]).reset_index(drop=True)
 
 
-def build_raw_df(universe: list[str]) -> pd.DataFrame:
+def build_raw_df(
+    universe: list[str],
+    *,
+    start_date: pd.Timestamp | None = None,
+    end_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
     print(f"Loading benchmark ({BENCHMARK_ID})...")
-    benchmark = _load_benchmark_close()
+    end_date = pd.Timestamp(end_date).normalize() if end_date is not None else resolve_data_end()
+    start_date = pd.Timestamp(start_date).normalize() if start_date is not None else pd.Timestamp(TRAIN_START)
+    benchmark = _load_benchmark_close(end_date=end_date)
 
-    start_date = pd.Timestamp(TRAIN_START)
-    end_date = pd.Timestamp(DATA_END)
     benchmark = benchmark[
         (benchmark["date"] >= start_date) & (benchmark["date"] <= end_date)
     ]
@@ -457,7 +499,7 @@ def build_raw_df(universe: list[str]) -> pd.DataFrame:
 
     # Add northbound net flow (market-level, optional)
     print("Loading northbound flow data...")
-    north_df = _load_northbound_flow()
+    north_df = _load_northbound_flow(end_date)
     if not north_df.empty:
         raw_df = raw_df.merge(north_df, on="date", how="left")
         raw_df["north_net_flow"] = raw_df["north_net_flow"].fillna(0.0)
@@ -481,6 +523,26 @@ def build_raw_df(universe: list[str]) -> pd.DataFrame:
     raw_df = raw_df.sort_values(["date", "order_book_id"]).reset_index(drop=True)
     print(f"raw_df shape: {raw_df.shape}  date range: {raw_df['date'].min().date()} – {raw_df['date'].max().date()}")
     return raw_df
+
+
+def build_live_raw_df(
+    *,
+    trade_date=None,
+    universe: list[str] | None = None,
+    universe_size: int = UNIVERSE_SIZE,
+    market_cap_floor_quantile: float | None = None,
+    market_cap_column: str | None = None,
+) -> pd.DataFrame:
+    """为 live advisor 构建截止指定日期的实时原始面板。"""
+    end_date = pd.Timestamp(trade_date).normalize() if trade_date is not None else resolve_data_end()
+    if universe is None:
+        universe = get_liquid_universe(
+            universe_size,
+            market_cap_floor_quantile=market_cap_floor_quantile,
+            market_cap_column=market_cap_column,
+            data_end=end_date,
+        )
+    return build_raw_df(universe, end_date=end_date)
 
 
 # ---------------------------------------------------------------------------

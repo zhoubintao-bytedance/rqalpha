@@ -12,6 +12,35 @@ RQAlpha is an algorithmic trading system that provides a complete solution for q
 
 **License**: Non-commercial use only (Apache 2.0). Commercial use requires authorization from Ricequant.
 
+## TX1 Quick Entry
+
+If a task mentions `TX1`, `tx1.rolling_score`, `run_live_advisor`, `PLAYBOOK`, or files under `skyeye/products/tx1/`, read these files before editing:
+
+1. `skyeye/products/tx1/README.md`
+2. `skyeye/products/tx1/PLAYBOOK.md`
+3. `skyeye/products/tx1/strategies/rolling_score/README.md`
+
+Use `skyeye/products/tx1/PLAYBOOK.md` as the operational source of truth for:
+
+- current default line
+- `run_live_advisor` commands
+- live-advisor output interpretation
+- TX1 day-to-day workflow
+
+Most common TX1 entry commands:
+
+```bash
+PYTHONPATH="$PWD" python -m skyeye.products.tx1.run_live_advisor \
+  --package-id <package_id> \
+  --packages-root skyeye/artifacts/packages/tx1 \
+  --trade-date <YYYY-MM-DD> \
+  --top-k 25 \
+  --format table
+
+uv run python -m skyeye.evaluation.rolling_score.cli \
+  skyeye/products/tx1/strategies/rolling_score/strategy.py
+```
+
 ## Common Commands
 
 ### Installation

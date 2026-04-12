@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from skyeye.products.tx1.live_advisor.package_io import (
+    DEFAULT_TX1_PACKAGES_ROOT,
+    package_component_path,
+)
+from skyeye.products.tx1.live_advisor.schema import LIVE_PACKAGE_REQUIRED_COMPONENTS
 
 
 # Benchmark is frozen at strategy_id + artifact_line level per RFC.
@@ -51,6 +56,17 @@ class ReplaySignal:
     test_end: str
     target_weights: dict[str, float]
     predictions: dict[str, float]
+
+
+@dataclass(frozen=True)
+class ResolvedLivePackage:
+    """已解析的 TX1 live promoted package。"""
+
+    package_id: str
+    package_root: Path
+    manifest_path: Path
+    component_paths: dict[str, Path]
+    manifest: dict
 
 
 def parse_artifact_line(ref: str) -> ArtifactLine:
@@ -141,6 +157,41 @@ def load_replay_signal_book(resolved_artifact: ResolvedArtifact) -> dict[str, Re
     )
 
 
+def resolve_live_package(
+    ref: str | Path,
+    packages_root: Path | None = None,
+) -> ResolvedLivePackage:
+    """解析 live package，并校验六件套是否齐全。"""
+    package_root = _resolve_live_package_root(ref, packages_root=packages_root)
+    if not package_root.is_dir():
+        raise FileNotFoundError("live package directory not found: {}".format(package_root))
+
+    component_paths = {}
+    for component_name in LIVE_PACKAGE_REQUIRED_COMPONENTS:
+        component_path = package_component_path(package_root, component_name)
+        if not component_path.is_file():
+            raise FileNotFoundError(
+                "live package missing required component {}: {}".format(
+                    component_name,
+                    component_path,
+                )
+            )
+        component_paths[component_name] = component_path
+
+    manifest_path = component_paths["manifest"]
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    package_id = str(manifest.get("package_id") or package_root.name)
+    return ResolvedLivePackage(
+        package_id=package_id,
+        package_root=package_root,
+        manifest_path=manifest_path,
+        component_paths=component_paths,
+        manifest=manifest,
+    )
+
+
 def _extract_train_cutoff(metadata: dict) -> str:
     """Extract train_cutoff from the last fold's date_range.train_end."""
     folds = metadata.get("folds", [])
@@ -226,6 +277,21 @@ def _normalize_date_text(value: Any) -> str:
     if " " in text:
         return text.split(" ", 1)[0]
     return text
+
+
+def _resolve_live_package_root(
+    ref: str | Path,
+    packages_root: Path | None = None,
+) -> Path:
+    """兼容 package_id 与显式目录路径的 live package 引用。"""
+    ref_path = Path(ref)
+    if ref_path.is_absolute():
+        return ref_path
+    ref_text = str(ref)
+    if "/" in ref_text or ref_text.startswith("."):
+        return ref_path.resolve()
+    root = packages_root or DEFAULT_TX1_PACKAGES_ROOT
+    return Path(root) / ref_text
 
 
 def _extract_numeric_mapping(frame: pd.DataFrame, value_column: str) -> dict[str, float]:

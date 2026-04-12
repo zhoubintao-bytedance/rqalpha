@@ -15,24 +15,34 @@ def test_run_feature_experiment_smoke(tmp_path, make_raw_panel):
     result = run_feature_experiments(
         raw_df=raw_df,
         output_dir=tmp_path,
-        variant_names=["baseline_5f", "combined_v2"],
+        variant_names=["baseline_5f", "baseline_5f_roe"],
         model_kind="linear",
         max_folds=1,
     )
 
     variant_names = [variant["name"] for variant in result["variants"]]
-    assert variant_names == ["baseline_5f", "combined_v2"]
+    assert variant_names == ["baseline_5f", "baseline_5f_roe"]
     assert result["variants"][0]["n_folds"] == 1
     assert result["variants"][0]["features"]
     assert (tmp_path / "feature_experiment_results.json").exists()
     assert (tmp_path / "feature_experiment_report.txt").exists()
     assert (tmp_path / "variant_metrics.csv").exists()
 
+    # 报告里必须显式暴露 spread 与稳定性 delta，便于判断是否值得继续推进。
+    report = (tmp_path / "feature_experiment_report.txt").read_text()
+    assert "top_bucket_spread_mean" in report
+    assert "fold_net_return_std" in report
+
+    # CSV 也要导出对应 delta 字段，便于后续程序化比较。
+    metrics = pd.read_csv(tmp_path / "variant_metrics.csv")
+    assert {"delta_top_bucket_spread_mean", "delta_fold_net_return_std"}.issubset(metrics.columns)
+
 
 def test_build_variants_contains_new_variants():
     variants = build_variants()
     names = [v["name"] for v in variants]
     assert "baseline_5f" in names
+    assert "baseline_5f_roe" in names
     assert "baseline_4f_fundamental_filter" in names
     assert "baseline_5f_fundamental_filter" in names
     assert "elite_ohlcv_3f" in names
@@ -45,6 +55,12 @@ def test_baseline_5f_variant_uses_expected_features():
     variants = build_variants()
     baseline_5f = next(v for v in variants if v["name"] == "baseline_5f")
     assert baseline_5f["features"] == list(BASELINE_5F_COLUMNS)
+
+
+def test_baseline_5f_roe_variant_uses_expected_features():
+    variants = build_variants()
+    baseline_5f_roe = next(v for v in variants if v["name"] == "baseline_5f_roe")
+    assert baseline_5f_roe["features"] == list(BASELINE_5F_COLUMNS) + ["return_on_equity_ttm"]
 
 
 def test_default_feature_columns_match_baseline_5f():

@@ -11,12 +11,14 @@ class LinearBaselineModel(object):
         self.coef_ = None
 
     def fit(self, train_X, train_y):
+        # 线性基线直接对扩展后的设计矩阵做最小二乘拟合。
         X = self._design_matrix(train_X)
         y = np.asarray(train_y, dtype=float)
         self.coef_, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
         return self
 
     def predict(self, test_X):
+        # 预测阶段复用训练时相同的设计矩阵拼接方式。
         if self.coef_ is None:
             raise RuntimeError("model must be fit before predict")
         X = self._design_matrix(test_X)
@@ -39,6 +41,7 @@ class TreeBaselineModel(object):
     _N_CANDIDATES = 50   # quantile-based threshold candidates per feature
 
     def fit(self, train_X, train_y):
+        # 简化树模型只搜索单层阈值，保持 walk-forward 下的低方差特性。
         X = train_X.to_numpy(dtype=float)
         y = np.asarray(train_y, dtype=float)
         best_loss = None
@@ -67,6 +70,7 @@ class TreeBaselineModel(object):
         return self
 
     def predict(self, test_X):
+        # 按训练时找到的最佳阈值做左右叶子打分。
         if self.threshold_ is None:
             raise RuntimeError("model must be fit before predict")
         X = test_X.to_numpy(dtype=float)
@@ -108,6 +112,7 @@ class LightGBMModel(object):
         self._model = None
 
     def fit(self, train_X, train_y, val_X=None, val_y=None):
+        # LightGBM 保留保守默认参数，并在可用时启用验证集早停。
         X = train_X.to_numpy(dtype=float)
         y = np.asarray(train_y, dtype=float)
         feature_names = list(train_X.columns) if hasattr(train_X, "columns") else None
@@ -139,6 +144,7 @@ class LightGBMModel(object):
         return self
 
     def predict(self, test_X):
+        # 预测时直接复用 Booster，对齐研究侧评分逻辑。
         if self._model is None:
             raise RuntimeError("model must be fit before predict")
         X = test_X.to_numpy(dtype=float)
@@ -153,6 +159,7 @@ class IndependentMultiHeadModel(object):
         self.models_ = {}
 
     def fit(self, train_X, train_targets, val_X=None, val_targets=None):
+        # 多头模型本质上是每个目标各自训练一套独立基模型。
         if train_targets is None or len(train_targets) == 0:
             raise ValueError("train_targets must not be empty")
         for head_name, head_config in self.head_configs.items():
@@ -179,6 +186,7 @@ class IndependentMultiHeadModel(object):
         return self
 
     def predict(self, test_X):
+        # 预测时保持 head_name -> ndarray 的稳定映射，便于后续拼装输出列。
         if not self.models_:
             raise RuntimeError("model must be fit before predict")
         return {
@@ -203,3 +211,99 @@ def create_model(kind, params=None):
 
 def create_multi_head_model(kind, head_configs, params=None):
     return IndependentMultiHeadModel(kind=kind, head_configs=head_configs, params=params)
+
+
+def dump_model_bundle(model, *, model_kind: str, feature_columns: list[str]) -> dict:
+    """将训练后的模型导出为可序列化 bundle。"""
+    if not feature_columns:
+        raise ValueError("feature_columns must not be empty")
+    if isinstance(model, IndependentMultiHeadModel):
+        if not model.models_:
+            raise RuntimeError("multi-head model must be fit before dump")
+        state = {
+            "base_model_kind": model.kind,
+            "head_configs": deepcopy(model.head_configs),
+            "heads": {},
+        }
+        for head_name, head_state in model.models_.items():
+            state["heads"][head_name] = {
+                "target_column": head_state["target_column"],
+                "bundle": dump_model_bundle(
+                    head_state["model"],
+                    model_kind=model.kind,
+                    feature_columns=feature_columns,
+                ),
+            }
+        return {
+            "model_kind": "multi_head",
+            "feature_columns": list(feature_columns),
+            "state": state,
+        }
+    if model_kind == "linear":
+        if model.coef_ is None:
+            raise RuntimeError("linear model must be fit before dump")
+        state = {
+            "coef": np.asarray(model.coef_, dtype=float).tolist(),
+        }
+    elif model_kind == "tree":
+        if model.threshold_ is None:
+            raise RuntimeError("tree model must be fit before dump")
+        state = {
+            "threshold": float(model.threshold_),
+            "left_value": float(model.left_value_),
+            "right_value": float(model.right_value_),
+            "feature_idx": int(model.feature_idx_),
+        }
+    elif model_kind == "lgbm":
+        if model._model is None:
+            raise RuntimeError("lightgbm model must be fit before dump")
+        state = {
+            "model_str": model._model.model_to_string(),
+            "params": dict(model._params),
+            "n_estimators": int(model._n_estimators),
+            "early_stopping_rounds": int(model._early_stopping),
+        }
+    else:
+        raise ValueError("unsupported model kind: {}".format(model_kind))
+    return {
+        "model_kind": model_kind,
+        "feature_columns": list(feature_columns),
+        "state": state,
+    }
+
+
+def load_model_bundle(bundle: dict):
+    """从序列化 bundle 恢复模型实例。"""
+    if not isinstance(bundle, dict):
+        raise ValueError("bundle must be a dict")
+    model_kind = bundle.get("model_kind")
+    state = bundle.get("state", {})
+    if model_kind == "multi_head":
+        model = IndependentMultiHeadModel(
+            kind=state["base_model_kind"],
+            head_configs=deepcopy(state.get("head_configs", {})),
+            params=None,
+        )
+        model.models_ = {}
+        for head_name, head_state in state.get("heads", {}).items():
+            loaded_model = load_model_bundle(head_state["bundle"])
+            model.models_[head_name] = {
+                "model": loaded_model,
+                "target_column": head_state["target_column"],
+            }
+        return model
+    model = create_model(model_kind, params=state.get("params"))
+    if model_kind == "linear":
+        model.coef_ = np.asarray(state.get("coef", []), dtype=float)
+    elif model_kind == "tree":
+        model.threshold_ = float(state["threshold"])
+        model.left_value_ = float(state["left_value"])
+        model.right_value_ = float(state["right_value"])
+        model.feature_idx_ = int(state["feature_idx"])
+    elif model_kind == "lgbm":
+        model._n_estimators = int(state.get("n_estimators", model._n_estimators))
+        model._early_stopping = int(state.get("early_stopping_rounds", model._early_stopping))
+        model._model = lgb.Booster(model_str=state["model_str"])
+    else:
+        raise ValueError("unsupported model kind: {}".format(model_kind))
+    return model
