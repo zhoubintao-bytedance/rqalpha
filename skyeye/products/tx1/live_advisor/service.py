@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pandas as pd
 
 from skyeye.data import DataFacade
@@ -61,9 +63,13 @@ class LiveAdvisorService(object):
             universe_source=universe_source,
             universe_cache_root=universe_cache_root,
         )
-        snapshot_gate = evaluate_snapshot_runtime_gates(
+        snapshot_gate = _call_with_supported_kwargs(
+            evaluate_snapshot_runtime_gates,
             snapshot,
             required_features=feature_columns,
+            freshness_policy=manifest.get("freshness_policy"),
+            label_end_date=manifest.get("label_end_date", manifest.get("fit_end_date")),
+            evidence_end_date=manifest.get("evidence_end_date"),
         )
         if not snapshot_gate["passed"]:
             return self._build_stop_result(
@@ -72,6 +78,7 @@ class LiveAdvisorService(object):
                 reasons=snapshot_gate["reasons"],
                 warnings=snapshot_gate.get("warnings"),
                 include_dropped=include_dropped,
+                gate_diagnostics=snapshot_gate.get("diagnostics"),
             )
 
         preprocessor = FeaturePreprocessor.from_bundle(package_payload["preprocessor_bundle"])
@@ -157,7 +164,7 @@ class LiveAdvisorService(object):
                 }
             )
 
-        warnings = []
+        warnings = list(snapshot_gate.get("warnings", []))
         if not isinstance(recent_canary_bundle, dict):
             warnings.append(
                 {
@@ -182,6 +189,11 @@ class LiveAdvisorService(object):
             "score_date": snapshot["trade_date"],
             "raw_data_end_date": snapshot.get("raw_data_end_date"),
             "fit_end_date": manifest.get("fit_end_date"),
+            "label_end_date": manifest.get("label_end_date", manifest.get("fit_end_date")),
+            "evidence_end_date": manifest.get("evidence_end_date"),
+            "data_dependency_summary": dict(manifest.get("data_dependency_summary") or {}),
+            "data_source_summary": dict(snapshot.get("data_source_summary") or {}),
+            "gate_diagnostics": dict(snapshot_gate.get("diagnostics") or {}),
             "recommendations": recommendations,
             "warnings": warnings,
             "portfolio_advice": portfolio_advice,
@@ -222,7 +234,15 @@ class LiveAdvisorService(object):
         return result
 
     @staticmethod
-    def _build_stop_result(manifest, snapshot, *, reasons, warnings=None, include_dropped):
+    def _build_stop_result(
+        manifest,
+        snapshot,
+        *,
+        reasons,
+        warnings=None,
+        include_dropped=False,
+        gate_diagnostics=None,
+    ):
         """统一返回 stop-serve 结果，避免静默降级。"""
         result = {
             "status": "stopped",
@@ -233,6 +253,11 @@ class LiveAdvisorService(object):
             "score_date": snapshot["trade_date"],
             "raw_data_end_date": snapshot.get("raw_data_end_date"),
             "fit_end_date": manifest.get("fit_end_date"),
+            "label_end_date": manifest.get("label_end_date", manifest.get("fit_end_date")),
+            "evidence_end_date": manifest.get("evidence_end_date"),
+            "data_dependency_summary": dict(manifest.get("data_dependency_summary") or {}),
+            "data_source_summary": dict(snapshot.get("data_source_summary") or {}),
+            "gate_diagnostics": dict(gate_diagnostics or {}),
             "reasons": list(reasons),
             "warnings": list(warnings or []),
             "recommendations": [],
@@ -280,7 +305,34 @@ class LiveAdvisorService(object):
             current_holdings=current_weights,
             should_rebalance=rebalance_due,
         )
+        cash_buffer = float(portfolio_policy.get("cash_buffer", 0.0) or 0.0)
+        if target_weights and 0.0 <= cash_buffer < 1.0:
+            scale = 1.0 - cash_buffer
+            target_weights = {
+                order_book_id: float(weight) * scale
+                for order_book_id, weight in target_weights.items()
+            }
         estimated_turnover = compute_turnover_ratio(current_weights, target_weights)
+        min_weight = float(portfolio_policy.get("min_weight", 0.0) or 0.0)
+        max_turnover = portfolio_policy.get("max_turnover")
+        max_turnover = float(max_turnover) if max_turnover is not None else None
+        preflight_checks = _build_portfolio_preflight_checks(
+            target_weights=target_weights,
+            cash_buffer=cash_buffer,
+            min_weight=min_weight,
+            max_turnover=max_turnover,
+            estimated_turnover=float(estimated_turnover),
+            max_positions=int(portfolio_policy.get("buy_top_k", 25)),
+        )
+        execution_blockers = []
+        if not preflight_checks["cash_buffer_ok"]["passed"]:
+            execution_blockers.append("cash_buffer_invalid")
+        if not preflight_checks["min_weight_ok"]["passed"]:
+            execution_blockers.append("min_weight_below_threshold")
+        if not preflight_checks["turnover_ok"]["passed"]:
+            execution_blockers.append("turnover_limit_exceeded")
+        if not preflight_checks["position_count_ok"]["passed"]:
+            execution_blockers.append("position_count_exceeded")
         action_rows = []
         for order_book_id in sorted(set(current_weights) | set(target_weights)):
             current_weight = float(current_weights.get(order_book_id, 0.0))
@@ -315,6 +367,10 @@ class LiveAdvisorService(object):
                 for row in action_rows
             },
             "estimated_turnover": float(estimated_turnover),
+            "cash_buffer": float(cash_buffer),
+            "preflight_checks": preflight_checks,
+            "execution_blockers": execution_blockers,
+            "advice_level": "blocked" if execution_blockers else "ok",
             "actions": action_rows,
         }
 
@@ -350,3 +406,49 @@ def _is_rebalance_due(
     else:
         gap = max(len(pd.bdate_range(last_rebalance_ts, trade_ts)) - 1, 0)
     return gap >= int(rebalance_interval)
+
+
+def _build_portfolio_preflight_checks(
+    *,
+    target_weights: dict[str, float],
+    cash_buffer: float,
+    min_weight: float,
+    max_turnover: float | None,
+    estimated_turnover: float,
+    max_positions: int,
+) -> dict:
+    """把执行前约束整理成结构化检查结果，供 CLI 和调用方直接消费。"""
+    min_target_weight = min(target_weights.values()) if target_weights else 0.0
+    return {
+        "cash_buffer_ok": {
+            "passed": 0.0 <= float(cash_buffer) < 1.0,
+            "actual": float(cash_buffer),
+            "threshold": 1.0,
+        },
+        "min_weight_ok": {
+            "passed": min_target_weight >= float(min_weight) if target_weights else True,
+            "actual": float(min_target_weight),
+            "threshold": float(min_weight),
+        },
+        "turnover_ok": {
+            "passed": True if max_turnover is None else float(estimated_turnover) <= float(max_turnover),
+            "actual": float(estimated_turnover),
+            "threshold": None if max_turnover is None else float(max_turnover),
+        },
+        "position_count_ok": {
+            "passed": len(target_weights) <= int(max_positions),
+            "actual": int(len(target_weights)),
+            "threshold": int(max_positions),
+        },
+    }
+
+
+def _call_with_supported_kwargs(func, *args, **kwargs):
+    """兼容测试替身和旧签名，只传目标函数真正声明过的参数。"""
+    parameters = inspect.signature(func).parameters
+    supported_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in parameters
+    }
+    return func(*args, **supported_kwargs)

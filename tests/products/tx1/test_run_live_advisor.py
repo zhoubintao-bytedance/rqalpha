@@ -152,3 +152,42 @@ def test_render_table_emits_red_warning_for_stale_requested_trade_date(monkeypat
     assert "2026-04-12" in output
     assert "2026-03-31" in output
     assert "\x1b[31m" in output
+
+
+def test_render_table_shows_freshness_metadata_and_execution_blockers(monkeypatch):
+    """验证表格会展示 label/evidence freshness 和执行阻塞原因。"""
+    monkeypatch.setattr(run_live_advisor, "_supports_color_output", lambda: False)
+    result = {
+        "package_id": "tx1_demo",
+        "gate_level": "canary_live",
+        "requested_trade_date": "2026-03-31",
+        "latest_available_trade_date": "2026-03-31",
+        "score_date": "2026-03-31",
+        "raw_data_end_date": "2026-03-31",
+        "fit_end_date": "2026-03-03",
+        "label_end_date": "2026-03-03",
+        "evidence_end_date": "2026-03-03",
+        "status": "ok",
+        "warnings": [],
+        "recommendations": [],
+        "portfolio_advice": {
+            "rebalance_due": True,
+            "estimated_turnover": 0.9,
+            "execution_blockers": ["min_weight_below_threshold"],
+            "preflight_checks": {
+                "min_weight_ok": {
+                    "passed": False,
+                    "threshold": 0.02,
+                    "actual": 0.009,
+                }
+            },
+            "actions": [],
+        },
+    }
+
+    output = run_live_advisor.render_table(result)
+
+    assert "label_end_date=2026-03-03" in output
+    assert "evidence_end_date=2026-03-03" in output
+    assert "执行阻塞" in output
+    assert "min_weight_below_threshold" in output

@@ -26,7 +26,10 @@ from skyeye.products.tx1.live_advisor.calibration import build_calibration_bundl
 from skyeye.products.tx1.live_advisor.package_io import build_live_package_payload, save_live_package
 from skyeye.products.tx1.persistence import load_experiment
 from skyeye.products.tx1.preprocessor import FeaturePreprocessor
-from skyeye.products.tx1.run_baseline_experiment import build_live_raw_df
+from skyeye.products.tx1.run_baseline_experiment import (
+    build_data_dependency_summary,
+    build_live_raw_df,
+)
 from skyeye.products.tx1.splitter import WalkForwardSplitter
 
 
@@ -184,6 +187,15 @@ def promote_experiment_to_live_package(
         "multi_output_enabled": bool(config.get("multi_output", {}).get("enabled", False)),
     }
     portfolio_policy = dict(config.get("portfolio", {}))
+    canary_reason = _build_canary_reason(gate_summary)
+    evidence_end_date = training["fit_end_date"]
+    if isinstance(recent_canary_bundle, dict):
+        evidence_end_date = str(
+            (recent_canary_bundle.get("window") or {}).get("end_date")
+            or training["fit_end_date"]
+        )
+    data_dependency_summary = build_data_dependency_summary(training["feature_columns"])
+    freshness_policy = _build_default_freshness_policy(int(config["labels"]["horizon"]))
 
     manifest = {
         "package_id": package_id or build_package_id(experiment_result, gate_summary, training["fit_end_date"]),
@@ -191,12 +203,17 @@ def promote_experiment_to_live_package(
         "source_experiment": _resolve_source_experiment_name(experiment_result),
         "horizon": int(config["labels"]["horizon"]),
         "fit_end_date": training["fit_end_date"],
+        "label_end_date": training["fit_end_date"],
         "data_end_date": training["data_end_date"],
+        "evidence_end_date": evidence_end_date,
         "created_at": datetime.now().isoformat(),
         "model_kind": str(config["model"]["kind"]),
         "required_features": list(training["feature_columns"]),
         "hashes": {},
         "gate_summary": gate_summary,
+        "canary_reason": canary_reason,
+        "data_dependency_summary": data_dependency_summary,
+        "freshness_policy": freshness_policy,
         "universe_id": str(config.get("universe", {}).get("universe_id", "liquid_top_300")),
     }
 
@@ -391,6 +408,37 @@ def build_recent_canary_bundle(
         }
     )
     return calibration_bundle
+
+
+def _build_canary_reason(gate_summary: dict) -> list[str]:
+    """把 canary 的阻塞原因沉淀到 manifest，便于 runtime 解释。"""
+    if str(gate_summary.get("gate_level")) != "canary_live":
+        return []
+    checks = gate_summary.get("checks", {})
+    reasons = [
+        check_name
+        for check_name in ("stability_score", "cv")
+        if not checks.get(check_name, {}).get("passed", True)
+    ]
+    if reasons:
+        return reasons
+    return [
+        check_name
+        for check_name, check_result in checks.items()
+        if not check_result.get("passed", True)
+    ]
+
+
+def _build_default_freshness_policy(horizon: int) -> dict:
+    """给 live package 生成默认 freshness 策略。"""
+    horizon_days = max(int(horizon), 1)
+    return {
+        "snapshot_max_delay_days": 1,
+        "model_warning_days": horizon_days,
+        "model_stop_days": horizon_days * 2,
+        "evidence_warning_days": horizon_days,
+        "evidence_stop_days": horizon_days * 2,
+    }
 
 
 def _build_check(actual: float, operator: str, threshold: float) -> dict:

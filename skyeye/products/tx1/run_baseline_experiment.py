@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import inspect
 import os
 from pathlib import Path
 
@@ -474,15 +475,49 @@ def _load_fundamental_factors(
     return result.sort_values(["date", "order_book_id"]).reset_index(drop=True)
 
 
+def build_data_dependency_summary(required_features: list[str] | None = None) -> dict:
+    """按特征集合推导 live runtime 真正需要的数据源。"""
+    if required_features is None:
+        # 研究侧旧链路保持全量装载，避免无意中改变历史实验口径。
+        return {
+            "bundle_price": True,
+            "bundle_volume": True,
+            "northbound_flow": True,
+            "fundamental_factors": list(FUNDAMENTAL_FACTORS),
+        }
+
+    required = {str(feature_name) for feature_name in required_features}
+    return {
+        "bundle_price": True,
+        "bundle_volume": True,
+        "northbound_flow": "north_net_flow" in required,
+        "fundamental_factors": [
+            feature_name
+            for feature_name in FUNDAMENTAL_FACTORS
+            if feature_name in required
+        ],
+    }
+
+
 def build_raw_df(
     universe: list[str],
     *,
     start_date: pd.Timestamp | None = None,
     end_date: pd.Timestamp | None = None,
+    required_features: list[str] | None = None,
+    data_dependency_summary: dict | None = None,
+    collect_source_diagnostics: bool = False,
 ) -> pd.DataFrame:
     print(f"Loading benchmark ({BENCHMARK_ID})...")
     end_date = pd.Timestamp(end_date).normalize() if end_date is not None else resolve_data_end()
     start_date = pd.Timestamp(start_date).normalize() if start_date is not None else pd.Timestamp(TRAIN_START)
+    dependency_summary = dict(
+        data_dependency_summary or build_data_dependency_summary(required_features)
+    )
+    source_diagnostics = {
+        "bundle_price": {"status": "loaded"},
+        "bundle_volume": {"status": "loaded"},
+    }
     benchmark = _load_benchmark_close(end_date=end_date)
 
     benchmark = benchmark[
@@ -498,30 +533,66 @@ def build_raw_df(
     sector_map = _load_sector_map()
     raw_df["sector"] = raw_df["order_book_id"].map(sector_map).fillna("Unknown")
 
-    # Add northbound net flow (market-level, optional)
-    print("Loading northbound flow data...")
-    north_df = _load_northbound_flow(end_date)
-    if not north_df.empty:
-        raw_df = raw_df.merge(north_df, on="date", how="left")
-        raw_df["north_net_flow"] = raw_df["north_net_flow"].fillna(0.0)
-        print(f"  Northbound data: {len(north_df)} days")
+    # live runtime 只在 package 真正依赖该源时才去拉额外数据，避免无意义在线请求。
+    if dependency_summary.get("northbound_flow"):
+        print("Loading northbound flow data...")
+        north_df = _load_northbound_flow(end_date)
+        if not north_df.empty:
+            raw_df = raw_df.merge(north_df, on="date", how="left")
+            raw_df["north_net_flow"] = raw_df["north_net_flow"].fillna(0.0)
+            source_diagnostics["northbound_flow"] = {
+                "status": "loaded",
+                "n_days": int(len(north_df)),
+            }
+            print(f"  Northbound data: {len(north_df)} days")
+        else:
+            source_diagnostics["northbound_flow"] = {
+                "status": "unavailable",
+                "n_days": 0,
+            }
+            print("  Northbound data: unavailable, skipping")
     else:
-        print("  Northbound data: unavailable, skipping")
+        source_diagnostics["northbound_flow"] = {
+            "status": "skipped_feature_not_required",
+        }
 
-    # Add fundamental factors (daily, via rqdatac)
-    print("Loading fundamental factors...")
-    fund_df = _load_fundamental_factors(universe, start_date, end_date)
-    if not fund_df.empty and len(fund_df) > 0:
-        raw_df = raw_df.merge(fund_df, on=["date", "order_book_id"], how="left")
-        loaded = [c for c in FUNDAMENTAL_FACTORS if c in raw_df.columns]
-        coverage = raw_df[loaded].notna().mean()
-        print(f"  Fundamental factors loaded: {loaded}")
-        for col in loaded:
-            print(f"    {col}: {coverage[col]:.1%} coverage")
+    required_fundamentals = list(dependency_summary.get("fundamental_factors") or [])
+    if required_fundamentals:
+        print("Loading fundamental factors...")
+        fund_df = _load_fundamental_factors(universe, start_date, end_date)
+        if not fund_df.empty and len(fund_df) > 0:
+            keep_columns = ["date", "order_book_id"] + [
+                column_name
+                for column_name in required_fundamentals
+                if column_name in fund_df.columns
+            ]
+            fund_df = fund_df.loc[:, keep_columns].copy()
+            raw_df = raw_df.merge(fund_df, on=["date", "order_book_id"], how="left")
+            loaded = [c for c in required_fundamentals if c in raw_df.columns]
+            coverage = raw_df[loaded].notna().mean() if loaded else pd.Series(dtype=float)
+            source_diagnostics["fundamental_factors"] = {
+                "status": "loaded",
+                "features": list(loaded),
+            }
+            print(f"  Fundamental factors loaded: {loaded}")
+            for col in loaded:
+                print(f"    {col}: {coverage[col]:.1%} coverage")
+        else:
+            source_diagnostics["fundamental_factors"] = {
+                "status": "unavailable",
+                "features": list(required_fundamentals),
+            }
+            print("  Fundamental factors: unavailable, skipping")
     else:
-        print("  Fundamental factors: unavailable, skipping")
+        source_diagnostics["fundamental_factors"] = {
+            "status": "skipped_feature_not_required",
+            "features": [],
+        }
 
     raw_df = raw_df.sort_values(["date", "order_book_id"]).reset_index(drop=True)
+    if collect_source_diagnostics:
+        raw_df.attrs["data_source_summary"] = source_diagnostics
+        raw_df.attrs["data_dependency_summary"] = dependency_summary
     print(f"raw_df shape: {raw_df.shape}  date range: {raw_df['date'].min().date()} – {raw_df['date'].max().date()}")
     return raw_df
 
@@ -535,6 +606,7 @@ def build_live_raw_df(
     market_cap_column: str | None = None,
     universe_source: str = "research",
     universe_cache_root: str | Path | None = None,
+    required_features: list[str] | None = None,
 ) -> pd.DataFrame:
     """为 live advisor 构建截止指定日期的实时原始面板。"""
     end_date = pd.Timestamp(trade_date).normalize() if trade_date is not None else resolve_data_end()
@@ -557,7 +629,26 @@ def build_live_raw_df(
             )
         else:
             raise ValueError("unsupported universe_source: {}".format(universe_source))
-    return build_raw_df(universe, end_date=end_date)
+    dependency_summary = build_data_dependency_summary(required_features)
+    return _call_with_supported_kwargs(
+        build_raw_df,
+        universe,
+        end_date=end_date,
+        required_features=required_features,
+        data_dependency_summary=dependency_summary,
+        collect_source_diagnostics=True,
+    )
+
+
+def _call_with_supported_kwargs(func, *args, **kwargs):
+    """兼容测试替身和旧调用方，只传目标函数显式支持的参数。"""
+    parameters = inspect.signature(func).parameters
+    supported_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in parameters
+    }
+    return func(*args, **supported_kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import pandas as pd
 
 from skyeye.data import DataFacade
@@ -28,8 +30,10 @@ def build_live_snapshot(
 ) -> dict:
     """构建指定日期的 live snapshot。"""
     requested_trade_date = pd.Timestamp(trade_date).normalize()
+    source_summary = {}
     if raw_df is None:
-        raw_df = build_live_raw_df(
+        raw_df = _call_with_supported_kwargs(
+            build_live_raw_df,
             trade_date=requested_trade_date,
             universe=universe,
             universe_size=universe_size,
@@ -37,9 +41,11 @@ def build_live_snapshot(
             market_cap_column=market_cap_column,
             universe_source=universe_source,
             universe_cache_root=universe_cache_root,
+            required_features=required_features,
         )
     if raw_df is None or len(raw_df) == 0:
         raise ValueError("raw_df must not be empty")
+    source_summary = dict(raw_df.attrs.get("data_source_summary", {}))
 
     frame = raw_df.copy()
     frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
@@ -100,6 +106,7 @@ def build_live_snapshot(
             "eligible_count": int(len(eligible_df)),
             "per_feature": feature_coverage,
         },
+        "data_source_summary": source_summary,
         "history_counts": history_counts,
         "snapshot_features": eligible_df,
     }
@@ -154,3 +161,14 @@ def _count_requested_gap(
 
     fallback_dates = pd.bdate_range(latest, requested)
     return max(len(fallback_dates) - 1, 0)
+
+
+def _call_with_supported_kwargs(func, **kwargs):
+    """兼容测试替身和旧签名，只传目标函数声明过的关键字参数。"""
+    parameters = inspect.signature(func).parameters
+    supported_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in parameters
+    }
+    return func(**supported_kwargs)

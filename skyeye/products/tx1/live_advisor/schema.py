@@ -39,6 +39,14 @@ LIVE_PACKAGE_REQUIRED_MANIFEST_FIELDS = (
     "gate_summary",
 )
 
+LIVE_PACKAGE_OPTIONAL_MANIFEST_FIELD_TYPES = {
+    "label_end_date": str,
+    "evidence_end_date": str,
+    "canary_reason": list,
+    "data_dependency_summary": dict,
+    "freshness_policy": dict,
+}
+
 
 def validate_live_package_manifest(manifest: dict) -> None:
     """校验 manifest 的关键字段是否齐全。"""
@@ -63,6 +71,14 @@ def validate_live_package_manifest(manifest: dict) -> None:
         raise ValueError("live package manifest hashes must be a dict")
     if not isinstance(manifest.get("gate_summary"), dict):
         raise ValueError("live package manifest gate_summary must be a dict")
+    for field_name, expected_type in LIVE_PACKAGE_OPTIONAL_MANIFEST_FIELD_TYPES.items():
+        if field_name in manifest and not isinstance(manifest[field_name], expected_type):
+            raise ValueError(
+                "live package manifest {} must be a {}".format(
+                    field_name,
+                    expected_type.__name__,
+                )
+            )
 
 
 def validate_live_package_payload(payload: dict) -> None:

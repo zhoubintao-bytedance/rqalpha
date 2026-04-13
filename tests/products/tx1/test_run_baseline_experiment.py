@@ -171,6 +171,80 @@ def test_build_live_raw_df_runtime_fast_uses_runtime_universe_snapshot(monkeypat
     assert captured["universe"] == ["C", "D"]
 
 
+def test_build_live_raw_df_passes_required_features_into_raw_loader(monkeypatch):
+    """验证 live raw panel 会把 package 的 required_features 透传给原始数据装载。"""
+    captured = {}
+
+    def fake_get_liquid_universe(n, market_cap_floor_quantile=None, market_cap_column=None, data_end=None):
+        return ["A", "B"]
+
+    def fake_build_raw_df(
+        universe,
+        *,
+        start_date=None,
+        end_date=None,
+        required_features=None,
+        data_dependency_summary=None,
+        collect_source_diagnostics=False,
+    ):
+        captured["required_features"] = list(required_features or [])
+        captured["collect_source_diagnostics"] = collect_source_diagnostics
+        return pd.DataFrame({"order_book_id": universe, "date": [pd.Timestamp(end_date)] * len(universe)})
+
+    monkeypatch.setattr(baseline_runner, "get_liquid_universe", fake_get_liquid_universe)
+    monkeypatch.setattr(baseline_runner, "build_raw_df", fake_build_raw_df)
+
+    baseline_runner.build_live_raw_df(
+        trade_date="2026-01-15",
+        required_features=["mom_40d", "volatility_20d"],
+    )
+
+    assert captured["required_features"] == ["mom_40d", "volatility_20d"]
+    assert captured["collect_source_diagnostics"] is True
+
+
+def test_build_raw_df_skips_optional_sources_when_package_features_do_not_need_them(monkeypatch):
+    """验证 baseline_5f 这类 package 不会再无条件拉 northbound/fundamental。"""
+    dates = pd.bdate_range("2026-01-01", periods=3)
+    benchmark = pd.DataFrame({"date": dates, "benchmark_close": [1.0, 1.1, 1.2]})
+    stocks = pd.DataFrame(
+        {
+            "date": list(dates),
+            "order_book_id": ["A"] * len(dates),
+            "close": [10.0, 10.5, 10.8],
+            "volume": [1000.0, 1100.0, 1200.0],
+            "total_turnover": [1.0, 1.1, 1.2],
+        }
+    )
+
+    monkeypatch.setattr(baseline_runner, "_load_benchmark_close", lambda end_date=None: benchmark.copy())
+    monkeypatch.setattr(baseline_runner, "_load_all_stocks", lambda universe, start_date, end_date: stocks.copy())
+    monkeypatch.setattr(baseline_runner, "_load_sector_map", lambda: {"A": "Bank"})
+    monkeypatch.setattr(
+        baseline_runner,
+        "_load_northbound_flow",
+        lambda data_end: (_ for _ in ()).throw(AssertionError("northbound should be skipped")),
+    )
+    monkeypatch.setattr(
+        baseline_runner,
+        "_load_fundamental_factors",
+        lambda universe, start_date, end_date: (_ for _ in ()).throw(AssertionError("fundamental should be skipped")),
+    )
+
+    raw_df = baseline_runner.build_raw_df(
+        ["A"],
+        start_date="2026-01-01",
+        end_date="2026-01-05",
+        required_features=["mom_40d", "volatility_20d", "reversal_5d", "amihud_20d", "turnover_stability_20d"],
+        collect_source_diagnostics=True,
+    )
+
+    source_summary = raw_df.attrs["data_source_summary"]
+
+    assert source_summary["northbound_flow"]["status"] == "skipped_feature_not_required"
+    assert source_summary["fundamental_factors"]["status"] == "skipped_feature_not_required"
+
+
 def test_data_facade_get_daily_bars_raises_quota_exceeded_without_bundle_fallback(monkeypatch, tmp_path):
     """验证本地无法覆盖的日线缺口遇到 QuotaExceeded 时，会显式报错。"""
 

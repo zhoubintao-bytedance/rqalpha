@@ -77,3 +77,73 @@ def test_snapshot_runtime_gate_blocks_when_total_candidates_below_base_threshold
     assert gate["passed"] is False
     assert any("universe_coverage_below_threshold" in reason for reason in gate["reasons"])
     assert gate["thresholds"]["min_eligible_count"] == 320
+
+
+def test_snapshot_runtime_gate_warns_when_model_and_evidence_are_old_but_still_within_stop_threshold():
+    """验证 model/evidence freshness 进入 warning 区间时，系统仍可出分但会提示。"""
+    snapshot = {
+        "requested_trade_date": "2026-04-10",
+        "trade_date": "2026-04-10",
+        "latest_available_trade_date": "2026-04-10",
+        "requested_vs_available_trading_gap": 0,
+        "raw_data_end_date": "2026-04-10",
+        "eligible_universe": ["A"] * 350,
+        "history_counts": [380] * 60,
+        "snapshot_features": pd.DataFrame({"mom_40d": [0.1] * 350, "volatility_20d": [0.2] * 350}),
+    }
+
+    gate = evaluate_snapshot_runtime_gates(
+        snapshot,
+        required_features=["mom_40d", "volatility_20d"],
+        freshness_policy={
+            "snapshot_max_delay_days": 1,
+            "model_warning_days": 3,
+            "model_stop_days": 10,
+            "evidence_warning_days": 3,
+            "evidence_stop_days": 10,
+        },
+        label_end_date="2026-04-03",
+        evidence_end_date="2026-04-03",
+    )
+
+    assert gate["passed"] is True
+    assert {warning["code"] for warning in gate["warnings"]} == {
+        "model_freshness_warning",
+        "evidence_freshness_warning",
+    }
+    assert gate["diagnostics"]["model_freshness"]["status"] == "warning"
+    assert gate["diagnostics"]["evidence_freshness"]["status"] == "warning"
+
+
+def test_snapshot_runtime_gate_blocks_when_model_and_evidence_are_too_old():
+    """验证 model/evidence freshness 超过 stop 阈值时，系统会拒绝出分。"""
+    snapshot = {
+        "requested_trade_date": "2026-04-10",
+        "trade_date": "2026-04-10",
+        "latest_available_trade_date": "2026-04-10",
+        "requested_vs_available_trading_gap": 0,
+        "raw_data_end_date": "2026-04-10",
+        "eligible_universe": ["A"] * 350,
+        "history_counts": [380] * 60,
+        "snapshot_features": pd.DataFrame({"mom_40d": [0.1] * 350, "volatility_20d": [0.2] * 350}),
+    }
+
+    gate = evaluate_snapshot_runtime_gates(
+        snapshot,
+        required_features=["mom_40d", "volatility_20d"],
+        freshness_policy={
+            "snapshot_max_delay_days": 1,
+            "model_warning_days": 3,
+            "model_stop_days": 8,
+            "evidence_warning_days": 3,
+            "evidence_stop_days": 8,
+        },
+        label_end_date="2026-03-20",
+        evidence_end_date="2026-03-20",
+    )
+
+    assert gate["passed"] is False
+    assert any("model_freshness_exceeded" in reason for reason in gate["reasons"])
+    assert any("evidence_freshness_exceeded" in reason for reason in gate["reasons"])
+    assert gate["diagnostics"]["model_freshness"]["status"] == "stop"
+    assert gate["diagnostics"]["evidence_freshness"]["status"] == "stop"

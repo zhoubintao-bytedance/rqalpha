@@ -83,6 +83,8 @@ def render_table(result: dict) -> str:
         "score_date={}".format(result.get("score_date")),
         "raw_data_end_date={}".format(result.get("raw_data_end_date")),
         "fit_end_date={}".format(result.get("fit_end_date")),
+        "label_end_date={}".format(result.get("label_end_date")),
+        "evidence_end_date={}".format(result.get("evidence_end_date")),
         "status={}".format(_format_status(result.get("status"))),
     ]
     warning_lines = _render_warning_lines(result.get("warnings", []))
@@ -143,9 +145,21 @@ def _build_portfolio_advice_notes(portfolio_advice: dict) -> list[str]:
         return []
     lines = [
         "组合建议:",
+        "  建议等级: {}".format(portfolio_advice.get("advice_level", "ok")),
         "  需要调仓: {}".format("是" if portfolio_advice.get("rebalance_due") else "否"),
         "  预计换手: {}".format(_format_percent(portfolio_advice.get("estimated_turnover"), digits=1)),
     ]
+    blockers = list(portfolio_advice.get("execution_blockers") or [])
+    if blockers:
+        lines.append("  执行阻塞:")
+        for blocker in blockers:
+            lines.append("    {}".format(blocker))
+    preflight_checks = dict(portfolio_advice.get("preflight_checks") or {})
+    if preflight_checks:
+        lines.append("  执行前检查:")
+        for check_name, check_payload in preflight_checks.items():
+            status = "通过" if check_payload.get("passed") else "失败"
+            lines.append("    {}: {}".format(check_name, status))
     actions = list(portfolio_advice.get("actions") or [])
     if not actions:
         return lines

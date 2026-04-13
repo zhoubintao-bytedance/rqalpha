@@ -204,3 +204,156 @@ def test_live_advisor_service_keeps_current_weights_when_rebalance_not_due():
     assert advice["target_weights"] == {"A": 0.9, "B": 0.1}
     assert advice["estimated_turnover"] == 0.0
     assert [item["action"] for item in advice["actions"]] == ["keep", "keep"]
+
+
+def test_live_advisor_service_surfaces_freshness_metadata_and_gate_diagnostics(make_raw_panel, tmp_path, monkeypatch):
+    """验证 service 会把 manifest freshness 元数据和 gate diagnostics 一并返回。"""
+    raw_df = make_raw_panel(periods=220, extended=True)
+    dataset = DatasetBuilder(input_window=60).build(raw_df)
+    labeled = LabelBuilder(horizon=20, transform="rank").build(dataset)
+    feature_columns = [column for column in FEATURE_COLUMNS if column in labeled.columns]
+    preprocessor = FeaturePreprocessor(neutralize=False, winsorize_scale=None, standardize=False)
+    transformed = preprocessor.transform(labeled, feature_columns)
+
+    model = create_model("linear")
+    model.fit(transformed[feature_columns], transformed["target_label"])
+
+    predictions_df = transformed[
+        [
+            "date",
+            "order_book_id",
+            "label_return_raw",
+            "label_volatility_horizon",
+            "label_max_drawdown_horizon",
+        ]
+    ].copy()
+    predictions_df["prediction"] = model.predict(transformed[feature_columns])
+    calibration_bundle = build_calibration_bundle(
+        {"fold_results": [{"predictions_df": predictions_df}]},
+        bucket_count=5,
+    )
+    payload = build_live_package_payload(
+        manifest={
+            "package_id": "tx1_live_service_freshness_demo",
+            "package_type": "canary_live",
+            "source_experiment": "synthetic_demo",
+            "horizon": 20,
+            "fit_end_date": str(pd.Timestamp(labeled["date"].max()).date()),
+            "label_end_date": str(pd.Timestamp(labeled["date"].max()).date()),
+            "data_end_date": str(pd.Timestamp(raw_df["date"].max()).date()),
+            "evidence_end_date": str(pd.Timestamp(labeled["date"].max()).date()),
+            "created_at": "2026-04-12T00:00:00",
+            "model_kind": "linear",
+            "required_features": feature_columns,
+            "hashes": {
+                "feature_schema": "sha256:feature",
+                "preprocessor_bundle": "sha256:preproc",
+                "model_bundle": "sha256:model",
+                "calibration_bundle": "sha256:calibration",
+                "portfolio_policy": "sha256:policy",
+                "recent_canary_bundle": "sha256:recent",
+            },
+            "gate_summary": {
+                "gate_level": "canary_live",
+                "passed": True,
+            },
+            "canary_reason": ["stability_score", "cv"],
+            "data_dependency_summary": {
+                "bundle_price": True,
+                "bundle_volume": True,
+                "northbound_flow": False,
+                "fundamental_factors": [],
+            },
+            "freshness_policy": {
+                "snapshot_max_delay_days": 1,
+                "model_warning_days": 20,
+                "model_stop_days": 40,
+                "evidence_warning_days": 20,
+                "evidence_stop_days": 40,
+            },
+        },
+        feature_schema={"feature_columns": feature_columns, "label_horizon": 20},
+        preprocessor_bundle=preprocessor.to_bundle(feature_columns),
+        model_bundle=dump_model_bundle(model, model_kind="linear", feature_columns=feature_columns),
+        calibration_bundle=calibration_bundle,
+        portfolio_policy={"buy_top_k": 25, "hold_top_k": 45},
+        recent_canary_bundle={
+            "window": {
+                "start_date": str(pd.Timestamp(labeled["date"].max() - pd.offsets.BDay(19)).date()),
+                "end_date": str(pd.Timestamp(labeled["date"].max()).date()),
+            },
+            "bucket_edges": [0.0, 1.0],
+            "bucket_stats": [{"bucket_id": "b0", "sample_count": 300, "win_rate": 0.58, "mean_return": 0.01, "median_return": 0.005, "return_quantiles": {"p25": -0.01, "p75": 0.02}}],
+        },
+    )
+    save_live_package(payload, packages_root=tmp_path)
+
+    monkeypatch.setattr(
+        live_advisor_service_module,
+        "evaluate_snapshot_runtime_gates",
+        lambda snapshot, required_features, **kwargs: {
+            "passed": True,
+            "reasons": [],
+            "warnings": [
+                {
+                    "level": "warning",
+                    "code": "model_freshness_warning",
+                    "message": "model is getting stale",
+                }
+            ],
+            "metrics": {
+                "model_freshness_gap_days": 12,
+                "evidence_freshness_gap_days": 12,
+            },
+            "diagnostics": {
+                "model_freshness": {"status": "warning"},
+                "evidence_freshness": {"status": "warning"},
+            },
+        },
+    )
+
+    service = LiveAdvisorService(packages_root=tmp_path)
+    result = service.get_recommendations(
+        "tx1_live_service_freshness_demo",
+        trade_date=str(pd.Timestamp(raw_df["date"].max()).date()),
+        top_k=1,
+        raw_df=raw_df,
+    )
+
+    assert result["label_end_date"] == str(pd.Timestamp(labeled["date"].max()).date())
+    assert result["evidence_end_date"] == str(pd.Timestamp(labeled["date"].max()).date())
+    assert any(item["code"] == "model_freshness_warning" for item in result["warnings"])
+    assert result["gate_diagnostics"]["model_freshness"]["status"] == "warning"
+    assert result["data_dependency_summary"]["bundle_price"] is True
+
+
+def test_live_advisor_service_marks_portfolio_advice_blocked_when_target_weights_too_fragmented():
+    """验证 target weight 过碎时，portfolio advice 会显式标记 blocked。"""
+    scored = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-04-10")] * 100,
+            "order_book_id": ["S{:03d}".format(idx) for idx in range(100)],
+            "prediction": list(range(100, 0, -1)),
+        }
+    )
+
+    advice = LiveAdvisorService._build_portfolio_advice(
+        scored,
+        {
+            "buy_top_k": 100,
+            "hold_top_k": 100,
+            "rebalance_interval": 20,
+            "holding_bonus": 0.5,
+            "cash_buffer": 0.1,
+            "min_weight": 0.02,
+            "max_turnover": 0.8,
+        },
+        current_holdings=None,
+        last_rebalance_date=None,
+        trade_date="2026-04-10",
+    )
+
+    assert advice["advice_level"] == "blocked"
+    assert "min_weight_below_threshold" in advice["execution_blockers"]
+    assert advice["preflight_checks"]["min_weight_ok"]["passed"] is False
+    assert abs(sum(advice["target_weights"].values()) - 0.9) < 1e-9

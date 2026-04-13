@@ -19,8 +19,67 @@
 - 验证证据：
   - 定向回归：`env PYTHONPATH=$PWD pytest tests/unittest/test_data/test_skyeye_data_facade.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_live_advisor_service.py tests/products/tx1/test_live_advisor_runtime_gates.py -q`
   - 结果：`24 passed`
-  - 扩大回归：`env PYTHONPATH=$PWD pytest tests/unittest/test_data/test_skyeye_data_facade.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_preprocessor.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_live_advisor_calibration.py tests/products/tx1/test_live_advisor_holdings_io.py tests/products/tx1/test_live_advisor_package_io.py tests/products/tx1/test_live_advisor_promotion.py tests/products/tx1/test_live_advisor_runtime_gates.py tests/products/tx1/test_live_advisor_service.py tests/products/tx1/test_live_advisor_snapshot.py tests/products/tx1/test_run_live_advisor.py -q`
+- 扩大回归：`env PYTHONPATH=$PWD pytest tests/unittest/test_data/test_skyeye_data_facade.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_preprocessor.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_live_advisor_calibration.py tests/products/tx1/test_live_advisor_holdings_io.py tests/products/tx1/test_live_advisor_package_io.py tests/products/tx1/test_live_advisor_promotion.py tests/products/tx1/test_live_advisor_runtime_gates.py tests/products/tx1/test_live_advisor_service.py tests/products/tx1/test_live_advisor_snapshot.py tests/products/tx1/test_run_live_advisor.py -q`
   - 结果：`63 passed`
+
+# TX1 实盘建议器当前可用性评估
+
+- [x] 梳理 TX1 当前 live package、实验产物和最近任务记录
+- [x] 核对 live advisor 关键代码与测试，确认 freshness / stop-serve / 组合建议语义
+- [x] 补充当前运行证据，判断是否适合作为“每天实盘指导”
+
+## Review
+
+- 截至 `2026-04-13`，TX1 live advisor 还不能算“已经完善好、可每天指导实盘”。
+- 当前最新实盘包 `skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260331_lgbm_20260303/manifest.json` 仍是 `canary_live`；`stability_score=14.2857 < 50`、`cv=0.8854 > 0.6`，没达到 `default_live` 门槛。
+- 真实链路验证：
+  - `env PYTHONPATH=$PWD python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-03-31 --top-k 5 --format json`
+  - 结果：`status=ok`，说明在本地最新可用数据日上，系统能输出 top-k 排名、历史 bucket 统计、recent canary 统计和 `portfolio_advice`。
+  - `env PYTHONPATH=$PWD python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-10 --top-k 3 --format json`
+  - `env PYTHONPATH=$PWD python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-13 --top-k 3 --format json`
+  - 结果：两次都 `status=stopped`，`latest_available_trade_date=2026-03-31`，说明今天并没有“当日可用”的实盘建议。
+- 当前代码里的 freshness / stop-serve 设计已经比较完整，但磁盘上的现有 package manifest 仍缺 `evidence_end_date` / `freshness_policy` / `data_dependency_summary`，说明产包没有按最新契约重新生成；运行时 `evidence_freshness` 现在还是 `unknown`。
+- 定向测试验证：
+  - `env PYTHONPATH=$PWD pytest tests/products/tx1/test_live_advisor_calibration.py tests/products/tx1/test_live_advisor_holdings_io.py tests/products/tx1/test_live_advisor_package_io.py tests/products/tx1/test_live_advisor_promotion.py tests/products/tx1/test_live_advisor_runtime_gates.py tests/products/tx1/test_live_advisor_service.py tests/products/tx1/test_live_advisor_snapshot.py tests/products/tx1/test_live_advisor_universe.py tests/products/tx1/test_run_live_advisor.py -q`
+  - 结果：`31 passed`
+- 近端证据仍偏弱：`2026-03-31` 实跑 top bucket 的历史 OOS `mean_return=+1.08%`，但 recent canary `2025-11-28 ~ 2026-03-03` 的同 bucket `mean_return=-0.23%`、`median_return=-1.28%`、`win_rate=42.56%`，更像“可参考的排序器”，还不是“可放心每天拿来指导实盘”的状态。
+
+# TX1 数据更新与 live package 重建
+
+- [x] 梳理 TX1 数据更新入口、当前 bundle 截止日与 promote 命令链路
+- [x] 补齐最新可用数据并确认 bundle / raw data 截止日
+- [x] 基于最新实验重新 promote live package
+- [x] 复核当天 live advisor 结果是否可用并记录证据
+
+## Review
+
+- 先验证了官方 `python -m rqalpha update-bundle -d /home/tiger/.rqalpha -c 4` 的失败根因：不是网络，而是 `rqdatac.share.errors.QuotaExceeded: login machine num exceeds`。原因在于官方 bundle 更新链路会在主进程和 worker 进程重复 `rqdatac.init()`，超出当前账号登录机数限制。
+- 随后改用单进程增量补数方式，只更新 TX1 实际依赖的 bundle 组件：`instruments.pk`、`trading_dates.npy`、`indexes.h5`、`stocks.h5`。执行后本地 bundle 已从 `2026-03-31` 更新到 `2026-04-13`：
+  - `indexes.h5 000300.XSHG 2026-04-13`
+  - `stocks.h5 000001.XSHE 2026-04-13`
+  - `resolve_data_end=2026-04-13`
+- 真实数据补齐证据：
+  - 单进程补数脚本完成后输出：`indexes.h5 done: ... latest=2026-04-13`、`stocks.h5 done: ... latest=2026-04-13`
+  - 轻量核对命令：`python - <<'PY' ... print(resolve_data_end()) ... PY`
+  - 结果：`resolve_data_end 2026-04-13 00:00:00`
+- 旧 package 在数据更新后已恢复“当天可用”：
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-13 --top-k 3 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - 结果：`status=ok`，`score_date=2026-04-13`，但仍有 `model_freshness_warning`，因为旧 package 的 `fit_end_date=2026-03-03`。
+- 已重新 promote 出新 package：
+  - 路径：`skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260331_lgbm_20260313`
+  - `package_id=tx1_canary_live_tx1_refresh_20260331_lgbm_20260313`
+  - `fit_end_date=2026-03-13`
+  - `label_end_date=2026-03-13`
+  - `evidence_end_date=2026-03-13`
+  - `data_end_date=2026-04-13`
+  - `freshness_policy={'snapshot_max_delay_days': 1, 'model_warning_days': 20, 'model_stop_days': 40, 'evidence_warning_days': 20, 'evidence_stop_days': 40}`
+  - `canary_reason=['stability_score', 'cv']`
+- 新 package 的当天复核：
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260313 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-13 --top-k 3 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - 结果：`status=ok`，`requested_trade_date=2026-04-13`，`latest_available_trade_date=2026-04-13`，`score_date=2026-04-13`，说明当天建议已可正常产出。
+  - 但仍有轻微 freshness warning：`model/evidence gap_days=21`，刚好略高于 `warning_days=20`；没有 stop-serve。
+  - top-3 为：`000793.XSHE`、`002024.XSHE`、`600690.XSHG`
+  - 新 package 的 recent canary 已明显改善：窗口 `2025-12-10 ~ 2026-03-13`，top bucket `win_rate=53.11%`、`mean_return=+1.26%`、`median_return=+0.50%`，相比旧 package 最近 canary 的负均值/负中位数更健康。
 
 # 本地改动并行 Review
 
@@ -610,6 +669,89 @@
   - 定向红绿测试：
     - `PYTHONPATH="$PWD" ./.venv/bin/pytest tests/products/tx1/test_live_advisor_snapshot.py tests/products/tx1/test_live_advisor_runtime_gates.py tests/products/tx1/test_run_live_advisor.py tests/products/tx1/test_live_advisor_package_io.py tests/products/tx1/test_live_advisor_promotion.py tests/products/tx1/test_live_advisor_service.py tests/products/tx1/test_live_advisor_holdings_io.py -q`
     - 结果：`18 passed`
-  - 全量 TX1 回归：
-    - `PYTHONPATH="$PWD" ./.venv/bin/pytest tests/products/tx1 -q`
-    - 结果：`161 passed`
+- 全量 TX1 回归：
+  - `PYTHONPATH="$PWD" ./.venv/bin/pytest tests/products/tx1 -q`
+  - 结果：`161 passed`
+
+# TX1 实盘建议器完成度盘点
+
+- [x] 梳理 `run_live_advisor`、`LiveAdvisorService`、promotion/package、snapshot/runtime gate 的当前实现边界
+- [x] 核对测试覆盖、最新 package 产物与最近一次真实链路验证证据
+- [x] 基于代码与产物证据评估完成度，并整理高优先级优化项
+
+## Review
+
+- 当前 `TX1` 实盘建议器已经不是“原型”，而是完成了可运行的 `package -> snapshot -> gate -> score -> calibration -> portfolio_advice -> CLI` 闭环；但仍停在 `canary_live`，未达到 `default_live`。
+- 当前最强 package 为 `skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260331_lgbm_20260303/manifest.json`：
+  - `fit_end_date=2026-03-03`
+  - `data_end_date=2026-03-31`
+  - `rank_ic_mean=0.0554`
+  - `top_bucket_spread_mean=0.0115`
+  - `stability_score=14.29` / `cv=0.8854`，因此只能 `canary_live`，不能 `default_live`
+- 当前验证证据：
+  - `env PYTHONPATH=$PWD ./.venv/bin/pytest tests/products/tx1/test_live_advisor_*.py tests/products/tx1/test_run_live_advisor.py -q`
+  - 结果：`25 passed`
+  - `env PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-10 --top-k 3 --format json`
+  - 结果：`status=stopped`，freshness gate 正常拦截 `2026-04-10` 请求，不会拿 `2026-03-31` 旧快照冒充当天建议
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-03-31 --top-k 3 --format json`
+  - 结果：`status=ok`，可输出 top-k、historical OOS bucket、recent canary evidence、portfolio_advice
+- 高优先级优化结论：
+  - 第一优先级是把研究侧稳定性做上来，解决 `default_live` 闸门不过的问题；现在最大短板不是“能不能跑”，而是“稳不稳定”。
+  - 第二优先级是缩短 `fit_end_date` 与 `trade_date` 的时间断层；当前 3 月 31 日出分时，监督标签只到 3 月 3 日，近端证据窗口也只到 3 月 3 日。
+- 第三优先级是补强在线/离线数据源健壮性；真实 CLI 运行时 `northbound` 与 `fundamental factors` 在当前环境里会降级为 unavailable，现阶段默认包还能跑是因为所需特征只依赖价格/流动性因子。
+
+# TX1 实盘建议器四项问题设计与修复
+
+- [x] 输出 Spec 第 1 段：现状分析与四项问题范围确认
+- [x] 输出 Spec 第 2 段：功能点 / 方案选项 / 推荐方案
+- [x] 输出 Spec 第 3 段：风险、接口、验证口径与实施边界
+- [x] 等待用户 HARD-GATE 确认
+- [x] 写实现计划并更新任务拆分
+- [ ] 按确认后的方案实现四项修复
+- [ ] 运行验证并记录证据
+
+### 实现计划
+
+- [x] Task 1：先写并跑失败测试，锁住 package 契约升级
+  - 目标：覆盖 `label_end_date / evidence_end_date / canary_reason / data_dependency_summary / freshness_policy`
+  - 文件：`tests/products/tx1/test_live_advisor_package_io.py`、`tests/products/tx1/test_live_advisor_promotion.py`
+- [x] Task 2：先写并跑失败测试，锁住 runtime freshness 分层 gate
+  - 目标：覆盖 `snapshot/model/evidence` 三层 freshness 的 `warn/stop` 语义
+  - 文件：`tests/products/tx1/test_live_advisor_runtime_gates.py`、`tests/products/tx1/test_live_advisor_service.py`
+- [x] Task 3：先写并跑失败测试，锁住 live raw panel 的依赖裁剪与 source diagnostics
+  - 目标：覆盖按 `required_features` 跳过非必要 `northbound/fundamental`，并返回 source summary
+  - 文件：`tests/products/tx1/test_run_baseline_experiment.py`、必要时补 `test_live_advisor_snapshot.py`
+- [x] Task 4：先写并跑失败测试，锁住 execution-aware portfolio advice
+  - 目标：覆盖 `preflight_checks / execution_blockers / advice_level`
+  - 文件：`tests/products/tx1/test_live_advisor_service.py`、`tests/products/tx1/test_run_live_advisor.py`
+- [x] Task 5：按最小实现补 schema / promotion / package_io / runtime_gates / service / CLI / raw_df
+- [x] Task 6：跑定向回归与真实链路验证，记录证据
+
+## Review
+
+- 已按方案 B 完成四项修复，落地范围：
+  - package 契约：promotion 新写入 `label_end_date / evidence_end_date / canary_reason / data_dependency_summary / freshness_policy`
+  - runtime gate：`evaluate_snapshot_runtime_gates()` 现支持 `snapshot/model/evidence` 三层 freshness，并返回 `warnings / diagnostics / metrics`
+  - live raw panel：`build_live_raw_df()` / `build_raw_df()` 新增 `required_features` 驱动的依赖裁剪，baseline_5f 这类 runtime 不再无条件拉 `northbound/fundamental`
+  - execution advice：`portfolio_advice` 新增 `cash_buffer / preflight_checks / execution_blockers / advice_level`，CLI 也会展示 `label_end_date / evidence_end_date / 执行阻塞`
+- 关键实现文件：
+  - `skyeye/products/tx1/run_baseline_experiment.py`
+  - `skyeye/products/tx1/live_advisor/promotion.py`
+  - `skyeye/products/tx1/live_advisor/runtime_gates.py`
+  - `skyeye/products/tx1/live_advisor/service.py`
+  - `skyeye/products/tx1/live_advisor/snapshot.py`
+  - `skyeye/products/tx1/live_advisor/schema.py`
+  - `skyeye/products/tx1/run_live_advisor.py`
+- 新增回归覆盖：
+  - `tests/products/tx1/test_live_advisor_promotion.py`
+  - `tests/products/tx1/test_live_advisor_runtime_gates.py`
+  - `tests/products/tx1/test_live_advisor_service.py`
+  - `tests/products/tx1/test_run_baseline_experiment.py`
+  - `tests/products/tx1/test_run_live_advisor.py`
+- 验证证据：
+  - 定向红绿：`env PYTHONPATH=$PWD ./.venv/bin/pytest tests/products/tx1/test_live_advisor_promotion.py tests/products/tx1/test_live_advisor_runtime_gates.py tests/products/tx1/test_live_advisor_service.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_run_live_advisor.py -q`
+  - 结果：`31 passed`
+  - 全量 TX1：`env PYTHONPATH=$PWD ./.venv/bin/pytest tests/products/tx1 -q`
+  - 结果：`179 passed`
+  - 真实 CLI smoke：`env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-03-31 --top-k 1 --format json`
+  - 结果：`status=ok`，并返回 `label_end_date / evidence_end_date / data_source_summary / gate_diagnostics / portfolio_advice.preflight_checks`
