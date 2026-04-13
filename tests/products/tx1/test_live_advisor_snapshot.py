@@ -1,6 +1,7 @@
 import pandas as pd
 
 from skyeye.products.tx1.evaluator import FEATURE_COLUMNS
+from skyeye.products.tx1.live_advisor import snapshot as snapshot_module
 from skyeye.products.tx1.live_advisor.snapshot import build_live_snapshot
 
 
@@ -40,3 +41,34 @@ def test_build_live_snapshot_tracks_requested_and_latest_available_trade_dates(m
     assert snapshot["latest_available_trade_date"] == latest_trade_date.strftime("%Y-%m-%d")
     assert snapshot["trade_date"] == latest_trade_date.strftime("%Y-%m-%d")
     assert snapshot["requested_vs_available_trading_gap"] >= 5
+
+
+def test_build_live_snapshot_defaults_to_runtime_fast_path_when_raw_df_missing(make_raw_panel, monkeypatch):
+    """验证 live snapshot 默认会请求 runtime fast path，而不是研究侧重路径。"""
+    raw_df = make_raw_panel(periods=180, extended=True)
+    captured = {}
+
+    def fake_build_live_raw_df(
+        *,
+        trade_date=None,
+        universe=None,
+        universe_size=300,
+        market_cap_floor_quantile=None,
+        market_cap_column=None,
+        universe_source=None,
+        universe_cache_root=None,
+    ):
+        captured["trade_date"] = trade_date
+        captured["universe_source"] = universe_source
+        captured["universe_cache_root"] = universe_cache_root
+        return raw_df.copy()
+
+    monkeypatch.setattr(snapshot_module, "build_live_raw_df", fake_build_live_raw_df)
+
+    build_live_snapshot(
+        trade_date=pd.Timestamp(raw_df["date"].max()),
+        required_features=["mom_40d", "volatility_20d", "reversal_5d", "amihud_20d"],
+    )
+
+    assert captured["universe_source"] == "runtime_fast"
+    assert captured["universe_cache_root"] is None

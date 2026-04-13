@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 from skyeye.data import DataFacade
+from skyeye.products.tx1.live_advisor.universe import resolve_runtime_liquid_universe
 
 BENCHMARK_ID = "000300.XSHG"
 
@@ -532,16 +533,30 @@ def build_live_raw_df(
     universe_size: int = UNIVERSE_SIZE,
     market_cap_floor_quantile: float | None = None,
     market_cap_column: str | None = None,
+    universe_source: str = "research",
+    universe_cache_root: str | Path | None = None,
 ) -> pd.DataFrame:
     """为 live advisor 构建截止指定日期的实时原始面板。"""
     end_date = pd.Timestamp(trade_date).normalize() if trade_date is not None else resolve_data_end()
     if universe is None:
-        universe = get_liquid_universe(
-            universe_size,
-            market_cap_floor_quantile=market_cap_floor_quantile,
-            market_cap_column=market_cap_column,
-            data_end=end_date,
-        )
+        effective_source = str(universe_source).strip().lower()
+        # runtime fast path 当前只保证“纯 liquid top”语义；若显式传了市值过滤，退回研究侧旧路径。
+        if effective_source == "runtime_fast" and market_cap_floor_quantile is None and market_cap_column is None:
+            payload = resolve_runtime_liquid_universe(
+                trade_date=end_date,
+                universe_size=universe_size,
+                cache_root=universe_cache_root,
+            )
+            universe = list(payload.get("order_book_ids") or [])
+        elif effective_source in ("research", "runtime_fast"):
+            universe = get_liquid_universe(
+                universe_size,
+                market_cap_floor_quantile=market_cap_floor_quantile,
+                market_cap_column=market_cap_column,
+                data_end=end_date,
+            )
+        else:
+            raise ValueError("unsupported universe_source: {}".format(universe_source))
     return build_raw_df(universe, end_date=end_date)
 
 

@@ -32,6 +32,13 @@ def build_parser():
     parser.add_argument("--include-dropped", action="store_true", help="Include dropped symbols in result output")
     parser.add_argument("--packages-root", help="Optional packages root override")
     parser.add_argument("--universe-size", type=int, default=300, help="Universe size when building live snapshot")
+    parser.add_argument(
+        "--universe-source",
+        choices=["runtime_fast", "research"],
+        default="runtime_fast",
+        help="Universe resolver used by live runtime",
+    )
+    parser.add_argument("--universe-cache-root", help="Optional runtime universe cache root override")
     parser.add_argument("--market-cap-floor-quantile", type=float, help="Optional market-cap floor quantile")
     parser.add_argument("--market-cap-column", help="Optional market-cap column override")
     parser.add_argument("--holdings-file", help="Optional csv/json holdings file")
@@ -52,6 +59,8 @@ def main(argv=None):
         top_k=args.top_k,
         include_dropped=args.include_dropped,
         universe_size=args.universe_size,
+        universe_source=args.universe_source,
+        universe_cache_root=args.universe_cache_root,
         market_cap_floor_quantile=args.market_cap_floor_quantile,
         market_cap_column=args.market_cap_column,
         current_holdings=current_holdings,

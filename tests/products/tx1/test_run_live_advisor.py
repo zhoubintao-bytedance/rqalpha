@@ -1,6 +1,53 @@
 from skyeye.products.tx1 import run_live_advisor
 
 
+def test_main_uses_runtime_fast_universe_defaults(monkeypatch, capsys):
+    """验证 CLI 默认会把 runtime fast path 传给 live service。"""
+    captured = {}
+
+    class FakeService:
+        """记录 CLI 传入参数的假 service。"""
+
+        def __init__(self, packages_root=None):
+            captured["packages_root"] = packages_root
+
+        def get_recommendations(self, package_ref, **kwargs):
+            captured["package_ref"] = package_ref
+            captured["kwargs"] = kwargs
+            return {
+                "status": "ok",
+                "package_id": "tx1_demo",
+                "gate_level": "canary_live",
+                "requested_trade_date": "2026-04-10",
+                "latest_available_trade_date": "2026-04-10",
+                "score_date": "2026-04-10",
+                "raw_data_end_date": "2026-04-10",
+                "fit_end_date": "2026-03-03",
+                "recommendations": [],
+                "warnings": [],
+                "portfolio_advice": {},
+            }
+
+    monkeypatch.setattr(run_live_advisor, "LiveAdvisorService", FakeService)
+    monkeypatch.setattr(run_live_advisor, "_supports_color_output", lambda: False)
+
+    rc = run_live_advisor.main(
+        [
+            "--package-id",
+            "tx1_demo",
+            "--trade-date",
+            "2026-04-10",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["package_ref"] == "tx1_demo"
+    assert captured["kwargs"]["universe_source"] == "runtime_fast"
+    assert captured["kwargs"]["universe_cache_root"] is None
+
+
 def test_render_table_uses_readable_headers_and_interpretation(monkeypatch):
     """验证表格输出会补充结果解读、中文列名和易读格式。"""
     monkeypatch.setattr(

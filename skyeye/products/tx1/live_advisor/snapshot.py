@@ -23,6 +23,8 @@ def build_live_snapshot(
     universe_size=300,
     market_cap_floor_quantile=None,
     market_cap_column=None,
+    universe_source="runtime_fast",
+    universe_cache_root=None,
 ) -> dict:
     """构建指定日期的 live snapshot。"""
     requested_trade_date = pd.Timestamp(trade_date).normalize()
@@ -33,6 +35,8 @@ def build_live_snapshot(
             universe_size=universe_size,
             market_cap_floor_quantile=market_cap_floor_quantile,
             market_cap_column=market_cap_column,
+            universe_source=universe_source,
+            universe_cache_root=universe_cache_root,
         )
     if raw_df is None or len(raw_df) == 0:
         raise ValueError("raw_df must not be empty")

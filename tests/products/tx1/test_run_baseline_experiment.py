@@ -127,6 +127,50 @@ def test_build_live_raw_df_passes_trade_date_into_universe_selection(monkeypatch
     assert captured["universe"] == ["A", "B"]
 
 
+def test_build_live_raw_df_runtime_fast_uses_runtime_universe_snapshot(monkeypatch):
+    """runtime fast path 应优先使用缓存候选池，而不是研究侧全市场重算。"""
+    captured = {}
+
+    def fake_resolve_runtime_liquid_universe(
+        *,
+        trade_date,
+        universe_size,
+        cache_root=None,
+        bundle_path=None,
+        min_history_days=500,
+    ):
+        captured["trade_date"] = trade_date
+        captured["universe_size"] = universe_size
+        captured["cache_root"] = cache_root
+        return {
+            "order_book_ids": ["C", "D"],
+            "data_end_date": "2026-01-14",
+        }
+
+    def fake_build_raw_df(universe, *, start_date=None, end_date=None):
+        captured["universe"] = list(universe)
+        captured["end_date"] = end_date
+        return pd.DataFrame({"order_book_id": universe, "date": [pd.Timestamp(end_date)] * len(universe)})
+
+    monkeypatch.setattr(
+        baseline_runner,
+        "resolve_runtime_liquid_universe",
+        fake_resolve_runtime_liquid_universe,
+    )
+    monkeypatch.setattr(baseline_runner, "build_raw_df", fake_build_raw_df)
+
+    baseline_runner.build_live_raw_df(
+        trade_date="2026-01-15",
+        universe_source="runtime_fast",
+    )
+
+    assert captured["trade_date"] == pd.Timestamp("2026-01-15")
+    assert captured["universe_size"] == baseline_runner.UNIVERSE_SIZE
+    assert captured["cache_root"] is None
+    assert captured["end_date"] == pd.Timestamp("2026-01-15")
+    assert captured["universe"] == ["C", "D"]
+
+
 def test_data_facade_get_daily_bars_raises_quota_exceeded_without_bundle_fallback(monkeypatch, tmp_path):
     """验证本地无法覆盖的日线缺口遇到 QuotaExceeded 时，会显式报错。"""
 

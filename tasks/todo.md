@@ -71,6 +71,72 @@
 - 已把“组合层小范围微调”上调为当前第一优先级，因为现有 `combo_h40_bonus1` / `combo_h45_bonus1` 相对 `combo_b25_h45` 仍有小幅正向收益增量且无新增 warnings。
 - 已明确把 `ep_ratio_ttm` / `return_on_equity_ttm` 的单因子直加路线降级，不再作为前排候选方向。
 
+# TX1 4 月缺失数据补齐与实盘建议验证
+
+- [x] 检查本地 bundle、TX1 live package 与 4 月日期覆盖现状
+- [x] 按 bundle 优先原则补齐 4 月缺失数据
+- [x] 运行 TX1 live advisor，验证 4 月可用交易日的建议输出
+- [x] 记录执行证据与结论
+
+## Review
+
+- 本地 bundle 基线仍停在 `2026-03-31`，最新可用 promoted package 为 `skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260331_lgbm_20260303/manifest.json`，`gate_level=canary_live`，`fit_end_date=2026-03-03`。
+- 直接按现有 `get_liquid_universe()` 跑 live advisor 首次补 4 月缺口过慢，最终改为在 `/tmp/tx1_live_april_20260410.py` 中直接读取 `~/.rqalpha/bundle/stocks.h5`，按 `2015-01-01 ~ 2026-03-31` 的成交量中位数计算 local liquid top 300，再只为这 300 只股票补 4 月缺失数据并评分。
+- 运行证据：
+  - `tmux` 任务：`env PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -u /tmp/tx1_live_april_20260410.py`
+  - 日志：`/tmp/tx1_live_april_20260410.log`
+  - 结果：`raw_df shape: (769362, 12)`，`date range: 2015-01-05 – 2026-04-10`，`raw_data_end_date=2026-04-10`，说明 4 月缺失数据已成功补到 `2026-04-10`。
+- `2026-04-10` 实盘建议验证结果：
+  - `status=ok`
+  - `requested_trade_date=2026-04-10`
+  - `latest_available_trade_date=2026-04-10`
+  - `score_date=2026-04-10`
+  - `top10`: `600115.XSHG`、`000793.XSHE`、`600029.XSHG`、`601212.XSHG`、`002024.XSHE`、`000980.XSHE`、`300287.XSHE`、`601728.XSHG`、`600690.XSHG`、`600015.XSHG`
+  - top bucket 历史 OOS 统计：`win_rate=0.4812`，`mean_return=0.01078`，`median_return=-0.00322`，属于右偏收益分布，不是高胜率信号。
+  - recent canary 窗口 `2025-11-28 ~ 2026-03-03`：`win_rate=0.4256`，`mean_return=-0.00229`，`median_return=-0.01284`，近端证据偏弱。
+  - `portfolio_advice.rebalance_due=true`，`estimated_turnover=0.50`，默认会给出 25 只等权 `4%` 的调仓目标。
+- 对 `2026-04-13` 的追跑验证显示：`requested_trade_date=2026-04-13`，但 `latest_available_trade_date=2026-04-10`，`score_date=2026-04-10`，说明当前环境下 4 月数据已经补到 `2026-04-10`，尚未拿到 `2026-04-13` 的可评分收盘数据。
+
+# TX1 run_live_advisor 正式程序性能改造
+
+- [x] 输出 Spec 第 1 段：现状分析与根因边界
+- [x] 输出 Spec 第 2 段：方案选项与推荐
+- [x] 输出 Spec 第 3 段：风险、接口与验证口径
+- [x] 等待用户 HARD-GATE 确认
+- [x] 先写失败测试，锁定 runtime fast path / universe cache / CLI 默认行为
+- [x] 新增 runtime universe resolver 与本地 cache 快照
+- [x] 接入 `build_live_raw_df` / `build_live_snapshot` / `LiveAdvisorService` / CLI 默认路径
+- [x] 运行定向测试与必要的真实链路验证
+- [x] 在 review 记录性能收益、行为一致性与剩余风险
+
+## Review
+
+- 已新增 `skyeye/products/tx1/live_advisor/universe.py`，提供 runtime fast path：
+  - 直接从 bundle 读取 `stocks.h5` / `indexes.h5`
+  - 按历史 `volume` 中位数计算 liquid top 300
+  - 以 `data_end_date + universe_size` 为 key 写入 `~/.rqalpha/tx1_live_advisor/universe_cache/`
+- 已将 runtime 默认调用链切到 fast path：
+  - `run_live_advisor.py` 新增 `--universe-source` / `--universe-cache-root`
+  - `LiveAdvisorService.get_recommendations()` 默认 `universe_source="runtime_fast"`
+  - `build_live_snapshot()` 默认透传 `runtime_fast`
+  - `build_live_raw_df()` 新增 `universe_source` / `universe_cache_root`，仅 live runtime 默认走 fast path；研究侧旧路径仍保留
+- 已修正一个边界问题：
+  - 初版 fast path 误把 `trading_dates.npy` 的未来交易日历当成实际 bundle 数据终点
+  - 现改为优先探测 `indexes.h5:000300.XSHG` 的真实最新行情日，不再虚报 `data_end_date`
+- 测试验证：
+  - 定向红绿：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_live_advisor_universe.py tests/products/tx1/test_live_advisor_snapshot.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_run_live_advisor.py -q`
+  - 结果：`18 passed`
+  - 扩大回归：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_live_advisor_*.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_run_live_advisor.py -q`
+  - 结果：`35 passed`
+- 真实链路验证：
+  - 命令：`env PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-10 --top-k 1 --format json`
+  - 结果：`status=ok`，`score_date=2026-04-10`，`raw_data_end_date=2026-04-10`，top-1 仍为 `600115.XSHG`
+  - runtime universe cache 已落盘：`~/.rqalpha/tx1_live_advisor/universe_cache/liquid_top_300_20260331.json`
+- 行为与风险：
+  - daily runtime 默认不再先卡在研究侧 `get_liquid_universe()` 的全市场长历史扫描；现在会直接进入 300 股票批量加载阶段
+  - fast path 当前只保证“纯 liquid top 300”语义；若显式传入 `market_cap_floor_quantile` / `market_cap_column`，仍会回退到旧研究路径
+  - 之前临时脚本留下的 `liquid_top_300_20260410.json` 旧 cache 仍在用户主目录，但正式代码现在按真实 bundle 数据终点使用 `20260331` key，不再继续写错日期
+
 # TX1 最新数据补跑
 
 - [x] 梳理 TX1 数据截止日、训练窗口和 artifact 过期原因

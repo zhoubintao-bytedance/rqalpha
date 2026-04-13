@@ -39,6 +39,8 @@ class LiveAdvisorService(object):
         universe_size=300,
         market_cap_floor_quantile=None,
         market_cap_column=None,
+        universe_source="runtime_fast",
+        universe_cache_root=None,
         current_holdings=None,
         last_rebalance_date=None,
     ) -> dict:
@@ -56,6 +58,8 @@ class LiveAdvisorService(object):
             universe_size=universe_size,
             market_cap_floor_quantile=market_cap_floor_quantile,
             market_cap_column=market_cap_column,
+            universe_source=universe_source,
+            universe_cache_root=universe_cache_root,
         )
         snapshot_gate = evaluate_snapshot_runtime_gates(
             snapshot,
