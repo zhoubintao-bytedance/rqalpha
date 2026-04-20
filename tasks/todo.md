@@ -1020,9 +1020,9 @@
 
 - [x] 复核 `master` 与 `tx1-autoresearch-a1` 的 git 状态、worktree 关系和本地脏改动边界
 - [x] 在 `tx1-autoresearch-a1` 运行新鲜定向验证，确认 feature tip 可合入
-- [ ] 提交 `tx1-autoresearch-a1` 当前改动，生成可合并提交
-- [ ] 将 feature 提交合入当前 `master`，避免覆盖 `master` 现有未跟踪文件
-- [ ] 在 `master` 上复测关键 autoresearch / TX1 研究侧回归
+- [x] 提交 `tx1-autoresearch-a1` 当前改动，生成可合并提交
+- [x] 将 feature 提交合入当前 `master`，避免覆盖 `master` 现有未跟踪文件
+- [x] 在 `master` 上复测关键 autoresearch / TX1 研究侧回归
 
 ## Review
 
@@ -1031,3 +1031,15 @@
   - 结果：`37 passed, 1 warning`
   - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_dataset_builder.py tests/products/tx1/test_label_builder.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_robustness.py tests/products/tx1/test_persistence.py -q`
   - 结果：`66 passed, 1 warning`
+- 合入结果：
+  - feature branch 提交：`5fc7674c Implement TX1 autoresearch A1 loop`
+  - 当前 `master` 已通过 `git merge --ff-only tx1-autoresearch-a1` 快进到该提交
+  - `master` 上原有未跟踪文件 `docs/superpowers/plans/2026-04-20-tx1-autoresearch-safety-closure.md` 未被覆盖
+- 合并后复测证据：
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_autoresearch_state.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_git_ops.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_run_autoresearch.py -q`
+  - 结果：`37 passed, 1 warning`
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_dataset_builder.py tests/products/tx1/test_label_builder.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_robustness.py tests/products/tx1/test_persistence.py -q`
+  - 结果：`66 passed, 1 warning`
+- 清理结果：
+  - 已删除 worktree：`/home/tiger/rqalpha/.worktrees/tx1-autoresearch-a1`
+  - 已删除分支：`tx1-autoresearch-a1`
