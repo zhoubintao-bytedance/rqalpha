@@ -36,7 +36,10 @@ def collect_workspace_safety_checks(workdir: str | Path) -> dict[str, object]:
         _run_git_command(workdir=repo_root, args=["rev-parse", "--show-toplevel"])
         checks["is_git_repo"] = True
         common_dir = _run_git_command(workdir=repo_root, args=["rev-parse", "--git-common-dir"]).strip()
-        checks["is_worktree"] = "/worktrees/" in common_dir.replace("\\", "/")
+        git_dir = _run_git_command(workdir=repo_root, args=["rev-parse", "--git-dir"]).strip()
+        common_dir_norm = common_dir.replace("\\", "/")
+        git_dir_norm = git_dir.replace("\\", "/")
+        checks["is_worktree"] = (git_dir_norm != common_dir_norm) or ("/worktrees/" in git_dir_norm)
         porcelain = _run_git_command(workdir=repo_root, args=["status", "--porcelain"])
         lines = [line for line in porcelain.splitlines() if line.strip()]
         checks["has_untracked_files"] = any(line.startswith("?? ") for line in lines)

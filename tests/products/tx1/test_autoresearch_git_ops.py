@@ -74,6 +74,7 @@ def test_git_ops_collects_workspace_safety_checks(monkeypatch, tmp_path):
     responses = {
         ("rev-parse", "--show-toplevel"): str(tmp_path) + "\n",
         ("rev-parse", "--git-common-dir"): str(tmp_path / ".git" / "worktrees" / "tx1") + "\n",
+        ("rev-parse", "--git-dir"): str(tmp_path / ".git" / "worktrees" / "tx1") + "\n",
         ("status", "--porcelain"): "",
     }
 
@@ -88,6 +89,26 @@ def test_git_ops_collects_workspace_safety_checks(monkeypatch, tmp_path):
     assert checks["is_worktree"] is True
     assert checks["is_clean"] is True
     assert checks["has_untracked_files"] is False
+    assert checks["reason_code"] is None
+
+
+def test_git_ops_detects_worktree_when_common_dir_points_to_main_git(monkeypatch, tmp_path):
+    responses = {
+        ("rev-parse", "--show-toplevel"): str(tmp_path) + "\n",
+        ("rev-parse", "--git-common-dir"): str(tmp_path / ".git") + "\n",
+        ("rev-parse", "--git-dir"): str(tmp_path / ".git" / "worktrees" / "tx1") + "\n",
+        ("status", "--porcelain"): "",
+    }
+
+    def _fake_run_git_command(*, workdir, args):
+        return responses[tuple(args)]
+
+    monkeypatch.setattr(git_ops, "_run_git_command", _fake_run_git_command)
+
+    checks = git_ops.collect_workspace_safety_checks(tmp_path)
+
+    assert checks["is_git_repo"] is True
+    assert checks["is_worktree"] is True
     assert checks["reason_code"] is None
 
 
