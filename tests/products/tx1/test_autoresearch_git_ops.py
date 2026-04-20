@@ -69,3 +69,37 @@ def test_git_ops_rolls_back_to_start_commit(monkeypatch, tmp_path):
         (tmp_path, ("reset", "--hard", "abc1234")),
     ]
 
+
+def test_git_ops_collects_workspace_safety_checks(monkeypatch, tmp_path):
+    responses = {
+        ("rev-parse", "--show-toplevel"): str(tmp_path) + "\n",
+        ("rev-parse", "--git-common-dir"): str(tmp_path / ".git" / "worktrees" / "tx1") + "\n",
+        ("status", "--porcelain"): "",
+    }
+
+    def _fake_run_git_command(*, workdir, args):
+        return responses[tuple(args)]
+
+    monkeypatch.setattr(git_ops, "_run_git_command", _fake_run_git_command)
+
+    checks = git_ops.collect_workspace_safety_checks(tmp_path)
+
+    assert checks["is_git_repo"] is True
+    assert checks["is_worktree"] is True
+    assert checks["is_clean"] is True
+    assert checks["has_untracked_files"] is False
+    assert checks["reason_code"] is None
+
+
+def test_git_ops_rolls_back_candidate_commit_to_start_commit(monkeypatch, tmp_path):
+    calls = []
+
+    def _fake_run_git_command(*, workdir, args):
+        calls.append(tuple(args))
+        return ""
+
+    monkeypatch.setattr(git_ops, "_run_git_command", _fake_run_git_command)
+
+    git_ops.rollback_candidate_commit(tmp_path, "abc1234")
+
+    assert calls == [("reset", "--hard", "abc1234")]

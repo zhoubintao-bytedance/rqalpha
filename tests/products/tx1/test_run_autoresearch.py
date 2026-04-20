@@ -2,6 +2,20 @@ from skyeye.products.tx1 import run_autoresearch
 from skyeye.products.tx1.autoresearch import loop as autoresearch_loop
 
 
+def _allow_workspace_checks(monkeypatch):
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "collect_workspace_safety_checks",
+        lambda workdir: {
+            "is_git_repo": True,
+            "is_worktree": True,
+            "is_clean": True,
+            "has_untracked_files": False,
+            "reason_code": None,
+        },
+    )
+
+
 def test_run_autoresearch_main_passes_arguments_to_loop(monkeypatch, tmp_path):
     captured = {}
 
@@ -86,10 +100,23 @@ def test_run_autoresearch_main_passes_execution_flags_to_loop(monkeypatch, tmp_p
     assert captured["horizon_days"] == 20
 
 
+def test_run_autoresearch_main_returns_nonzero_for_invalid(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        run_autoresearch,
+        "run_loop",
+        lambda **kwargs: {"status": "invalid", "reason_code": "not_worktree"},
+    )
+
+    rc = run_autoresearch.main(["--run-tag", "demo", "--runs-root", str(tmp_path)])
+
+    assert rc == 2
+
+
 def test_run_loop_initializes_state_with_git_metadata(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
+    _allow_workspace_checks(monkeypatch)
     monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
 
@@ -112,6 +139,7 @@ def test_run_loop_executes_baseline_trial_and_records_summary(monkeypatch, tmp_p
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
+    _allow_workspace_checks(monkeypatch)
     monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
     monkeypatch.setattr(
@@ -159,6 +187,7 @@ def test_run_loop_builds_raw_df_and_records_candidate_result(monkeypatch, tmp_pa
     repo_root.mkdir()
     captured = {}
 
+    _allow_workspace_checks(monkeypatch)
     monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
 
@@ -247,6 +276,7 @@ def test_run_loop_keeps_best_commit_when_candidate_is_discarded(monkeypatch, tmp
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
+    _allow_workspace_checks(monkeypatch)
     monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
     monkeypatch.setattr(autoresearch_loop, "build_research_raw_df", lambda **kwargs: {"raw_df": "ok"})
@@ -314,6 +344,113 @@ def test_run_loop_keeps_best_commit_when_candidate_is_discarded(monkeypatch, tmp
     assert results_lines[2].startswith("def5678\tdiscard\t-0.001000\t0.200000\t10.000000\tguardrail_failed\t")
 
 
+def test_run_loop_returns_invalid_when_workspace_precheck_fails(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "collect_workspace_safety_checks",
+        lambda workdir: {
+            "is_git_repo": True,
+            "is_worktree": False,
+            "is_clean": True,
+            "has_untracked_files": False,
+            "reason_code": "not_worktree",
+        },
+    )
+
+    result = autoresearch_loop.run_loop(
+        run_tag="demo",
+        runs_root=tmp_path / "runs",
+        workdir=repo_root,
+    )
+
+    assert result["status"] == "invalid"
+    assert result["reason_code"] == "not_worktree"
+    assert result["state"]["last_status"] == "invalid"
+    assert result["state"]["last_reason_code"] == "not_worktree"
+
+
+def test_run_loop_records_crash_when_candidate_raises(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    _allow_workspace_checks(monkeypatch)
+    monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
+    monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "run_feature_trial",
+        lambda **kwargs: {
+            "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08},
+            "robustness": {"stability": {"stability_score": 61.0}},
+            "experiment_path": str(tmp_path / "exp_0000"),
+        },
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "evaluate_current_candidate",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    result = autoresearch_loop.run_loop(
+        run_tag="demo",
+        runs_root=tmp_path / "runs",
+        workdir=repo_root,
+        evaluate_current=True,
+        raw_df=object(),
+    )
+
+    assert result["status"] == "crash"
+    assert result["state"]["last_status"] == "crash"
+    assert result["state"]["last_reason_code"] == "candidate_crash"
+    assert result["state"]["last_error"] == "boom"
+
+
+def test_run_loop_keeps_best_commit_unchanged_for_keep(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    _allow_workspace_checks(monkeypatch)
+    monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
+    monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "run_feature_trial",
+        lambda **kwargs: {
+            "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08},
+            "robustness": {"stability": {"stability_score": 61.0}},
+            "experiment_path": str(tmp_path / "exp_0000"),
+        },
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "evaluate_current_candidate",
+        lambda **kwargs: {
+            "status": "keep",
+            "reason_code": "full_pass_not_best",
+            "commit": "def5678",
+            "full_summary": {
+                "portfolio": {"net_mean_return": 0.0021, "max_drawdown": 0.08},
+                "robustness": {"stability": {"stability_score": 61.5}},
+                "experiment_path": str(tmp_path / "exp_0001"),
+            },
+        },
+    )
+
+    result = autoresearch_loop.run_loop(
+        run_tag="demo",
+        runs_root=tmp_path / "runs",
+        workdir=repo_root,
+        raw_df=object(),
+        evaluate_current=True,
+    )
+
+    assert result["state"]["current_commit"] == "def5678"
+    assert result["state"]["best_commit"] == "abc1234"
+
+
 def test_candidate_cycle_rejects_read_only_path_and_rolls_back(monkeypatch, tmp_path):
     calls = []
 
@@ -329,7 +466,7 @@ def test_candidate_cycle_rejects_read_only_path_and_rolls_back(monkeypatch, tmp_
     )
     monkeypatch.setattr(
         autoresearch_loop,
-        "rollback_to_commit",
+        "rollback_candidate_commit",
         lambda workdir, commit: calls.append((workdir, commit)),
     )
 
@@ -395,7 +532,7 @@ def test_candidate_cycle_discards_after_smoke_failure(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         autoresearch_loop,
-        "rollback_to_commit",
+        "rollback_candidate_commit",
         lambda workdir, commit: calls.append((workdir, commit)),
     )
 
@@ -476,7 +613,7 @@ def test_candidate_cycle_runs_full_trial_after_smoke_keep(monkeypatch, tmp_path)
     monkeypatch.setattr(autoresearch_loop, "judge_candidate", _fake_judge)
     monkeypatch.setattr(
         autoresearch_loop,
-        "rollback_to_commit",
+        "rollback_candidate_commit",
         lambda workdir, commit: rollback_calls.append((workdir, commit)),
     )
 

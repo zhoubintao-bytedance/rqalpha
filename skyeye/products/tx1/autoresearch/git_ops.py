@@ -22,6 +22,38 @@ def resolve_repo_root(cwd: str | Path) -> Path:
     return Path(cwd).resolve()
 
 
+def collect_workspace_safety_checks(workdir: str | Path) -> dict[str, object]:
+    """收集 autoresearch 启动前要求的 git/worktree 安全检查结果。"""
+    repo_root = resolve_repo_root(workdir)
+    checks = {
+        "is_git_repo": False,
+        "is_worktree": False,
+        "is_clean": False,
+        "has_untracked_files": False,
+        "reason_code": None,
+    }
+    try:
+        _run_git_command(workdir=repo_root, args=["rev-parse", "--show-toplevel"])
+        checks["is_git_repo"] = True
+        common_dir = _run_git_command(workdir=repo_root, args=["rev-parse", "--git-common-dir"]).strip()
+        checks["is_worktree"] = "/worktrees/" in common_dir.replace("\\", "/")
+        porcelain = _run_git_command(workdir=repo_root, args=["status", "--porcelain"])
+        lines = [line for line in porcelain.splitlines() if line.strip()]
+        checks["has_untracked_files"] = any(line.startswith("?? ") for line in lines)
+        checks["is_clean"] = not lines
+    except subprocess.CalledProcessError:
+        checks["reason_code"] = "not_git_repo"
+        return checks
+
+    if not checks["is_worktree"]:
+        checks["reason_code"] = "not_worktree"
+    elif checks["has_untracked_files"]:
+        checks["reason_code"] = "worktree_not_clean"
+    elif not checks["is_clean"]:
+        checks["reason_code"] = "worktree_not_clean"
+    return checks
+
+
 def get_current_commit(workdir: str | Path) -> str:
     """读取当前工作区 HEAD 的短 commit。"""
     return _run_git_command(
@@ -55,12 +87,17 @@ def create_experiment_commit(workdir: str | Path, message: str) -> str:
     return get_current_commit(repo_root)
 
 
-def rollback_to_commit(workdir: str | Path, commit: str) -> None:
-    """把工作区强制回滚到指定 commit。"""
+def rollback_candidate_commit(workdir: str | Path, commit: str) -> None:
+    """回退本轮 candidate commit，对齐 autoresearch 的单轮撤销语义。"""
     _run_git_command(
         workdir=resolve_repo_root(workdir),
         args=["reset", "--hard", str(commit)],
     )
+
+
+def rollback_to_commit(workdir: str | Path, commit: str) -> None:
+    """把工作区强制回滚到指定 commit。"""
+    rollback_candidate_commit(workdir, commit)
 
 
 def _run_git_command(*, workdir: Path, args: list[str]) -> str:

@@ -10,7 +10,9 @@ from skyeye.products.tx1.autoresearch.loop import run_loop
 
 def build_parser() -> argparse.ArgumentParser:
     """构造 autoresearch CLI 的参数解析器。"""
-    parser = argparse.ArgumentParser(description="Run TX1 autoresearch loop")
+    parser = argparse.ArgumentParser(
+        description="Run TX1 autoresearch loop (requires a clean dedicated git worktree)"
+    )
     parser.add_argument("--run-tag", required=True, help="本次 autoresearch run 的唯一标签")
     parser.add_argument(
         "--runs-root",
@@ -36,7 +38,7 @@ def main(argv=None) -> int:
     """解析 CLI 参数并启动 autoresearch 主循环。"""
     parser = build_parser()
     args = parser.parse_args(argv)
-    run_loop(
+    result = run_loop(
         run_tag=args.run_tag,
         runs_root=Path(args.runs_root),
         build_raw_df_for_run=bool(args.build_raw_df),
@@ -52,6 +54,9 @@ def main(argv=None) -> int:
         smoke_max_folds=args.smoke_max_folds,
         full_max_folds=args.full_max_folds,
     )
+    status = str(result.get("status") or "ok")
+    if status in {"invalid", "crash"}:
+        return 2
     return 0
 
 

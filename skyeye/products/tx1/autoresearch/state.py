@@ -42,6 +42,9 @@ class AutoresearchStateStore(object):
             "best_summary": dict(baseline_summary or {}),
             "experiment_count": 0,
             "last_status": "initialized",
+            "last_reason_code": None,
+            "last_experiment_path": "",
+            "last_error": None,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
@@ -91,12 +94,17 @@ class AutoresearchStateStore(object):
         decision_status: str,
         commit: str,
         candidate_summary: dict[str, Any] | None,
+        reason_code: str | None = None,
+        error_message: str | None = None,
     ) -> dict[str, Any]:
         """根据 keep/discard/champion 等决策推进 state。"""
         state = self.load()
         state["experiment_count"] = int(state.get("experiment_count", 0)) + 1
         state["last_status"] = str(decision_status)
-        if decision_status in {"keep", "champion", "frontier"}:
+        state["last_reason_code"] = reason_code
+        state["last_experiment_path"] = str((candidate_summary or {}).get("experiment_path", ""))
+        state["last_error"] = error_message
+        if decision_status in {"keep", "champion"}:
             # 被保留的候选可以推进当前工作基线，后续 patch 会在它的基础上继续演化。
             state["current_commit"] = str(commit)
         if decision_status == "champion":

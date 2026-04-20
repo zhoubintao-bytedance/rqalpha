@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from skyeye.products.tx1.autoresearch.git_ops import (
+    collect_workspace_safety_checks,
     create_experiment_commit,
     ensure_read_only_paths_untouched,
     get_current_branch,
     get_current_commit,
     list_changed_paths,
-    rollback_to_commit,
+    rollback_candidate_commit,
 )
 from skyeye.products.tx1.autoresearch.runner import (
     build_research_raw_df,
@@ -52,6 +53,37 @@ def run_loop(
     repo_root = Path(workdir).resolve() if workdir is not None else Path.cwd().resolve()
     run_root = build_run_root(runs_root, run_tag)
     store = AutoresearchStateStore(run_root)
+    workspace_checks = collect_workspace_safety_checks(repo_root)
+    if workspace_checks.get("reason_code") is not None:
+        state = store.initialize(
+            run_tag=run_tag,
+            baseline_commit="",
+            branch_name="",
+            baseline_summary={},
+        )
+        reason_code = str(workspace_checks["reason_code"])
+        state = store.update_after_decision(
+            decision_status="invalid",
+            commit="",
+            candidate_summary=None,
+            reason_code=reason_code,
+            error_message=None,
+        )
+        return {
+            "run_tag": run_tag,
+            "run_root": str(run_root),
+            "workdir": str(repo_root),
+            "state": state,
+            "state_store": store,
+            "baseline_summary": None,
+            "candidate_result": None,
+            "max_experiments": int(max_experiments),
+            "smoke_max_folds": int(smoke_max_folds),
+            "full_max_folds": None if full_max_folds is None else int(full_max_folds),
+            "status": "invalid",
+            "reason_code": reason_code,
+        }
+
     baseline_commit = get_current_commit(repo_root)
     branch_name = get_current_branch(repo_root)
     state = store.initialize(
@@ -96,20 +128,30 @@ def run_loop(
 
     candidate_result = None
     if evaluate_current:
-        candidate_result = evaluate_current_candidate(
-            workdir=repo_root,
-            run_root=run_root,
-            start_commit=baseline_commit,
-            experiment_index=1,
-            raw_df=raw_df,
-            baseline_summary=baseline_summary,
-            variant_name=variant_name,
-            model_kind=model_kind,
-            label_transform=label_transform,
-            horizon_days=horizon_days,
-            smoke_max_folds=smoke_max_folds,
-            full_max_folds=full_max_folds,
-        )
+        try:
+            candidate_result = evaluate_current_candidate(
+                workdir=repo_root,
+                run_root=run_root,
+                start_commit=baseline_commit,
+                experiment_index=1,
+                raw_df=raw_df,
+                baseline_summary=baseline_summary,
+                variant_name=variant_name,
+                model_kind=model_kind,
+                label_transform=label_transform,
+                horizon_days=horizon_days,
+                smoke_max_folds=smoke_max_folds,
+                full_max_folds=full_max_folds,
+            )
+        except Exception as exc:
+            candidate_result = {
+                "status": "crash",
+                "reason_code": "candidate_crash",
+                "commit": baseline_commit,
+                "error_message": str(exc),
+                "smoke_summary": {},
+            }
+
         _record_candidate_result(
             state_store=store,
             baseline_commit=baseline_commit,
@@ -127,7 +169,7 @@ def run_loop(
         "max_experiments": int(max_experiments),
         "smoke_max_folds": int(smoke_max_folds),
         "full_max_folds": None if full_max_folds is None else int(full_max_folds),
-        "status": "initialized",
+        "status": str((candidate_result or {}).get("status") or "initialized"),
     }
 
 
@@ -151,7 +193,7 @@ def evaluate_current_candidate(
     changed_paths = list_changed_paths(repo_root)
     read_only_hits = ensure_read_only_paths_untouched(changed_paths, READ_ONLY_ROOTS)
     if read_only_hits:
-        rollback_to_commit(repo_root, start_commit)
+        rollback_candidate_commit(repo_root, start_commit)
         return {
             "status": "invalid",
             "reason_code": "read_only_path_touched",
@@ -175,7 +217,7 @@ def evaluate_current_candidate(
         stage="smoke",
     )
     if smoke_decision.get("status") != "keep":
-        rollback_to_commit(repo_root, start_commit)
+        rollback_candidate_commit(repo_root, start_commit)
         return {
             "status": smoke_decision.get("status", "discard"),
             "reason_code": smoke_decision.get("reason_code"),
@@ -200,7 +242,7 @@ def evaluate_current_candidate(
         stage="full",
     )
     if full_decision.get("status") == "discard":
-        rollback_to_commit(repo_root, start_commit)
+        rollback_candidate_commit(repo_root, start_commit)
 
     return {
         "status": full_decision.get("status", "discard"),
@@ -236,6 +278,8 @@ def _record_candidate_result(
         decision_status=status,
         commit=commit,
         candidate_summary=candidate_summary,
+        reason_code=reason_code,
+        error_message=candidate_result.get("error_message"),
     )
 
 

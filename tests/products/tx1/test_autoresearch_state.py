@@ -106,3 +106,42 @@ def test_state_store_only_promotes_best_commit_on_champion(tmp_path):
     assert champion_state["current_commit"] == "fedcba9"
     assert champion_state["best_commit"] == "fedcba9"
     assert champion_state["best_summary"] == {"net_mean_return": 0.003}
+
+
+def test_state_store_initializes_safety_closure_fields(tmp_path):
+    store = AutoresearchStateStore(tmp_path / "run")
+
+    state = store.initialize(
+        run_tag="demo",
+        baseline_commit="abc1234",
+        branch_name="tx1-autoresearch",
+        baseline_summary={},
+    )
+
+    assert state["last_reason_code"] is None
+    assert state["last_experiment_path"] == ""
+    assert state["last_error"] is None
+
+
+def test_state_store_updates_reason_and_error_fields(tmp_path):
+    store = AutoresearchStateStore(tmp_path / "run")
+    store.initialize(
+        run_tag="demo",
+        baseline_commit="abc1234",
+        branch_name="tx1-autoresearch",
+        baseline_summary={"portfolio": {"net_mean_return": 0.001}},
+    )
+
+    state = store.update_after_decision(
+        decision_status="crash",
+        commit="def5678",
+        candidate_summary={"experiment_path": "/tmp/exp_0001"},
+        reason_code="smoke_crashed",
+        error_message="boom",
+    )
+
+    assert state["last_status"] == "crash"
+    assert state["last_reason_code"] == "smoke_crashed"
+    assert state["last_experiment_path"] == "/tmp/exp_0001"
+    assert state["last_error"] == "boom"
+    assert state["best_commit"] == "abc1234"
