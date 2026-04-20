@@ -1,0 +1,130 @@
+"""TX1 autoresearch 的候选判定逻辑。"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+DEFAULT_GUARDRAILS = {
+    "max_drawdown": 0.12,
+    "mean_turnover": 0.20,
+    "stability_score": 50.0,
+    "cv": 0.60,
+    "positive_ratio": 0.70,
+}
+
+
+def judge_candidate(
+    candidate_summary: dict[str, Any] | None,
+    *,
+    baseline_summary: dict[str, Any] | None = None,
+    stage: str = "full",
+    guardrails: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """按“稳健优先、收益最大化”规则判定候选命运。"""
+    if not candidate_summary:
+        return {
+            "status": "crash",
+            "reason_code": "missing_summary",
+            "failed_guards": ["summary_missing"],
+            "score_delta": {},
+        }
+
+    limits = dict(DEFAULT_GUARDRAILS)
+    limits.update(guardrails or {})
+    failed_guards = _collect_failed_guards(candidate_summary, limits)
+    baseline_summary = dict(baseline_summary or {})
+
+    if failed_guards:
+        return {
+            "status": "discard",
+            "reason_code": "guardrail_failed",
+            "failed_guards": failed_guards,
+            "score_delta": _build_score_delta(candidate_summary, baseline_summary),
+        }
+
+    score_delta = _build_score_delta(candidate_summary, baseline_summary)
+    stage_name = str(stage).strip().lower()
+    if stage_name == "smoke":
+        return {
+            "status": "keep",
+            "reason_code": "smoke_pass",
+            "failed_guards": [],
+            "score_delta": score_delta,
+        }
+
+    improved = (
+        score_delta["net_mean_return"] > 0.0
+        and score_delta["max_drawdown"] <= 0.0
+        and score_delta["stability_score"] >= 0.0
+    )
+    if improved:
+        return {
+            "status": "champion",
+            "reason_code": "full_improved",
+            "failed_guards": [],
+            "score_delta": score_delta,
+        }
+
+    return {
+        "status": "discard",
+        "reason_code": "no_material_improvement",
+        "failed_guards": [],
+        "score_delta": score_delta,
+    }
+
+
+def _collect_failed_guards(summary: dict[str, Any], limits: dict[str, float]) -> list[str]:
+    """提取候选在硬门槛上失败的字段列表。"""
+    failed = []
+    if _metric(summary, "portfolio", "max_drawdown") > limits["max_drawdown"]:
+        failed.append("max_drawdown")
+    if _metric(summary, "portfolio", "mean_turnover") > limits["mean_turnover"]:
+        failed.append("mean_turnover")
+    if _metric(summary, "robustness", "stability", "stability_score") < limits["stability_score"]:
+        failed.append("stability_score")
+    if _metric(summary, "robustness", "stability", "cv") > limits["cv"]:
+        failed.append("cv")
+    if _metric(summary, "robustness", "regime_scores", "metric_consistency", "positive_ratio") < limits["positive_ratio"]:
+        failed.append("positive_ratio")
+    if _metric(summary, "robustness", "overfit_flags", "flag_ic_decay", default=False):
+        failed.append("flag_ic_decay")
+    if _metric(summary, "robustness", "overfit_flags", "flag_spread_decay", default=False):
+        failed.append("flag_spread_decay")
+    if _metric(summary, "robustness", "overfit_flags", "flag_val_dominant", default=False):
+        failed.append("flag_val_dominant")
+    return failed
+
+
+def _build_score_delta(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, float]:
+    """构造相对 baseline 的关键指标差值。"""
+    return {
+        "net_mean_return": _metric(candidate, "portfolio", "net_mean_return") - _metric(
+            baseline, "portfolio", "net_mean_return"
+        ),
+        "top_bucket_spread_mean": _metric(candidate, "prediction", "top_bucket_spread_mean") - _metric(
+            baseline, "prediction", "top_bucket_spread_mean"
+        ),
+        "rank_ic_mean": _metric(candidate, "prediction", "rank_ic_mean") - _metric(
+            baseline, "prediction", "rank_ic_mean"
+        ),
+        "max_drawdown": _metric(candidate, "portfolio", "max_drawdown") - _metric(
+            baseline, "portfolio", "max_drawdown"
+        ),
+        "stability_score": _metric(candidate, "robustness", "stability", "stability_score") - _metric(
+            baseline, "robustness", "stability", "stability_score"
+        ),
+    }
+
+
+def _metric(payload: dict[str, Any], *keys: str, default: Any = 0.0) -> Any:
+    """安全读取嵌套指标，缺失时返回默认值。"""
+    current: Any = payload
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+        if current is None:
+            return default
+    return current
+
