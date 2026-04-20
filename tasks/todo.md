@@ -215,9 +215,201 @@
   - 轻量链路验证显示：`resolve_data_end=2026-03-31`，`raw_df` / `dataset` 终点均为 `2026-03-31`，`labeled_df` 终点为 `2026-03-03`。
   - 在当前 `train=3y / val=6m / test=6m / embargo=20d / horizon=20d` 设计下，fold 数仍为 `14`，最后一个 `test_end` 仍是 `2025-11-18`。
 - 全量补跑验证：
-  - 已生成新实验 `skyeye/artifacts/experiments/tx1/tx1_refresh_20260331_lgbm/experiment.json`。
-  - 新实验关键指标：`rank_ic_mean=0.0554`，`top_bucket_spread_mean=0.0115`，`net_mean_return=0.000330`，`max_drawdown=0.0559`。
-  - `build_runtime('tx1.rolling_score', artifact_line='refresh_20260331_lgbm', load_signal_book=True)` 可正常加载，但 `signal_end` 仍为 `2025-11-18`。
+- 已生成新实验 `skyeye/artifacts/experiments/tx1/tx1_refresh_20260331_lgbm/experiment.json`。
+- 新实验关键指标：`rank_ic_mean=0.0554`，`top_bucket_spread_mean=0.0115`，`net_mean_return=0.000330`，`max_drawdown=0.0559`。
+- `build_runtime('tx1.rolling_score', artifact_line='refresh_20260331_lgbm', load_signal_book=True)` 可正常加载，但 `signal_end` 仍为 `2025-11-18`。
+
+# SkyEye 接入 autoresearch 方案设计
+
+- [x] 梳理 `skyeye` / `autoresearch` 现状与约束证据
+- [x] 输出 Spec 第 1 段：现状分析与问题边界
+- [x] 等待用户确认 Spec 第 1 段
+- [x] 输出 Spec 第 2 段：方案选项与推荐架构
+- [x] 记录用户决策：第一期改用方案 A（原版 autoresearch 风格，直接改 TX1 研究源码）
+- [x] 等待用户确认 Spec 第 2 段
+- [x] 输出 Spec 第 3 段：实施计划、风险与验证口径
+- [x] 等待用户 HARD-GATE 确认
+
+## Implementation Plan
+
+### Task 1: 搭建 TX1 autoresearch 运行骨架
+
+- [x] 新建 `skyeye/products/tx1/autoresearch/__init__.py`
+- [x] 新建 `skyeye/products/tx1/autoresearch/state.py`，定义 `state.json` / `results.tsv` / run root` 的读写逻辑
+- [x] 新建 `skyeye/products/tx1/autoresearch/judge.py`，实现 `keep/discard/crash/frontier/champion` 判定
+- [x] 新建 `skyeye/products/tx1/autoresearch/git_ops.py`，封装 baseline commit、实验 commit、discard 回滚、keep 推进
+- [x] 新建 `skyeye/products/tx1/autoresearch/runner.py`，封装 baseline run / candidate run / experiment artifact 采集
+- [x] 新建 `skyeye/products/tx1/autoresearch/loop.py`，实现主循环与阶段切换
+- [x] 新建 `skyeye/products/tx1/run_autoresearch.py`，提供 CLI 入口，解析 `run_tag` / `max_experiments` / `smoke_max_folds` / `full_max_folds`
+
+### Task 2: 接入现有 TX1 研究链路
+
+- [ ] 在 `runner.py` 中默认复用 `run_feature_experiments(...)` 与 `ExperimentRunner.run(...)`，避免重写研究执行协议
+- [x] 统一解析 `experiment.json`、fold metrics、robustness 指标，产出 judge 可消费的标准摘要
+- [ ] 落盘 run 级目录到 `skyeye/artifacts/experiments/tx1_autoresearch/<run_tag>/`
+- [ ] 保持单次实验产物写入独立子目录，禁止覆盖已有实验目录
+
+### Task 3: 实现原版 autoresearch 风格的 keep/discard/rollback 循环
+
+- [ ] 记录每轮实验起点 commit，并在 patch 后创建实验 commit
+- [ ] 实验失败或 judge 判 `discard/crash` 时，只回滚本轮实验 commit，不碰用户已有改动
+- [ ] 实验通过并被 judge 判 `keep/champion` 时，推进当前分支 head
+- [ ] `results.tsv` 保持未追踪，不写入 git 历史
+- [ ] 命中只读路径（`skyeye/products/tx1/live_advisor/**`、`skyeye/products/tx1/strategies/rolling_score/runtime.py`）时，直接判 invalid 并回滚
+
+### Task 4: 落地“稳健优先、收益最大化” judge
+
+# TX1 2026-04-17 实盘回测器建议
+
+- [x] 确认 TX1 live advisor 的可执行入口、可用 package 与 `2026-04-17` 数据可达性
+- [x] 运行 TX1 live advisor，获取 `2026-04-17` 的推荐结果与组合建议
+- [x] 整理基于模型输出的买入建议、风险提示与验证证据
+
+## Review
+
+- 运行入口：
+  - `skyeye/products/tx1/run_live_advisor.py` 的 `main()` 会把 `--trade-date / --top-k / --holdings-file` 透传给 `LiveAdvisorService.get_recommendations(...)`。
+- stop-serve 规则：
+  - `skyeye/products/tx1/live_advisor/runtime_gates.py` 的 `evaluate_snapshot_runtime_gates(...)` 会在 `requested_trade_date` 超过 `latest_available_trade_date` 且超出 `snapshot_max_delay_days` 时返回 `requested_trade_date_stale`，禁止把旧快照伪装成当天建议。
+- 组合建议规则：
+  - `skyeye/products/tx1/live_advisor/service.py` 的 `_build_portfolio_advice(...)` 会把 `portfolio_policy.buy_top_k` 默认成 `25`。
+  - `skyeye/products/tx1/portfolio_proxy.py` 的 `build_target_weights(...)` 在空仓假设下会按 `buy_top_k` 生成等权目标组合。
+- 本地只读核对：
+  - `env PYTHONPATH=$PWD python -c 'from skyeye.products.tx1.run_baseline_experiment import resolve_data_end; print(resolve_data_end())'`
+  - 结果：`2026-04-13 00:00:00`
+- 沙箱内首次运行：
+  - `env PYTHONPATH=$PWD MPLCONFIGDIR=/tmp/mplconfig python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260313 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-17 --top-k 25 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - 结果：`status=stopped`，`latest_available_trade_date=2026-04-13`，`score_date=2026-04-13`
+- 放开网络后重跑：
+  - `env PYTHONPATH=$PWD MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260313 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-17 --top-k 25 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - 结果：`status=ok`
+  - `requested_trade_date=2026-04-17`
+  - `latest_available_trade_date=2026-04-17`
+  - `score_date=2026-04-17`
+  - `raw_data_end_date=2026-04-17`
+  - `raw_df shape=(733470, 7)`，`date range: 2015-01-05 – 2026-04-17`
+- Top 10 建议：
+  - `300433.XSHE 蓝思科技`
+  - `601615.XSHG 明阳智能`
+  - `002024.XSHE ST易购`
+  - `600115.XSHG 中国东航`
+  - `600690.XSHG 海尔智家`
+  - `601728.XSHG 中国电信`
+  - `300182.XSHE 捷成股份`
+  - `601006.XSHG 大秦铁路`
+  - `600029.XSHG 南方航空`
+  - `300253.XSHE 卫宁健康`
+- 风险提示：
+  - `model_end_date=2026-03-13`，相对 `trade_date=2026-04-17` 落后 `25` 个交易日，处于 `warning`
+  - `evidence_end_date=2026-03-13`，相对 `trade_date=2026-04-17` 落后 `25` 个交易日，处于 `warning`
+  - top bucket 历史 OOS：`win_rate=48.1%`、`mean_return=+1.08%`、`median_return=-0.32%`
+  - 近端 canary 窗口 `2025-12-10 ~ 2026-03-13`：`win_rate=53.1%`、`mean_return=+1.26%`、`median_return=+0.50%`
+- 组合层结论：
+  - `portfolio_advice.rebalance_due=true`
+  - 默认空仓假设下给出 `25` 只股票等权 `4%` 的目标组合
+  - `estimated_turnover=50%`
+
+- [x] 以 `stability_score`、`cv`、`positive_ratio`、`max_drawdown`、`mean_turnover`、`flag_ic_decay`、`flag_spread_decay`、`flag_val_dominant` 作为第一层硬门槛
+- [x] 在过线候选中用 `net_mean_return`、`top_bucket_spread_mean`、`rank_ic_mean` 做第二层排序
+- [x] 输出 `keep/discard/crash/frontier/champion` 原因，避免黑盒决策
+- [ ] 支持 baseline、current champion、frontier 候选的三方比较
+
+### Task 5: 落地“两阶段评估”降低实验成本
+
+- [ ] 第一阶段 smoke 默认走 `max_folds=1~2`，快速淘汰明显差解
+- [ ] 第二阶段 full 仅对 smoke 过线候选运行完整 fold 评估
+- [ ] judge 必须区分 smoke 结果与 full 结果，禁止仅凭 smoke 直接晋升 champion
+
+### Task 6: 补测试并做回归验证
+
+- [x] 新增 `tests/products/tx1/test_autoresearch_state.py`
+- [x] 新增 `tests/products/tx1/test_autoresearch_judge.py`
+- [x] 新增 `tests/products/tx1/test_autoresearch_git_ops.py`
+- [x] 新增 `tests/products/tx1/test_run_autoresearch.py`
+- [ ] 回归运行：`tests/products/tx1/test_dataset_builder.py`
+- [ ] 回归运行：`tests/products/tx1/test_label_builder.py`
+- [ ] 回归运行：`tests/products/tx1/test_baseline_models.py`
+- [ ] 回归运行：`tests/products/tx1/test_run_feature_experiment.py`
+- [ ] 回归运行：`tests/products/tx1/test_run_baseline_experiment.py`
+- [ ] 回归运行：`tests/products/tx1/test_robustness.py`
+- [ ] 回归运行：`tests/products/tx1/test_persistence.py`
+
+### Task 7: 真实 smoke loop 验证
+
+- [ ] 跑一次 baseline experiment，确认 `state.json` / `results.tsv` / baseline summary 正常生成
+- [ ] 人工构造一次劣化 patch，验证 `discard` 与 git 回滚路径
+- [ ] 人工构造一次提升 patch，验证 `keep/champion` 与分支推进路径
+- [ ] 用 `compare_experiments.py` 输出对比报告，作为最终验收证据
+
+## Review
+
+- 已在隔离 worktree `.worktrees/tx1-autoresearch` 内完成 autoresearch 第一层骨架：
+  - `skyeye/products/tx1/autoresearch/__init__.py`
+  - `skyeye/products/tx1/autoresearch/state.py`
+  - `skyeye/products/tx1/autoresearch/judge.py`
+  - `skyeye/products/tx1/autoresearch/git_ops.py`
+  - `skyeye/products/tx1/autoresearch/runner.py`
+  - `skyeye/products/tx1/autoresearch/loop.py`
+  - `skyeye/products/tx1/run_autoresearch.py`
+- 已新增 5 组定向测试：
+  - `tests/products/tx1/test_autoresearch_state.py`
+  - `tests/products/tx1/test_autoresearch_judge.py`
+  - `tests/products/tx1/test_autoresearch_git_ops.py`
+  - `tests/products/tx1/test_autoresearch_runner.py`
+  - `tests/products/tx1/test_run_autoresearch.py`
+- 当前已落地能力：
+  - `state.json` / `results.tsv` 初始化与状态推进
+  - “稳健优先、收益最大化”的基础 judge
+  - git 当前分支 / commit / 改动路径 / 提交 / 回滚封装
+  - 实验摘要标准化加载
+  - `run_autoresearch` CLI 和 loop 初始化
+- 验证证据：
+  - worktree 基线：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_config.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py -q`
+  - 结果：`29 passed`
+  - autoresearch 定向：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_autoresearch_state.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_git_ops.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_run_autoresearch.py -q`
+  - 结果：`13 passed`
+  - 扩大回归：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_autoresearch_state.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_git_ops.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_run_autoresearch.py tests/products/tx1/test_config.py tests/products/tx1/test_persistence.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py -q`
+  - 结果：`44 passed`
+- 当前仍未完成：
+  - 真实实验执行器还未接入 `run_feature_experiments(...)` / `ExperimentRunner.run(...)`
+  - 主循环还未实现实际 candidate run、discard rollback、keep/champion 推进
+  - smoke/full 两阶段评估还未真正跑通
+
+# TX1 2026-04-15 实盘建议复核
+
+- [x] 核对 TX1 live advisor 当前可用 package 与本地数据终点
+- [x] 运行 `2026-04-15` 交易日的 live advisor，获取最新建议结果
+- [x] 记录命令、输出证据与结论
+
+## Review
+
+- 使用 package：`skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260331_lgbm_20260313/manifest.json`
+  - `package_id=tx1_canary_live_tx1_refresh_20260331_lgbm_20260313`
+  - `gate_level=canary_live`
+  - `data_end_date=2026-04-13`
+- 本地只读核对：
+  - `env PYTHONPATH=$PWD python - <<'PY' ... print(resolve_data_end()) ... PY`
+  - 结果：`resolve_data_end=2026-04-13 00:00:00`
+- 首次在沙箱内直接运行：
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260313 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-15 --top-k 10 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - 结果：`status=stopped`，`latest_available_trade_date=2026-04-13`，`score_date=2026-04-13`
+  - 根因：当前沙箱内 `rqdatac` 无法做 DNS 解析，`DataFacade.provider` 初始化失败，只能退回本地 bundle
+- 放开外网访问后重跑同一条命令，成功补齐到 `2026-04-15`：
+  - `status=ok`
+  - `requested_trade_date=2026-04-15`
+  - `latest_available_trade_date=2026-04-15`
+  - `score_date=2026-04-15`
+  - `raw_data_end_date=2026-04-15`
+  - `raw_df shape=(732870, 7)`，`date range: 2015-01-05 – 2026-04-15`
+- Top 10 建议：
+  - `600115.XSHG`、`002024.XSHE`、`601615.XSHG`、`600029.XSHG`、`601728.XSHG`、`601006.XSHG`、`601212.XSHG`、`300253.XSHE`、`600036.XSHG`、`300027.XSHE`
+- 风险提示：
+  - `model_end_date=2026-03-13`，相对 `trade_date=2026-04-15` 落后 `23` 个交易日，处于 `warning`
+  - `evidence_end_date=2026-03-13`，相对 `trade_date=2026-04-15` 落后 `23` 个交易日，处于 `warning`
+- 结果解读：
+  - top bucket 历史 OOS：`win_rate=48.1%`、`mean_return=+1.08%`、`median_return=-0.32%`，仍是右偏收益排序器，不是高胜率信号
+  - 近端 canary 窗口 `2025-12-10 ~ 2026-03-13`：`win_rate=53.1%`、`mean_return=+1.26%`、`median_return=+0.50%`
+  - `portfolio_advice.rebalance_due=true`，默认给出 `25` 只股票等权 `4%` 的目标组合，`estimated_turnover=50%`
 - 结论：
   - 之前“数据不是最新”有两层原因：一是本地 bundle 价格数据确实停在旧日期；二是即使补到 `2026-03-31`，现有 TX1 replay 设计也还不足以产出 `2026-04` 的新信号。
   - 按当前切分规则，要出现第 15 个 fold，`labeled_df` 至少要到 `2026-05-04`，对应 `raw_df` 约需要到 `2026-06-01` 左右。
@@ -755,3 +947,35 @@
   - 结果：`179 passed`
   - 真实 CLI smoke：`env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260303 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-03-31 --top-k 1 --format json`
   - 结果：`status=ok`，并返回 `label_end_date / evidence_end_date / data_source_summary / gate_diagnostics / portfolio_advice.preflight_checks`
+
+# TX1 2026-04-14 实盘建议查看
+
+- [x] 确认可用 live package、bundle 数据截止日与运行参数
+- [x] 运行 TX1 live advisor，查看 `2026-04-14` 的建议输出
+- [x] 记录命令证据与结果摘要
+
+## Review
+
+- 本次使用 package：`skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260331_lgbm_20260313/manifest.json`
+  - `package_id=tx1_canary_live_tx1_refresh_20260331_lgbm_20260313`
+  - `gate_level=canary_live`
+  - `data_end_date=2026-04-13`
+- 实际运行命令：
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260313 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-14 --top-k 10 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260331_lgbm_20260313 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-14 --top-k 10 --universe-cache-root /tmp/tx1_live_universe_cache --format table`
+- 运行结果：
+  - `status=ok`
+  - `requested_trade_date=2026-04-14`
+  - `latest_available_trade_date=2026-04-13`
+  - `score_date=2026-04-13`
+  - `raw_data_end_date=2026-04-13`
+  - `raw_df shape=(732270, 7)`，`date range: 2015-01-05 – 2026-04-13`
+- Top 10 建议：
+  - `000793.XSHE`、`002024.XSHE`、`600690.XSHG`、`001979.XSHE`、`600029.XSHG`、`600115.XSHG`、`601728.XSHG`、`601615.XSHG`、`601006.XSHG`、`300027.XSHE`
+- CLI 风险提示：
+  - `model_end_date=2026-03-13` 距 `trade_date=2026-04-14` 落后 `21` 个交易日，处于 `warning` 模式
+  - `evidence_end_date=2026-03-13` 距 `trade_date=2026-04-14` 落后 `21` 个交易日，处于 `warning` 模式
+- 结果解读：
+  - top 桶历史 OOS：`win_rate=48.1%`、`mean_return=+1.08%`、`median_return=-0.32%`，更像右偏收益排序器，不是高胜率信号
+  - 近端 canary 窗口 `2025-12-10 ~ 2026-03-13`：`win_rate=53.1%`、`mean_return=+1.26%`、`median_return=+0.50%`
+  - `portfolio_advice.rebalance_due=true`，默认给出 `25` 只股票等权 `4%` 的建仓目标，`estimated_turnover=50%`
