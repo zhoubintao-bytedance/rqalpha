@@ -73,19 +73,69 @@ def get_current_branch(workdir: str | Path) -> str:
     ).strip()
 
 
-def list_changed_paths(workdir: str | Path) -> list[str]:
-    """列出相对 HEAD 的已修改路径，供只读路径审计使用。"""
-    output = _run_git_command(
+def get_head_commit(workdir: str | Path) -> str:
+    """读取当前 HEAD 的短 commit，供 resume 对齐使用。"""
+    return get_current_commit(workdir)
+
+
+def checkout_commit(workdir: str | Path, commit: str) -> None:
+    """把当前 worktree 对齐到指定 commit，同时保留所在分支。"""
+    _run_git_command(
         workdir=resolve_repo_root(workdir),
-        args=["diff", "--name-only", "--relative", "HEAD"],
+        args=["reset", "--hard", str(commit)],
     )
-    return [line.strip() for line in output.splitlines() if line.strip()]
 
 
-def create_experiment_commit(workdir: str | Path, message: str) -> str:
+def list_changed_paths(workdir: str | Path, include_untracked: bool = False) -> list[str]:
+    """列出相对 HEAD 的改动路径，可选带上未跟踪文件。"""
+    repo_root = resolve_repo_root(workdir)
+    if not include_untracked:
+        output = _run_git_command(
+            workdir=repo_root,
+            args=["diff", "--name-only", "--relative", "HEAD"],
+        )
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
+    output = _run_git_command(
+        workdir=repo_root,
+        args=["status", "--porcelain", "--untracked-files=all"],
+    )
+    changed_paths = []
+    for raw_line in output.splitlines():
+        if not raw_line.strip():
+            continue
+        path_text = raw_line[3:].strip()
+        if " -> " in path_text:
+            path_text = path_text.split(" -> ", 1)[1].strip()
+        if path_text and path_text not in changed_paths:
+            changed_paths.append(path_text)
+    return changed_paths
+
+
+def assert_only_allowed_paths_changed(
+    changed_paths: list[str],
+    allowed_write_roots: list[str],
+    read_only_roots: list[str],
+) -> list[str]:
+    """检查改动是否越出允许写入的研究面白名单。"""
+    invalid = []
+    for changed_path in changed_paths:
+        if _matches_any_root(changed_path, read_only_roots):
+            continue
+        if _matches_any_root(changed_path, allowed_write_roots):
+            continue
+        invalid.append(str(changed_path))
+    return invalid
+
+
+def create_experiment_commit(workdir: str | Path, message: str, allowed_paths: list[str] | None = None) -> str:
     """提交当前实验改动，并返回提交后的短 commit。"""
     repo_root = resolve_repo_root(workdir)
-    _run_git_command(workdir=repo_root, args=["add", "-A"])
+    if allowed_paths:
+        normalized_paths = [str(path) for path in allowed_paths]
+        _run_git_command(workdir=repo_root, args=["add", "--", *normalized_paths])
+    else:
+        _run_git_command(workdir=repo_root, args=["add", "-A"])
     _run_git_command(workdir=repo_root, args=["commit", "-m", str(message)])
     return get_current_commit(repo_root)
 
@@ -101,6 +151,27 @@ def rollback_candidate_commit(workdir: str | Path, commit: str) -> None:
 def rollback_to_commit(workdir: str | Path, commit: str) -> None:
     """把工作区强制回滚到指定 commit。"""
     rollback_candidate_commit(workdir, commit)
+
+
+def rollback_to_parent_commit(workdir: str | Path, parent_commit: str) -> None:
+    """把当前 worktree 回到本轮候选的父 commit。"""
+    rollback_candidate_commit(workdir, parent_commit)
+
+
+def _matches_any_root(path_text: str, roots: list[str]) -> bool:
+    """判断路径是否命中任一文件或目录根。"""
+    normalized_path = str(path_text).replace("\\", "/").lstrip("./")
+    for root in roots:
+        normalized_root = str(root).replace("\\", "/").lstrip("./")
+        if not normalized_root:
+            continue
+        if normalized_root.endswith("/"):
+            if normalized_path.startswith(normalized_root):
+                return True
+            continue
+        if normalized_path == normalized_root or normalized_path.startswith(normalized_root + "/"):
+            return True
+    return False
 
 
 def _run_git_command(*, workdir: Path, args: list[str]) -> str:

@@ -101,6 +101,56 @@ def run_feature_trial(
     return summary
 
 
+def run_baseline_trial(
+    *,
+    run_root: str | Path,
+    raw_df,
+    variant_name: str = "baseline_5f",
+    model_kind: str = "lgbm",
+    label_transform: str = "rank",
+    horizon_days: int = 20,
+    max_folds: int | None = None,
+) -> dict[str, Any]:
+    """执行 baseline 评估，统一 baseline 的实验索引约定。"""
+    return run_feature_trial(
+        run_root=run_root,
+        experiment_index=0,
+        raw_df=raw_df,
+        variant_name=variant_name,
+        model_kind=model_kind,
+        label_transform=label_transform,
+        horizon_days=horizon_days,
+        max_folds=max_folds,
+    )
+
+
+def run_candidate_trial(
+    *,
+    run_root: str | Path,
+    experiment_index: int,
+    stage: str,
+    raw_df,
+    variant_name: str = "baseline_5f",
+    model_kind: str = "lgbm",
+    label_transform: str = "rank",
+    horizon_days: int = 20,
+    max_folds: int | None = None,
+) -> dict[str, Any]:
+    """执行候选评估，并把阶段标签显式落到摘要里。"""
+    summary = run_feature_trial(
+        run_root=run_root,
+        experiment_index=experiment_index,
+        raw_df=raw_df,
+        variant_name=variant_name,
+        model_kind=model_kind,
+        label_transform=label_transform,
+        horizon_days=horizon_days,
+        max_folds=max_folds,
+    )
+    summary["stage"] = str(stage)
+    return summary
+
+
 def _extract_variant_payload(payload: dict[str, Any], *, variant_name: str) -> dict[str, Any]:
     """从 feature experiment payload 中取出指定 variant 的结果。"""
     for variant in payload.get("variants") or []:

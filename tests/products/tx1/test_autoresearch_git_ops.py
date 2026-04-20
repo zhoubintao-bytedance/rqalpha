@@ -27,9 +27,9 @@ def test_git_ops_lists_changed_paths_and_commits(monkeypatch, tmp_path):
 
     def _fake_run_git_command(*, workdir, args):
         calls.append((workdir, tuple(args)))
-        if args == ["diff", "--name-only", "--relative", "HEAD"]:
-            return "skyeye/products/tx1/dataset_builder.py\nskyeye/products/tx1/baseline_models.py\n"
-        if args == ["add", "-A"]:
+        if args == ["status", "--porcelain", "--untracked-files=all"]:
+            return " M skyeye/products/tx1/dataset_builder.py\n?? skyeye/products/tx1/new_factor.py\n"
+        if args == ["add", "--", "skyeye/products/tx1/dataset_builder.py", "skyeye/products/tx1/new_factor.py"]:
             return ""
         if args == ["commit", "-m", "exp: tune turnover"]:
             return "[tx1-autoresearch deadbee] exp: tune turnover\n"
@@ -39,16 +39,26 @@ def test_git_ops_lists_changed_paths_and_commits(monkeypatch, tmp_path):
 
     monkeypatch.setattr(git_ops, "_run_git_command", _fake_run_git_command)
 
-    changed = git_ops.list_changed_paths(tmp_path)
-    commit = git_ops.create_experiment_commit(tmp_path, "exp: tune turnover")
+    changed = git_ops.list_changed_paths(tmp_path, include_untracked=True)
+    commit = git_ops.create_experiment_commit(
+        tmp_path,
+        "exp: tune turnover",
+        allowed_paths=[
+            "skyeye/products/tx1/dataset_builder.py",
+            "skyeye/products/tx1/new_factor.py",
+        ],
+    )
 
     assert changed == [
         "skyeye/products/tx1/dataset_builder.py",
-        "skyeye/products/tx1/baseline_models.py",
+        "skyeye/products/tx1/new_factor.py",
     ]
     assert commit == "deadbee"
     assert calls[-3:] == [
-        (tmp_path, ("add", "-A")),
+        (
+            tmp_path,
+            ("add", "--", "skyeye/products/tx1/dataset_builder.py", "skyeye/products/tx1/new_factor.py"),
+        ),
         (tmp_path, ("commit", "-m", "exp: tune turnover")),
         (tmp_path, ("rev-parse", "--short", "HEAD")),
     ]
@@ -124,3 +134,19 @@ def test_git_ops_rolls_back_candidate_commit_to_start_commit(monkeypatch, tmp_pa
     git_ops.rollback_candidate_commit(tmp_path, "abc1234")
 
     assert calls == [("reset", "--hard", "abc1234")]
+
+
+def test_git_ops_flags_paths_outside_allowed_write_roots():
+    invalid = git_ops.assert_only_allowed_paths_changed(
+        changed_paths=[
+            "skyeye/products/tx1/dataset_builder.py",
+            "tasks/todo.md",
+        ],
+        allowed_write_roots=[
+            "skyeye/products/tx1/dataset_builder.py",
+            "skyeye/products/tx1/label_builder.py",
+        ],
+        read_only_roots=["skyeye/products/tx1/live_advisor/"],
+    )
+
+    assert invalid == ["tasks/todo.md"]

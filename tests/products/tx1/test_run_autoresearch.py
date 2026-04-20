@@ -1,5 +1,6 @@
 from skyeye.products.tx1 import run_autoresearch
 from skyeye.products.tx1.autoresearch import loop as autoresearch_loop
+from skyeye.products.tx1.autoresearch.state import AutoresearchStateStore
 
 
 def _allow_workspace_checks(monkeypatch):
@@ -124,7 +125,7 @@ def test_run_loop_initializes_state_with_git_metadata(monkeypatch, tmp_path):
         run_tag="demo",
         runs_root=tmp_path / "runs",
         workdir=repo_root,
-        max_experiments=2,
+        max_experiments=0,
         smoke_max_folds=1,
         full_max_folds=4,
     )
@@ -144,7 +145,7 @@ def test_run_loop_executes_baseline_trial_and_records_summary(monkeypatch, tmp_p
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
     monkeypatch.setattr(
         autoresearch_loop,
-        "run_feature_trial",
+        "run_baseline_trial",
         lambda **kwargs: {
             "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.01},
             "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08, "mean_turnover": 0.16},
@@ -168,7 +169,7 @@ def test_run_loop_executes_baseline_trial_and_records_summary(monkeypatch, tmp_p
         raw_df=object(),
         variant_name="baseline_5f",
         model_kind="linear",
-        max_experiments=2,
+        max_experiments=0,
         smoke_max_folds=1,
         full_max_folds=4,
     )
@@ -195,7 +196,7 @@ def test_run_loop_builds_raw_df_and_records_candidate_result(monkeypatch, tmp_pa
         captured["build_research_raw_df"] = dict(kwargs)
         return {"raw_df": "ok"}
 
-    def _fake_run_feature_trial(**kwargs):
+    def _fake_run_baseline_trial(**kwargs):
         captured["baseline_raw_df"] = kwargs["raw_df"]
         return {
             "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.01},
@@ -236,8 +237,14 @@ def test_run_loop_builds_raw_df_and_records_candidate_result(monkeypatch, tmp_pa
         }
 
     monkeypatch.setattr(autoresearch_loop, "build_research_raw_df", _fake_build_research_raw_df)
-    monkeypatch.setattr(autoresearch_loop, "run_feature_trial", _fake_run_feature_trial)
+    monkeypatch.setattr(autoresearch_loop, "run_baseline_trial", _fake_run_baseline_trial)
     monkeypatch.setattr(autoresearch_loop, "evaluate_current_candidate", _fake_evaluate_current_candidate)
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "detect_workspace_patch",
+        lambda workdir: {"changed_paths": ["skyeye/products/tx1/dataset_builder.py"]},
+        raising=False,
+    )
 
     result = autoresearch_loop.run_loop(
         run_tag="demo",
@@ -282,7 +289,7 @@ def test_run_loop_keeps_best_commit_when_candidate_is_discarded(monkeypatch, tmp
     monkeypatch.setattr(autoresearch_loop, "build_research_raw_df", lambda **kwargs: {"raw_df": "ok"})
     monkeypatch.setattr(
         autoresearch_loop,
-        "run_feature_trial",
+        "run_baseline_trial",
         lambda **kwargs: {
             "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.01},
             "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08, "mean_turnover": 0.16},
@@ -320,6 +327,12 @@ def test_run_loop_keeps_best_commit_when_candidate_is_discarded(monkeypatch, tmp
                 "experiment_path": str(tmp_path / "runs" / "demo" / "experiments" / "exp_0001"),
             },
         },
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "detect_workspace_patch",
+        lambda workdir: {"changed_paths": ["skyeye/products/tx1/dataset_builder.py"]},
+        raising=False,
     )
 
     result = autoresearch_loop.run_loop(
@@ -381,7 +394,7 @@ def test_run_loop_records_crash_when_candidate_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
     monkeypatch.setattr(
         autoresearch_loop,
-        "run_feature_trial",
+        "run_baseline_trial",
         lambda **kwargs: {
             "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08},
             "robustness": {"stability": {"stability_score": 61.0}},
@@ -392,6 +405,12 @@ def test_run_loop_records_crash_when_candidate_raises(monkeypatch, tmp_path):
         autoresearch_loop,
         "evaluate_current_candidate",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "detect_workspace_patch",
+        lambda workdir: {"changed_paths": ["skyeye/products/tx1/dataset_builder.py"]},
+        raising=False,
     )
 
     result = autoresearch_loop.run_loop(
@@ -417,7 +436,7 @@ def test_run_loop_keeps_best_commit_unchanged_for_keep(monkeypatch, tmp_path):
     monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
     monkeypatch.setattr(
         autoresearch_loop,
-        "run_feature_trial",
+        "run_baseline_trial",
         lambda **kwargs: {
             "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08},
             "robustness": {"stability": {"stability_score": 61.0}},
@@ -438,6 +457,12 @@ def test_run_loop_keeps_best_commit_unchanged_for_keep(monkeypatch, tmp_path):
             },
         },
     )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "detect_workspace_patch",
+        lambda workdir: {"changed_paths": ["skyeye/products/tx1/dataset_builder.py"]},
+        raising=False,
+    )
 
     result = autoresearch_loop.run_loop(
         run_tag="demo",
@@ -451,13 +476,124 @@ def test_run_loop_keeps_best_commit_unchanged_for_keep(monkeypatch, tmp_path):
     assert result["state"]["best_commit"] == "abc1234"
 
 
+def test_run_loop_returns_waiting_for_patch_when_workspace_has_no_candidate(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    _allow_workspace_checks(monkeypatch)
+    monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
+    monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "run_baseline_trial",
+        lambda **kwargs: {
+            "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.01},
+            "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08, "mean_turnover": 0.16},
+            "robustness": {
+                "stability": {"stability_score": 61.0, "cv": 0.5},
+                "overfit_flags": {
+                    "flag_ic_decay": False,
+                    "flag_spread_decay": False,
+                    "flag_val_dominant": False,
+                },
+                "regime_scores": {"metric_consistency": {"positive_ratio": 0.82}},
+            },
+            "experiment_path": str(tmp_path / "runs" / "demo" / "experiments" / "exp_0000"),
+        },
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "detect_workspace_patch",
+        lambda workdir: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "evaluate_current_candidate",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not evaluate candidate without patch")),
+    )
+
+    result = autoresearch_loop.run_loop(
+        run_tag="demo",
+        runs_root=tmp_path / "runs",
+        workdir=repo_root,
+        raw_df=object(),
+        max_experiments=2,
+    )
+
+    assert result["status"] == "waiting_for_patch"
+    assert result["state"]["last_status"] == "waiting_for_patch"
+    assert result["state"]["current_commit"] == "abc1234"
+
+
+def test_run_loop_resumes_from_current_commit_without_rerunning_baseline(monkeypatch, tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    run_root = tmp_path / "runs" / "demo"
+    store = AutoresearchStateStore(run_root)
+    state = store.initialize(
+        run_tag="demo",
+        baseline_commit="abc1234",
+        branch_name="tx1-autoresearch",
+        baseline_summary={
+            "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.01},
+            "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08, "mean_turnover": 0.16},
+            "robustness": {"stability": {"stability_score": 61.0, "cv": 0.5}},
+            "experiment_path": str(run_root / "experiments" / "exp_0000"),
+        },
+        budget={"max_experiments": 2, "smoke_max_folds": 1, "full_max_folds": 4},
+        raw_df_spec={"universe_size": 300, "start_date": "2020-01-01", "end_date": "2024-12-31"},
+        allowed_write_roots=["skyeye/products/tx1/dataset_builder.py"],
+        read_only_roots=["skyeye/products/tx1/live_advisor/"],
+    )
+    state["current_commit"] = "keep1234"
+    state["best_commit"] = "keep1234"
+    state["best_summary"] = dict(state["baseline_summary"])
+    state["next_experiment_index"] = 3
+    store.save(state)
+
+    calls = []
+    _allow_workspace_checks(monkeypatch)
+    monkeypatch.setattr(autoresearch_loop, "get_current_commit", lambda workdir: "abc1234")
+    monkeypatch.setattr(autoresearch_loop, "get_current_branch", lambda workdir: "tx1-autoresearch")
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "checkout_commit",
+        lambda workdir, commit: calls.append((workdir, commit)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "run_baseline_trial",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("resume should reuse existing baseline summary")),
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "detect_workspace_patch",
+        lambda workdir: None,
+        raising=False,
+    )
+
+    result = autoresearch_loop.run_loop(
+        run_tag="demo",
+        runs_root=tmp_path / "runs",
+        workdir=repo_root,
+        max_experiments=2,
+    )
+
+    assert calls == [(repo_root, "keep1234")]
+    assert result["status"] == "waiting_for_patch"
+    assert result["state"]["current_commit"] == "keep1234"
+    assert result["state"]["best_commit"] == "keep1234"
+
+
 def test_candidate_cycle_rejects_read_only_path_and_rolls_back(monkeypatch, tmp_path):
     calls = []
 
     monkeypatch.setattr(
         autoresearch_loop,
         "list_changed_paths",
-        lambda workdir: ["skyeye/products/tx1/live_advisor/service.py"],
+        lambda workdir, include_untracked=True: ["skyeye/products/tx1/live_advisor/service.py"],
     )
     monkeypatch.setattr(
         autoresearch_loop,
@@ -484,13 +620,53 @@ def test_candidate_cycle_rejects_read_only_path_and_rolls_back(monkeypatch, tmp_
     assert calls == [(tmp_path, "abc1234")]
 
 
+def test_candidate_cycle_rejects_path_outside_allowed_write_roots(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "list_changed_paths",
+        lambda workdir, include_untracked=True: ["tasks/todo.md"],
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "ensure_read_only_paths_untouched",
+        lambda changed_paths, read_only_roots: [],
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "assert_only_allowed_paths_changed",
+        lambda changed_paths, allowed_write_roots, read_only_roots: list(changed_paths),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        autoresearch_loop,
+        "rollback_candidate_commit",
+        lambda workdir, commit: calls.append((workdir, commit)),
+    )
+
+    result = autoresearch_loop.evaluate_current_candidate(
+        workdir=tmp_path,
+        run_root=tmp_path / "runs" / "demo",
+        start_commit="keep1234",
+        experiment_index=3,
+        raw_df=object(),
+        allowed_write_roots=["skyeye/products/tx1/dataset_builder.py"],
+    )
+
+    assert result["status"] == "invalid"
+    assert result["reason_code"] == "path_outside_allowed_write_roots"
+    assert result["changed_paths"] == ["tasks/todo.md"]
+    assert calls == [(tmp_path, "keep1234")]
+
+
 def test_candidate_cycle_discards_after_smoke_failure(monkeypatch, tmp_path):
     calls = []
 
     monkeypatch.setattr(
         autoresearch_loop,
         "list_changed_paths",
-        lambda workdir: ["skyeye/products/tx1/dataset_builder.py"],
+        lambda workdir, include_untracked=True: ["skyeye/products/tx1/dataset_builder.py"],
     )
     monkeypatch.setattr(
         autoresearch_loop,
@@ -500,11 +676,11 @@ def test_candidate_cycle_discards_after_smoke_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(
         autoresearch_loop,
         "create_experiment_commit",
-        lambda workdir, message: "def5678",
+        lambda workdir, message, allowed_paths=None: "def5678",
     )
     monkeypatch.setattr(
         autoresearch_loop,
-        "run_feature_trial",
+        "run_candidate_trial",
         lambda **kwargs: {
             "prediction": {"rank_ic_mean": 0.01, "top_bucket_spread_mean": 0.001},
             "portfolio": {"net_mean_return": -0.001, "max_drawdown": 0.20, "mean_turnover": 0.21},
@@ -523,7 +699,7 @@ def test_candidate_cycle_discards_after_smoke_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(
         autoresearch_loop,
         "judge_candidate",
-        lambda candidate_summary, baseline_summary, stage: {
+        lambda candidate_summary, baseline_summary, best_summary=None, stage="full": {
             "status": "discard",
             "reason_code": "guardrail_failed",
             "failed_guards": ["max_drawdown"],
@@ -558,7 +734,7 @@ def test_candidate_cycle_runs_full_trial_after_smoke_keep(monkeypatch, tmp_path)
     monkeypatch.setattr(
         autoresearch_loop,
         "list_changed_paths",
-        lambda workdir: ["skyeye/products/tx1/dataset_builder.py"],
+        lambda workdir, include_untracked=True: ["skyeye/products/tx1/dataset_builder.py"],
     )
     monkeypatch.setattr(
         autoresearch_loop,
@@ -568,10 +744,10 @@ def test_candidate_cycle_runs_full_trial_after_smoke_keep(monkeypatch, tmp_path)
     monkeypatch.setattr(
         autoresearch_loop,
         "create_experiment_commit",
-        lambda workdir, message: "def5678",
+        lambda workdir, message, allowed_paths=None: "def5678",
     )
 
-    def _fake_run_feature_trial(**kwargs):
+    def _fake_run_candidate_trial(**kwargs):
         smoke_call["count"] += 1
         if kwargs["max_folds"] == 1:
             return {
@@ -601,11 +777,11 @@ def test_candidate_cycle_runs_full_trial_after_smoke_keep(monkeypatch, tmp_path)
                 "regime_scores": {"metric_consistency": {"positive_ratio": 0.85}},
             },
             "experiment_path": str(tmp_path / "runs" / "demo" / "experiments" / "exp_0001"),
-        }
+            }
 
-    monkeypatch.setattr(autoresearch_loop, "run_feature_trial", _fake_run_feature_trial)
+    monkeypatch.setattr(autoresearch_loop, "run_candidate_trial", _fake_run_candidate_trial)
 
-    def _fake_judge(candidate_summary, baseline_summary, stage):
+    def _fake_judge(candidate_summary, baseline_summary, best_summary=None, stage="full"):
         if stage == "smoke":
             return {"status": "keep", "reason_code": "smoke_pass", "failed_guards": [], "score_delta": {}}
         return {"status": "champion", "reason_code": "full_improved", "failed_guards": [], "score_delta": {}}

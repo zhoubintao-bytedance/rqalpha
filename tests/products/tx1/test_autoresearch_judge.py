@@ -64,7 +64,12 @@ def test_judge_candidate_marks_champion_when_full_eval_is_more_robust_and_profit
         },
     }
 
-    decision = judge_candidate(candidate, baseline_summary=baseline, stage="full")
+    decision = judge_candidate(
+        candidate,
+        baseline_summary=baseline,
+        best_summary=baseline,
+        stage="full",
+    )
 
     assert decision["status"] == "champion"
     assert decision["reason_code"] == "full_improved"
@@ -99,8 +104,64 @@ def test_judge_candidate_never_promotes_smoke_result_to_champion():
         },
     }
 
-    decision = judge_candidate(candidate, baseline_summary=baseline, stage="smoke")
+    decision = judge_candidate(
+        candidate,
+        baseline_summary=baseline,
+        best_summary=baseline,
+        stage="smoke",
+    )
 
     assert decision["status"] == "keep"
     assert decision["reason_code"] == "smoke_pass"
 
+
+def test_judge_candidate_returns_keep_when_candidate_beats_baseline_but_not_best():
+    baseline = {
+        "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.010},
+        "portfolio": {"net_mean_return": 0.0015, "max_drawdown": 0.09, "mean_turnover": 0.18},
+        "robustness": {
+            "stability": {"stability_score": 58.0, "cv": 0.55},
+            "overfit_flags": {
+                "flag_ic_decay": False,
+                "flag_spread_decay": False,
+                "flag_val_dominant": False,
+            },
+            "regime_scores": {"metric_consistency": {"positive_ratio": 0.78}},
+        },
+    }
+    best = {
+        "prediction": {"rank_ic_mean": 0.07, "top_bucket_spread_mean": 0.013},
+        "portfolio": {"net_mean_return": 0.0025, "max_drawdown": 0.08, "mean_turnover": 0.16},
+        "robustness": {
+            "stability": {"stability_score": 65.0, "cv": 0.48},
+            "overfit_flags": {
+                "flag_ic_decay": False,
+                "flag_spread_decay": False,
+                "flag_val_dominant": False,
+            },
+            "regime_scores": {"metric_consistency": {"positive_ratio": 0.85}},
+        },
+    }
+    candidate = {
+        "prediction": {"rank_ic_mean": 0.06, "top_bucket_spread_mean": 0.012},
+        "portfolio": {"net_mean_return": 0.0021, "max_drawdown": 0.08, "mean_turnover": 0.16},
+        "robustness": {
+            "stability": {"stability_score": 62.0, "cv": 0.50},
+            "overfit_flags": {
+                "flag_ic_decay": False,
+                "flag_spread_decay": False,
+                "flag_val_dominant": False,
+            },
+            "regime_scores": {"metric_consistency": {"positive_ratio": 0.82}},
+        },
+    }
+
+    decision = judge_candidate(
+        candidate,
+        baseline_summary=baseline,
+        best_summary=best,
+        stage="full",
+    )
+
+    assert decision["status"] == "keep"
+    assert decision["reason_code"] == "full_pass_not_best"

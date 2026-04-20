@@ -979,3 +979,55 @@
   - top 桶历史 OOS：`win_rate=48.1%`、`mean_return=+1.08%`、`median_return=-0.32%`，更像右偏收益排序器，不是高胜率信号
   - 近端 canary 窗口 `2025-12-10 ~ 2026-03-13`：`win_rate=53.1%`、`mean_return=+1.26%`、`median_return=+0.50%`
   - `portfolio_advice.rebalance_due=true`，默认给出 `25` 只股票等权 `4%` 的建仓目标，`estimated_turnover=50%`
+
+# TX1 autoresearch A1 多轮编排改造
+
+- [x] 建立隔离 worktree，并验证 autoresearch 现有定向测试基线通过
+- [x] 扩展 `tasks/todo.md`，落盘本次 A1 实施计划与验证口径
+- [x] 先补失败测试，锁定多轮 loop / resume / waiting_for_patch / allowed-write / parent rollback / baseline-vs-best judge 行为
+- [x] 改造 `skyeye/products/tx1/autoresearch/state.py`，补齐 run state、ledger 字段和 `results.tsv` 扩列
+- [x] 改造 `skyeye/products/tx1/autoresearch/git_ops.py`，实现 allowed-write 审计、未跟踪文件检测、parent commit 回滚和受限 commit
+- [x] 改造 `skyeye/products/tx1/autoresearch/runner.py`，显式化 baseline / smoke / full 执行协议并固定 run 预算
+- [x] 改造 `skyeye/products/tx1/autoresearch/judge.py`，支持 baseline + best 双比较，区分 `keep` / `champion` / `discard`
+- [x] 新增 `skyeye/products/tx1/autoresearch/patch_source.py`，抽象外部 patch 探测接口
+- [x] 改造 `skyeye/products/tx1/autoresearch/loop.py` 和 `skyeye/products/tx1/run_autoresearch.py`，落地可续跑的状态机式多轮 orchestrator
+- [x] 运行 autoresearch 定向测试，确认新状态机与 git 语义通过
+- [x] 运行 TX1 研究侧核心回归：`test_dataset_builder.py`、`test_label_builder.py`、`test_baseline_models.py`、`test_run_feature_experiment.py`、`test_run_baseline_experiment.py`、`test_robustness.py`、`test_persistence.py`
+- [ ] 运行真实 smoke 验证：baseline 产物、劣化 patch discard 回滚、改进 patch keep/champion 推进
+
+## Review
+
+- 已把 TX1 autoresearch 从“一次 baseline + 一次 current candidate”抬到 A1 版本的可续跑编排器：
+  - `state.py` 现记录 `budget / raw_df_spec / allowed_write_roots / read_only_roots / frontier_commits / next_experiment_index / last_attempt`
+  - `results.tsv` 扩列到 `reason_code / experiment_index / parent_commit / stage_reached`
+  - `git_ops.py` 现支持未跟踪文件检测、受限 path staging、allowed-write 白名单审计、`checkout_commit`
+  - `judge.py` 现支持 `baseline_summary + best_summary` 双比较，full 阶段可区分 `keep` 与 `champion`
+  - `loop.py` 现支持新 run / resume、`waiting_for_patch`、parent commit 语义和外部 patch source 抽象
+  - 新增 `patch_source.py`，把 workspace patch 探测从 loop 里拆出
+- 额外修正了一条与 autoresearch 改造无关但会卡住核心回归的环境耦合测试：
+  - `tests/products/tx1/test_run_baseline_experiment.py::test_data_facade_get_factor_raises_quota_exceeded`
+  - 根因是测试误用了真实本地 cache，命中缓存时不会走 fake provider；现已显式禁用 cache，使测试与机器状态解耦
+- 验证证据：
+  - autoresearch 全套：`env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_autoresearch_state.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_git_ops.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_run_autoresearch.py -q`
+  - 结果：`37 passed`
+  - TX1 研究侧核心回归：`env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_dataset_builder.py tests/products/tx1/test_label_builder.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_robustness.py tests/products/tx1/test_persistence.py -q`
+  - 结果：`66 passed`
+- 尚未执行真实 smoke CLI 验证：
+  - 当前 worktree 带着本次实现改动，直接跑 `run_autoresearch` 会命中 `worktree_not_clean`
+  - 若要做这一步，需要再起一个独立 clean worktree，把当前改动补丁化后落进去，再构造一正一负两类 candidate patch
+
+# TX1 autoresearch A1 合入 master
+
+- [x] 复核 `master` 与 `tx1-autoresearch-a1` 的 git 状态、worktree 关系和本地脏改动边界
+- [x] 在 `tx1-autoresearch-a1` 运行新鲜定向验证，确认 feature tip 可合入
+- [ ] 提交 `tx1-autoresearch-a1` 当前改动，生成可合并提交
+- [ ] 将 feature 提交合入当前 `master`，避免覆盖 `master` 现有未跟踪文件
+- [ ] 在 `master` 上复测关键 autoresearch / TX1 研究侧回归
+
+## Review
+
+- 新鲜验证证据：
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_autoresearch_state.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_git_ops.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_run_autoresearch.py -q`
+  - 结果：`37 passed, 1 warning`
+  - `env MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD pytest tests/products/tx1/test_dataset_builder.py tests/products/tx1/test_label_builder.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_robustness.py tests/products/tx1/test_persistence.py -q`
+  - 结果：`66 passed, 1 warning`

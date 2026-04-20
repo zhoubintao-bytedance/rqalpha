@@ -18,6 +18,7 @@ def judge_candidate(
     candidate_summary: dict[str, Any] | None,
     *,
     baseline_summary: dict[str, Any] | None = None,
+    best_summary: dict[str, Any] | None = None,
     stage: str = "full",
     guardrails: dict[str, float] | None = None,
 ) -> dict[str, Any]:
@@ -34,6 +35,7 @@ def judge_candidate(
     limits.update(guardrails or {})
     failed_guards = _collect_failed_guards(candidate_summary, limits)
     baseline_summary = dict(baseline_summary or {})
+    best_summary = dict(best_summary or baseline_summary)
 
     if failed_guards:
         return {
@@ -41,9 +43,11 @@ def judge_candidate(
             "reason_code": "guardrail_failed",
             "failed_guards": failed_guards,
             "score_delta": _build_score_delta(candidate_summary, baseline_summary),
+            "best_score_delta": _build_score_delta(candidate_summary, best_summary),
         }
 
     score_delta = _build_score_delta(candidate_summary, baseline_summary)
+    best_score_delta = _build_score_delta(candidate_summary, best_summary)
     stage_name = str(stage).strip().lower()
     if stage_name == "smoke":
         return {
@@ -51,19 +55,24 @@ def judge_candidate(
             "reason_code": "smoke_pass",
             "failed_guards": [],
             "score_delta": score_delta,
+            "best_score_delta": best_score_delta,
         }
 
-    improved = (
-        score_delta["net_mean_return"] > 0.0
-        and score_delta["max_drawdown"] <= 0.0
-        and score_delta["stability_score"] >= 0.0
-    )
-    if improved:
+    if _materially_improves(score_delta):
+        if _materially_improves(best_score_delta):
+            return {
+                "status": "champion",
+                "reason_code": "full_improved",
+                "failed_guards": [],
+                "score_delta": score_delta,
+                "best_score_delta": best_score_delta,
+            }
         return {
-            "status": "champion",
-            "reason_code": "full_improved",
+            "status": "keep",
+            "reason_code": "full_pass_not_best",
             "failed_guards": [],
             "score_delta": score_delta,
+            "best_score_delta": best_score_delta,
         }
 
     return {
@@ -71,6 +80,7 @@ def judge_candidate(
         "reason_code": "no_material_improvement",
         "failed_guards": [],
         "score_delta": score_delta,
+        "best_score_delta": best_score_delta,
     }
 
 
@@ -117,6 +127,15 @@ def _build_score_delta(candidate: dict[str, Any], baseline: dict[str, Any]) -> d
     }
 
 
+def _materially_improves(score_delta: dict[str, float]) -> bool:
+    """判断候选是否在收益和稳健性上形成材料性改进。"""
+    return (
+        score_delta["net_mean_return"] > 0.0
+        and score_delta["max_drawdown"] <= 0.0
+        and score_delta["stability_score"] >= 0.0
+    )
+
+
 def _metric(payload: dict[str, Any], *keys: str, default: Any = 0.0) -> Any:
     """安全读取嵌套指标，缺失时返回默认值。"""
     current: Any = payload
@@ -127,4 +146,3 @@ def _metric(payload: dict[str, Any], *keys: str, default: Any = 0.0) -> Any:
         if current is None:
             return default
     return current
-

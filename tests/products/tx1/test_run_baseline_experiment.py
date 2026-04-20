@@ -293,6 +293,7 @@ def test_data_facade_get_factor_raises_quota_exceeded(monkeypatch):
 
     facade = DataFacade()
     facade.provider = FakeProvider()
+    facade.cache_store = None
 
     with pytest.raises(QuotaExceeded):
         facade.get_factor(["000001.XSHE"], ["ep_ratio_ttm"], "2026-03-01", "2026-03-31")

@@ -9,7 +9,8 @@ from typing import Any
 
 
 RESULTS_TSV_HEADER = (
-    "commit\tstatus\tnet_mean_return\tmax_drawdown\tstability_score\tdescription\texperiment_path"
+    "commit\tstatus\tnet_mean_return\tmax_drawdown\tstability_score\treason_code\t"
+    "experiment_path\texperiment_index\tparent_commit\tstage_reached"
 )
 
 
@@ -29,6 +30,10 @@ class AutoresearchStateStore(object):
         baseline_commit: str,
         branch_name: str,
         baseline_summary: dict[str, Any] | None = None,
+        budget: dict[str, Any] | None = None,
+        raw_df_spec: dict[str, Any] | None = None,
+        allowed_write_roots: list[str] | None = None,
+        read_only_roots: list[str] | None = None,
     ) -> dict[str, Any]:
         """初始化 run 根目录、state.json 与 results.tsv。"""
         self.run_root.mkdir(parents=True, exist_ok=True)
@@ -40,11 +45,26 @@ class AutoresearchStateStore(object):
             "best_commit": str(baseline_commit),
             "baseline_summary": dict(baseline_summary or {}),
             "best_summary": dict(baseline_summary or {}),
+            "frontier_commits": [],
+            "next_experiment_index": 0,
             "experiment_count": 0,
+            "budget": dict(budget or {}),
+            "raw_df_spec": dict(raw_df_spec or {}),
+            "allowed_write_roots": list(allowed_write_roots or []),
+            "read_only_roots": list(read_only_roots or []),
             "last_status": "initialized",
             "last_reason_code": None,
             "last_experiment_path": "",
             "last_error": None,
+            "last_attempt": {
+                "experiment_index": None,
+                "parent_commit": None,
+                "candidate_commit": None,
+                "status": None,
+                "reason_code": None,
+                "stage_reached": "",
+                "experiment_path": "",
+            },
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         }
@@ -68,10 +88,13 @@ class AutoresearchStateStore(object):
     def append_result(
         self,
         *,
+        experiment_index: int,
+        parent_commit: str,
         commit: str,
         status: str,
+        stage_reached: str,
         metrics: dict[str, Any] | None,
-        description: str,
+        reason_code: str,
         experiment_path: str | Path,
     ) -> None:
         """向 results.tsv 追加一行实验摘要，便于快速筛选。"""
@@ -82,8 +105,11 @@ class AutoresearchStateStore(object):
             self._format_metric(metrics.get("net_mean_return")),
             self._format_metric(metrics.get("max_drawdown")),
             self._format_metric(metrics.get("stability_score")),
-            str(description),
+            str(reason_code),
             str(experiment_path),
+            str(int(experiment_index)),
+            str(parent_commit),
+            str(stage_reached),
         ]
         with self.results_path.open("a", encoding="utf-8") as handle:
             handle.write("\t".join(row) + "\n")
@@ -91,19 +117,32 @@ class AutoresearchStateStore(object):
     def update_after_decision(
         self,
         *,
+        experiment_index: int,
         decision_status: str,
+        parent_commit: str,
         commit: str,
         candidate_summary: dict[str, Any] | None,
+        stage_reached: str,
         reason_code: str | None = None,
         error_message: str | None = None,
     ) -> dict[str, Any]:
         """根据 keep/discard/champion 等决策推进 state。"""
         state = self.load()
         state["experiment_count"] = int(state.get("experiment_count", 0)) + 1
+        state["next_experiment_index"] = max(int(state.get("next_experiment_index", 0)), int(experiment_index) + 1)
         state["last_status"] = str(decision_status)
         state["last_reason_code"] = reason_code
         state["last_experiment_path"] = str((candidate_summary or {}).get("experiment_path", ""))
         state["last_error"] = error_message
+        state["last_attempt"] = {
+            "experiment_index": int(experiment_index),
+            "parent_commit": str(parent_commit),
+            "candidate_commit": str(commit),
+            "status": str(decision_status),
+            "reason_code": reason_code,
+            "stage_reached": str(stage_reached),
+            "experiment_path": str((candidate_summary or {}).get("experiment_path", "")),
+        }
         if decision_status in {"keep", "champion"}:
             # 被保留的候选可以推进当前工作基线，后续 patch 会在它的基础上继续演化。
             state["current_commit"] = str(commit)
