@@ -58,3 +58,35 @@ def test_main_runs_multi_output_research_mode(make_raw_panel, tmp_path):
     assert predictions_df["prediction_mdd"].notna().all()
     assert predictions_df["reliability_score"].between(0.0, 1.0).all()
     assert result["output_dir"].endswith("tx1_multi_output")
+
+
+def test_main_accepts_explicit_feature_list(make_raw_panel):
+    raw_df = make_raw_panel(periods=2200)
+
+    result = main(
+        {
+            "model": {"kind": "linear"},
+            "features": [
+                "mom_40d",
+                "volatility_20d",
+                "reversal_5d",
+                "mom_20d",
+            ],
+        },
+        raw_df=raw_df,
+    )
+
+    assert result["feature_columns"] == [
+        "mom_40d",
+        "volatility_20d",
+        "reversal_5d",
+        "mom_20d",
+    ]
+
+
+def test_main_respects_max_folds(make_raw_panel):
+    raw_df = make_raw_panel(periods=2200)
+
+    result = main({"model": {"kind": "linear"}}, raw_df=raw_df, max_folds=2)
+
+    assert len(result["fold_results"]) == 2

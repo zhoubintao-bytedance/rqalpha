@@ -61,10 +61,23 @@ class ExperimentRunner(object):
             }
         return specs
 
-    def run(self, raw_df, output_dir=None):
+    def _resolve_feature_columns(self, dataset):
+        """解析本轮实验真正要使用的特征列，保留历史上的“缺列即跳过”兼容语义。"""
+        configured = list(self.config.get("features") or FEATURE_COLUMNS)
+        available = [column for column in configured if column in dataset.columns]
+        if not available:
+            raise ValueError("no feature columns configured for experiment")
+        return available
+
+    def run(self, raw_df, output_dir=None, max_folds=None):
         dataset = self.dataset_builder.build(raw_df)
+        # 先在完整数据集上锁定特征列，避免不同 fold 因缺列而隐式漂移。
+        feature_cols = self._resolve_feature_columns(dataset)
         labeled = self.label_builder.build(dataset)
         folds = self.splitter.split(labeled)
+        if max_folds is not None:
+            # autoresearch 的 smoke/full 预算需要真实落到 fold 数上，否则夜跑时长不可控。
+            folds = folds[: int(max_folds)]
         fold_results = []
         cost_config = self._build_cost_config()
         portfolio_builder = PortfolioProxy(
@@ -80,9 +93,6 @@ class ExperimentRunner(object):
             train_df = fold["train_df"].copy()
             val_df = fold["val_df"].copy()
             test_df = fold["test_df"].copy()
-
-            # Derive feature columns from what the dataset actually contains
-            feature_cols = [c for c in FEATURE_COLUMNS if c in train_df.columns]
 
             # Preprocessing inside fold to prevent data leakage
             if self.preprocessor is not None:
@@ -185,6 +195,7 @@ class ExperimentRunner(object):
             "model_kind": self.config["model"]["kind"],
             "model_heads": list(head_specs.keys()),
             "prediction_columns": list(PREDICTION_OUTPUT_COLUMNS),
+            "feature_columns": list(feature_cols),
             "fold_results": fold_results,
             "aggregate_metrics": aggregate,
         }

@@ -101,6 +101,36 @@ def test_run_autoresearch_main_passes_execution_flags_to_loop(monkeypatch, tmp_p
     assert captured["horizon_days"] == 20
 
 
+def test_run_autoresearch_main_dispatches_catalog_search(monkeypatch, tmp_path):
+    captured = {}
+
+    def _fake_run_catalog_search(**kwargs):
+        captured.update(kwargs)
+        return {
+            "run_tag": kwargs["run_tag"],
+            "status": "completed",
+        }
+
+    monkeypatch.setattr(run_autoresearch, "run_catalog_search", _fake_run_catalog_search)
+
+    rc = run_autoresearch.main(
+        [
+            "--run-tag",
+            "demo",
+            "--runs-root",
+            str(tmp_path),
+            "--search-catalog",
+            "risk_reward_v1",
+            "--max-experiments",
+            "2",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["catalog_name"] == "risk_reward_v1"
+    assert captured["max_experiments"] == 2
+
+
 def test_run_autoresearch_main_returns_nonzero_for_invalid(monkeypatch, tmp_path):
     monkeypatch.setattr(
         run_autoresearch,

@@ -8,7 +8,7 @@ from skyeye.products.tx1.preprocessor import FeaturePreprocessor
 from skyeye.products.tx1.splitter import WalkForwardSplitter
 
 
-def main(config=None, raw_df=None, output_dir=None):
+def main(config=None, raw_df=None, output_dir=None, max_folds=None):
     cfg = normalize_config(config)
     if raw_df is None:
         raise ValueError("raw_df is required for the phase-1 TX1 research runner")
@@ -51,4 +51,4 @@ def main(config=None, raw_df=None, output_dir=None):
         ),
         preprocessor=preprocessor,
     )
-    return runner.run(raw_df, output_dir=output_dir)
+    return runner.run(raw_df, output_dir=output_dir, max_folds=max_folds)

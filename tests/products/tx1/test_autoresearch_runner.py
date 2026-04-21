@@ -9,6 +9,14 @@ def test_runner_builds_dedicated_experiment_path(tmp_path):
     assert path == run_root / "experiments" / "exp_0007"
 
 
+def test_runner_builds_stage_specific_experiment_path(tmp_path):
+    run_root = tmp_path / "tx1_run"
+
+    path = runner.build_stage_experiment_root(run_root, experiment_index=7, stage="full")
+
+    assert path == run_root / "experiments" / "exp_0007" / "full"
+
+
 def test_runner_loads_summary_from_experiment_result():
     result = {
         "output_dir": "/tmp/demo_exp",
@@ -179,3 +187,46 @@ def test_runner_builds_research_raw_df_from_universe_and_date_window(monkeypatch
         "start_date": "2020-01-01",
         "end_date": "2024-12-31",
     }
+
+
+def test_runner_runs_config_trial_and_returns_summary(monkeypatch, tmp_path):
+    captured = {}
+
+    def _fake_tx1_main(*, config, raw_df, output_dir, max_folds=None):
+        captured["config"] = config
+        captured["raw_df"] = raw_df
+        captured["output_dir"] = output_dir
+        captured["max_folds"] = max_folds
+        return {
+            "output_dir": output_dir,
+            "aggregate_metrics": {
+                "prediction": {"rank_ic_mean": 0.05, "top_bucket_spread_mean": 0.01},
+                "portfolio": {"net_mean_return": 0.002, "max_drawdown": 0.08, "mean_turnover": 0.16},
+                "robustness": {
+                    "stability": {"stability_score": 60.0, "cv": 0.5},
+                    "overfit_flags": {
+                        "flag_ic_decay": False,
+                        "flag_spread_decay": False,
+                        "flag_val_dominant": False,
+                    },
+                    "regime_scores": {"metric_consistency": {"positive_ratio": 0.8}},
+                },
+            },
+        }
+
+    monkeypatch.setattr(runner, "tx1_main", _fake_tx1_main)
+
+    summary = runner.run_config_trial(
+        run_root=tmp_path / "tx1_run",
+        experiment_index=2,
+        raw_df={"raw_df": "ok"},
+        config={"features": ["mom_40d"]},
+        stage="full",
+        max_folds=3,
+    )
+
+    assert captured["config"]["features"] == ["mom_40d"]
+    assert captured["raw_df"] == {"raw_df": "ok"}
+    assert captured["max_folds"] == 3
+    assert captured["output_dir"].endswith("exp_0002/full")
+    assert summary["experiment_path"].endswith("exp_0002/full")

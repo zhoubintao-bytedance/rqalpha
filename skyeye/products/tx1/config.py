@@ -7,6 +7,7 @@ DEFAULT_CONFIG = {
     "dataset": {
         "input_window": 60,
     },
+    "features": None,
     "labels": {
         "horizon": 20,
         "transform": "rank",
@@ -76,6 +77,28 @@ FROZEN_INPUT_WINDOW = 60
 FROZEN_HORIZON = 20
 
 
+def _normalize_features(features):
+    """规范化显式特征列表，保留顺序并移除重复项。"""
+    if features is None:
+        return None
+    if not isinstance(features, (list, tuple)):
+        raise ValueError("features must be a list or tuple of feature names")
+
+    normalized = []
+    for feature in features:
+        if not isinstance(feature, str):
+            raise ValueError("feature names must be strings")
+        name = feature.strip()
+        if not name:
+            raise ValueError("feature names must not be empty")
+        if name not in normalized:
+            normalized.append(name)
+
+    if not normalized:
+        raise ValueError("features must not be empty")
+    return normalized
+
+
 def _deep_update(base, override):
     result = deepcopy(base)
     for key, value in (override or {}).items():
@@ -88,6 +111,7 @@ def _deep_update(base, override):
 
 def normalize_config(config=None):
     cfg = _deep_update(DEFAULT_CONFIG, config or {})
+    cfg["features"] = _normalize_features(cfg.get("features"))
     model_kind = cfg["model"]["kind"]
     if model_kind not in VALID_MODEL_KINDS:
         raise ValueError("unsupported model kind: {}".format(model_kind))

@@ -1043,3 +1043,41 @@
 - 清理结果：
   - 已删除 worktree：`/home/tiger/rqalpha/.worktrees/tx1-autoresearch-a1`
   - 已删除分支：`tx1-autoresearch-a1`
+
+# TX1 autoresearch 风险收益优化
+
+- [x] 梳理 TX1 当前默认线、历史实验结果与 autoresearch 现状约束
+- [x] 确认本轮主问题：现有 autoresearch 只会评估当前 patch，不会自动生成候选
+- [x] 确认本轮主方向：围绕低回撤/高收益目标，优先探索流动性增强、稳健组合层和轻量风险约束
+- [x] 扩展 TX1 研究 runner，使候选特征集合可配置并能落成真实实验产物
+- [x] 扩展 autoresearch，新增可夜跑的候选 catalog 搜索模式与结果记账
+- [x] 调整 judge 到 TX1 真实分布可用的基线相对 guardrail，避免默认线同量级候选被全部误杀
+- [x] 补充/更新定向测试，覆盖新配置通路、catalog 搜索和 judge 动态门槛
+- [x] 跑 TX1 定向回归并记录证据
+- [x] 启动一轮真实 autoresearch catalog 搜索，产出 leaderboard 与 champion 候选
+- [ ] 启动一轮最多 45 分钟的 focused retry，围绕更值得尝试的方向追加验证
+
+## Review
+
+- 本次实现把 TX1 autoresearch 从“只能评估当前 workspace patch”扩成了“可直接跑真实候选 catalog 搜索”的可夜跑版本：
+  - `main.py` / `experiment_runner.py` 新增显式 `features` 与 `max_folds` 通路，候选特征集不再被全局 `baseline_5f` 锁死，且 smoke/full 预算终于真正落到 fold 数上
+  - `skyeye/products/tx1/autoresearch/catalog.py` 新增 `risk_reward_v1` 候选 catalog，围绕 `baseline_5f`、`liquidity_plus`、更慢组合层和轻量风险辅助头展开
+  - `skyeye/products/tx1/autoresearch/search.py` 新增 catalog 搜索编排，落盘 `catalog_results.json` 与 `catalog_leaderboard.tsv`
+  - `judge.py` 新增基线相对 guardrail，修正了 TX1 默认线低稳定分/high-CV 真实分布下“所有候选都被绝对门槛误杀”的问题
+- 新增/更新回归覆盖：
+  - `tests/products/tx1/test_config.py`
+  - `tests/products/tx1/test_main.py`
+  - `tests/products/tx1/test_autoresearch_runner.py`
+  - `tests/products/tx1/test_autoresearch_judge.py`
+  - `tests/products/tx1/test_autoresearch_search.py`
+  - `tests/products/tx1/test_run_autoresearch.py`
+- 验证证据：
+  - 定向回归：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_config.py tests/products/tx1/test_main.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_search.py tests/products/tx1/test_run_autoresearch.py -q`
+  - 结果：`43 passed`
+  - 扩大回归：`env PYTHONPATH=$PWD pytest tests/products/tx1/test_config.py tests/products/tx1/test_main.py tests/products/tx1/test_baseline_models.py tests/products/tx1/test_preprocessor.py tests/products/tx1/test_run_feature_experiment.py tests/products/tx1/test_run_baseline_experiment.py tests/products/tx1/test_persistence.py tests/products/tx1/test_robustness.py tests/products/tx1/test_autoresearch_state.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_autoresearch_git_ops.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_autoresearch_search.py tests/products/tx1/test_run_autoresearch.py -q`
+  - 结果：`113 passed`
+- 已启动真实夜跑：
+  - 运行标签：`20260421_catalog_overnight_v1`
+  - 命令：`env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_MAX_THREADS=4 MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD python -u -m skyeye.products.tx1.run_autoresearch --run-tag 20260421_catalog_overnight_v1 --runs-root skyeye/artifacts/experiments/tx1_autoresearch --search-catalog risk_reward_v1 --max-experiments 5 --smoke-max-folds 1 --full-max-folds 4 --model-kind lgbm`
+  - 当前产物目录：`skyeye/artifacts/experiments/tx1_autoresearch/20260421_catalog_overnight_v1/`
+  - 当前运行进程：`python -u -m skyeye.products.tx1.run_autoresearch ... --run-tag 20260421_catalog_overnight_v1 ...`

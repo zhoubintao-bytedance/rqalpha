@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from skyeye.products.tx1.autoresearch.catalog import DEFAULT_CATALOG_NAME
 from skyeye.products.tx1.autoresearch.loop import run_loop
+from skyeye.products.tx1.autoresearch.search import run_catalog_search
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-kind", choices=["linear", "tree", "lgbm"], default="lgbm", help="候选评估使用的模型类型")
     parser.add_argument("--label-transform", choices=["raw", "rank", "quantile"], default="rank", help="标签变换方式")
     parser.add_argument("--horizon-days", type=int, default=20, help="标签 horizon 天数")
+    parser.add_argument(
+        "--search-catalog",
+        default=None,
+        help="可选，运行无需 workspace patch 的候选 catalog 搜索；默认 catalog 为 {}".format(DEFAULT_CATALOG_NAME),
+    )
     return parser
 
 
@@ -38,22 +45,39 @@ def main(argv=None) -> int:
     """解析 CLI 参数并启动 autoresearch 主循环。"""
     parser = build_parser()
     args = parser.parse_args(argv)
-    result = run_loop(
-        run_tag=args.run_tag,
-        runs_root=Path(args.runs_root),
-        build_raw_df_for_run=bool(args.build_raw_df),
-        evaluate_current=bool(args.evaluate_current),
-        universe_size=int(args.universe_size),
-        start_date=args.start_date,
-        end_date=args.end_date,
-        variant_name=args.variant_name,
-        model_kind=args.model_kind,
-        label_transform=args.label_transform,
-        horizon_days=int(args.horizon_days),
-        max_experiments=args.max_experiments,
-        smoke_max_folds=args.smoke_max_folds,
-        full_max_folds=args.full_max_folds,
-    )
+    if args.search_catalog is not None:
+        catalog_name = args.search_catalog or DEFAULT_CATALOG_NAME
+        result = run_catalog_search(
+            run_tag=args.run_tag,
+            runs_root=Path(args.runs_root),
+            universe_size=int(args.universe_size),
+            start_date=args.start_date,
+            end_date=args.end_date,
+            catalog_name=catalog_name,
+            model_kind=args.model_kind,
+            label_transform=args.label_transform,
+            horizon_days=int(args.horizon_days),
+            max_experiments=args.max_experiments,
+            smoke_max_folds=args.smoke_max_folds,
+            full_max_folds=args.full_max_folds,
+        )
+    else:
+        result = run_loop(
+            run_tag=args.run_tag,
+            runs_root=Path(args.runs_root),
+            build_raw_df_for_run=bool(args.build_raw_df),
+            evaluate_current=bool(args.evaluate_current),
+            universe_size=int(args.universe_size),
+            start_date=args.start_date,
+            end_date=args.end_date,
+            variant_name=args.variant_name,
+            model_kind=args.model_kind,
+            label_transform=args.label_transform,
+            horizon_days=int(args.horizon_days),
+            max_experiments=args.max_experiments,
+            smoke_max_folds=args.smoke_max_folds,
+            full_max_folds=args.full_max_folds,
+        )
     status = str(result.get("status") or "ok")
     if status in {"invalid", "crash"}:
         return 2

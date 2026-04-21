@@ -31,11 +31,10 @@ def judge_candidate(
             "score_delta": {},
         }
 
-    limits = dict(DEFAULT_GUARDRAILS)
-    limits.update(guardrails or {})
-    failed_guards = _collect_failed_guards(candidate_summary, limits)
     baseline_summary = dict(baseline_summary or {})
     best_summary = dict(best_summary or baseline_summary)
+    limits = _resolve_guardrails(baseline_summary=baseline_summary, guardrails=guardrails)
+    failed_guards = _collect_failed_guards(candidate_summary, limits)
 
     if failed_guards:
         return {
@@ -104,6 +103,37 @@ def _collect_failed_guards(summary: dict[str, Any], limits: dict[str, float]) ->
     if _metric(summary, "robustness", "overfit_flags", "flag_val_dominant", default=False):
         failed.append("flag_val_dominant")
     return failed
+
+
+def _resolve_guardrails(
+    *,
+    baseline_summary: dict[str, Any],
+    guardrails: dict[str, float] | None,
+) -> dict[str, float]:
+    """把默认 guardrail 和基线相对 guardrail 合并成真实可用的门槛。"""
+    limits = dict(DEFAULT_GUARDRAILS)
+    limits.update(guardrails or {})
+    if not baseline_summary:
+        return limits
+
+    baseline_stability = float(_metric(baseline_summary, "robustness", "stability", "stability_score"))
+    baseline_cv = float(_metric(baseline_summary, "robustness", "stability", "cv"))
+    baseline_positive_ratio = float(
+        _metric(baseline_summary, "robustness", "regime_scores", "metric_consistency", "positive_ratio")
+    )
+
+    # TX1 当前默认线本身就处在“低稳定分、高 CV”的真实分布里。
+    # 如果还坚持绝对门槛，autoresearch 会把所有同量级候选都误判为 invalid。
+    limits["stability_score"] = min(
+        limits["stability_score"],
+        max(10.0, baseline_stability * 0.85),
+    )
+    limits["cv"] = max(limits["cv"], baseline_cv + 0.15)
+    limits["positive_ratio"] = max(
+        min(limits["positive_ratio"], baseline_positive_ratio),
+        baseline_positive_ratio - 0.10,
+    )
+    return limits
 
 
 def _build_score_delta(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, float]:

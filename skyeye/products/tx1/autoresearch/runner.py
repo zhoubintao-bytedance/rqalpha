@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from skyeye.products.tx1.main import main as tx1_main
 from skyeye.products.tx1.persistence import load_experiment
 from skyeye.products.tx1.robustness import summarize_experiment
 from skyeye.products.tx1.run_baseline_experiment import _get_liquid_universe, build_raw_df
@@ -19,6 +21,14 @@ def build_run_root(runs_root: str | Path, run_tag: str) -> Path:
 def build_experiment_root(run_root: str | Path, experiment_index: int) -> Path:
     """为单次实验分配独立产物目录，避免覆盖历史结果。"""
     return Path(run_root).resolve() / "experiments" / "exp_{:04d}".format(int(experiment_index))
+
+
+def build_stage_experiment_root(run_root: str | Path, experiment_index: int, stage: str | None = None) -> Path:
+    """在同一实验编号下给 smoke/full 分配独立子目录。"""
+    root = build_experiment_root(run_root, experiment_index=experiment_index)
+    if not stage:
+        return root
+    return root / str(stage)
 
 
 def build_research_raw_df(
@@ -148,6 +158,34 @@ def run_candidate_trial(
         max_folds=max_folds,
     )
     summary["stage"] = str(stage)
+    return summary
+
+
+def run_config_trial(
+    *,
+    run_root: str | Path,
+    experiment_index: int,
+    raw_df,
+    config: dict[str, Any],
+    stage: str | None = None,
+    max_folds: int | None = None,
+) -> dict[str, Any]:
+    """按显式 config 执行一次真实 TX1 实验，并返回标准摘要。"""
+    experiment_root = build_stage_experiment_root(
+        run_root,
+        experiment_index=experiment_index,
+        stage=stage,
+    )
+    payload = tx1_main(
+        config=deepcopy(config),
+        raw_df=raw_df,
+        output_dir=str(experiment_root),
+        max_folds=max_folds,
+    )
+    summary = load_summary_from_experiment_result(payload)
+    summary["experiment_path"] = str(experiment_root)
+    if stage is not None:
+        summary["stage"] = str(stage)
     return summary
 
 

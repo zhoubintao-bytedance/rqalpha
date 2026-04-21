@@ -59,6 +59,17 @@ def test_normalize_config_accepts_multi_output_research_flags():
     assert cfg["multi_output"]["reliability_score"]["enabled"]
 
 
+def test_normalize_config_accepts_explicit_features():
+    cfg = normalize_config(
+        {
+            "model": {"kind": "linear"},
+            "features": ["mom_40d", "volatility_20d", "mom_40d"],
+        }
+    )
+
+    assert cfg["features"] == ["mom_40d", "volatility_20d"]
+
+
 def test_normalize_config_rejects_auxiliary_flags_without_master_switch():
     with pytest.raises(ValueError):
         normalize_config(
@@ -93,3 +104,8 @@ def test_normalize_config_rejects_invalid_multi_output_dependencies():
                 }
             }
         )
+
+
+def test_normalize_config_rejects_invalid_feature_payload():
+    with pytest.raises(ValueError):
+        normalize_config({"features": "mom_40d"})
