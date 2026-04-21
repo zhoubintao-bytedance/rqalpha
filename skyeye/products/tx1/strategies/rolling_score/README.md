@@ -14,7 +14,7 @@
 | 标签 | `20d horizon + rank transform` |
 | 组合规则 | `Top25 买入 / Top45 持有 / 跌出 Top45 退出` |
 | 调仓节奏 | `20` 交易日重平衡 |
-| 组合层补丁 | `holding_bonus=0.5`, `single_stock_cap=0.10`, `turnover_threshold=0.30` |
+| 组合层补丁 | `holding_bonus=0.5`, `single_stock_cap=0.10`, `turnover_threshold=0.20` |
 | 平滑 | `EMA halflife=5`, `ema_min_weight=0.005` |
 
 ## 运行流程
@@ -53,9 +53,9 @@
 ### 当前 profile 约定
 
 - `smooth`
-  当前默认档位，对应 `Top25/Top45` 和温和 EMA 平滑。
+  当前默认档位，对应 `Top25/Top45`、温和 EMA 平滑和 `turnover_threshold=0.20`。
 - `baseline`
-  与 `smooth` 口径一致，保留给显式 baseline 命名使用。
+  历史默认对照档位，保留 `turnover_threshold=0.30` 供显式 baseline 比较使用。
 - `soft_sticky` / `sticky` / `ultra_sticky`
   历史 `Top20/Top50` 研究档位，只用于对照，不是当前默认策略。
 

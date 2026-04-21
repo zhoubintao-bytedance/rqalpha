@@ -404,6 +404,7 @@ def run_rolling_backtests(
     mod_configs=None,
     extra_config=None,
     benchmark_id=None,
+    return_details=False,
 ):
     """对策略文件执行滚动窗口回测，返回结果列表
 
@@ -427,6 +428,7 @@ def run_rolling_backtests(
     total = len(run_list)
     results = []
     failed = 0
+    failed_windows = []
 
     for seq, (idx, (start, end)) in enumerate(run_list, 1):
         start_str = start.strftime("%Y-%m-%d")
@@ -469,12 +471,24 @@ def run_rolling_backtests(
             if result is None:
                 print("失败(返回None)")
                 failed += 1
+                failed_windows.append({
+                    "idx": idx,
+                    "start": start_str,
+                    "end": end_str,
+                    "error": "result_none",
+                })
                 continue
 
             summary = result["sys_analyser"]["summary"]
             trades = result["sys_analyser"]["trades"]
             portfolio = result["sys_analyser"].get("portfolio")
             sample_diagnostics = analyze_window_sample(start, trades, portfolio)
+            # 把 sys_analyser 之外的 mod 返回透传出来，便于上层做策略诊断。
+            extra_results = {
+                str(key): value
+                for key, value in dict(result).items()
+                if str(key) != "sys_analyser"
+            }
 
             window_score = score_window(summary)
             use_color = sys.stdout.isatty()
@@ -493,13 +507,28 @@ def run_rolling_backtests(
                 "score": window_score,
                 "trades": trades,
                 "sample_diagnostics": sample_diagnostics,
+                "mod_results": extra_results,
             })
         except Exception as e:
             print(f"异常: {e}")
             failed += 1
+            failed_windows.append({
+                "idx": idx,
+                "start": start_str,
+                "end": end_str,
+                "error": str(e),
+            })
 
     if failed > 0:
         print(f"\n  警告: {failed} 个窗口回测失败")
+
+    if return_details:
+        return {
+            "windows": results,
+            "failed_windows": failed_windows,
+            "total_windows": total,
+            "successful_windows": len(results),
+        }
 
     return results
 

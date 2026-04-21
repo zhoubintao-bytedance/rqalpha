@@ -1055,7 +1055,10 @@
 - [x] 补充/更新定向测试，覆盖新配置通路、catalog 搜索和 judge 动态门槛
 - [x] 跑 TX1 定向回归并记录证据
 - [x] 启动一轮真实 autoresearch catalog 搜索，产出 leaderboard 与 champion 候选
-- [ ] 启动一轮最多 45 分钟的 focused retry，围绕更值得尝试的方向追加验证
+- [x] 启动一轮最多 45 分钟的 focused retry，围绕更值得尝试的方向追加验证
+- [x] 落地 `skyeye/tmp` 版 4 小时 focused runner，避免再发超长 heredoc
+- [x] 将搜索空间改到 `liquidity_plus` 主线，并系统覆盖组合层微调、`risk` 叠加、基本面/过滤三条线
+- [x] 跑定向测试与脚本自检，确认用户只需一行命令即可启动
 
 ## Review
 
@@ -1081,3 +1084,152 @@
   - 命令：`env OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4 NUMEXPR_MAX_THREADS=4 MPLCONFIGDIR=/tmp/mplconfig PYTHONPATH=$PWD python -u -m skyeye.products.tx1.run_autoresearch --run-tag 20260421_catalog_overnight_v1 --runs-root skyeye/artifacts/experiments/tx1_autoresearch --search-catalog risk_reward_v1 --max-experiments 5 --smoke-max-folds 1 --full-max-folds 4 --model-kind lgbm`
   - 当前产物目录：`skyeye/artifacts/experiments/tx1_autoresearch/20260421_catalog_overnight_v1/`
   - 当前运行进程：`python -u -m skyeye.products.tx1.run_autoresearch ... --run-tag 20260421_catalog_overnight_v1 ...`
+- focused retry 也已实际完成：
+  - 运行标签：`20260421_focus_retry_45m`
+  - 产物目录：`skyeye/artifacts/experiments/tx1_autoresearch/20260421_focus_retry_45m/`
+  - 结论：`liquidity_plus` 仍是唯一明显抬收益的方向，但被 `stability_score` 和 `positive_ratio` 护栏卡住；`light_guard`、`preproc` 线继续表现较弱。
+- 本轮又补了一个可直接复制的一行启动入口：
+  - 新增 `skyeye/products/tx1/autoresearch/focused_search.py`，把 4 小时 focused search 固化成可测试 helper，搜索空间显式覆盖三条线：
+    - `liquidity_plus` 组合层微调
+    - `liquidity_plus + risk`
+    - `liquidity_plus + 基本面增强 / 基本面过滤`
+  - 新增 `skyeye/tmp/run_tx1_autoresearch_4h.py`，用户现在不需要再粘贴超长 heredoc。
+  - 基本面过滤没有直接切 `raw_df`，而是放在 `labeled panel` 层做按日期截面筛选，避免破坏单股票滚动特征历史。
+  - 验证证据：
+    - `env PYTHONPATH=$PWD pytest tests/products/tx1/test_autoresearch_search.py tests/products/tx1/test_autoresearch_runner.py tests/products/tx1/test_autoresearch_judge.py tests/products/tx1/test_run_autoresearch.py tests/products/tx1/test_autoresearch_focused_search.py -q`
+    - 结果：`34 passed`
+    - `env PYTHONPATH=$PWD python -m py_compile skyeye/products/tx1/autoresearch/focused_search.py skyeye/tmp/run_tx1_autoresearch_4h.py`
+    - 结果：通过
+    - `env PYTHONPATH=$PWD python skyeye/tmp/run_tx1_autoresearch_4h.py --help`
+    - 结果：帮助信息可正常输出；实际夜跑命令需要补 `MPLCONFIGDIR=/tmp/mplconfig` 以避免 matplotlib cache 警告。
+
+# TX1 autoresearch 4h runner 二阶段演进
+
+- [x] 现状分析：核对 `skyeye/tmp/run_tx1_autoresearch_4h.py`、`focused_search.py`、`catalog.py`、`PLAYBOOK.md` 与最新 run 结果，确认当前 4h runner 为“固定候选 + 时间上限”而非“预算跑满型”闭环
+- [x] 功能点设计：给 `liquidity_plus` 主线补“稳化搜索”，显式覆盖 `linear/tree/lgbm` 与更强正则、预处理开关，优先消除 `flag_ic_decay` / `flag_spread_decay` / `flag_val_dominant`
+- [x] 功能点设计：把第二阶段接到 `combo_b25_h45` 邻域的真实策略搜索，优先对接 `rolling_score` 可执行口径，而不是只停留在 `PortfolioProxy + label return proxy`
+- [x] 功能点设计：把 wall-clock 预算从“最长 4h”改成“尽量跑满 4h+”，支持候选跑空后自动扩表、阶段切换、复盘再投喂
+- [x] 风险与决策：明确阶段切换条件、champion/keep 放行标准、budget 用尽条件，以及 proxy 指标与 replay 指标冲突时的优先级
+- [x] HARD-GATE：用户已确认三段 Spec，可进入实现
+- [x] 实现 `focused_search.py` 二阶段 runner：补 phase-1 稳化搜索、frontier 扩表、phase-2 replay 搜索与统一结果落盘
+- [x] 实现 `run_tx1_autoresearch_4h.py` 新入口参数，确保默认走二阶段 budget-driven 搜索
+- [x] 补充 `tests/products/tx1/test_autoresearch_focused_search.py`：覆盖 phase-1 过滤、phase-2 replay、预算扩表与输出字段
+- [x] 补充 `tests/products/tx1/test_tx1_runtime.py`：覆盖 `extra.tx1_profile_overrides` 生效、类型校验与冻结字段保护
+- [x] 运行定向测试 / 命令验证，并在本节末尾记录 review 与证据
+
+## Review
+
+- `skyeye/products/tx1/autoresearch/focused_search.py` 已从“固定候选 + 到点停止”重构为二阶段 budget loop：
+  - phase-1 先以 `liquidity_plus` 为锚点，搜索 `linear / tree / lgbm(default|heavy_reg|ultra_reg|leaf_guard|slow_lr)` 与预处理开关，并只产出 `frontier_seed / discard`
+  - phase-2 再以 `combo_b25_h45@smooth` 为 replay 锚点，围绕 `combo_h40_bonus1`、`combo_h45_bonus1`、`baseline_lgbm`、`combo_guarded_b25_h45` 与 profile/override 邻域做真实 `rolling_score` replay 搜索
+  - 新结果文件已补充 `phase / evaluation_mode / candidate_signature / artifact_line_id / strategy_profile / profile_overrides / composite_score`
+- `skyeye/products/tx1/strategies/rolling_score/runtime.py` 的新能力已被测试锁住：
+  - `extra.tx1_profile_overrides` 可覆盖 `single_stock_cap / ema_halflife`
+  - 非 dict 会抛错
+  - 冻结字段 `benchmark / artifact_line_id` 不会被 extra overrides 改掉
+- `skyeye/tmp/run_tx1_autoresearch_4h.py` 已新增 `--max-stabilization-rounds / --max-replay-rounds / --replay-cash / --replay-window-indices`
+- 验证证据：
+  - `env PYTHONPATH=$PWD python -m py_compile skyeye/products/tx1/autoresearch/focused_search.py skyeye/tmp/run_tx1_autoresearch_4h.py tests/products/tx1/test_autoresearch_focused_search.py tests/products/tx1/test_tx1_runtime.py`
+  - 结果：通过
+  - `env PYTHONPATH=$PWD pytest tests/products/tx1/test_tx1_runtime.py tests/products/tx1/test_autoresearch_focused_search.py -q`
+  - 结果：`15 passed`
+  - `env PYTHONPATH=$PWD python skyeye/tmp/run_tx1_autoresearch_4h.py --help`
+  - 结果：帮助信息可正常输出；当前环境仍建议显式加 `MPLCONFIGDIR=/tmp/mplconfig`
+
+## 4h 后重点看
+
+- phase-1 是否产出 1~3 个 `frontier_seed`；重点看 `flag_ic_decay / flag_spread_decay / flag_val_dominant` 是否消失或明显减少
+- 如果 flags 还在，是否至少换来了更高 `stability_score` 和不恶化的 `positive_ratio`；否则停止继续围绕 `liquidity_plus` 投时间
+- phase-2 是否出现真实 replay `keep/champion`；重点看 `composite_score` 是否超过 `combo_b25_h45` baseline，而不是只看 proxy 亮不亮
+- 若 replay 提升来自 `combo_h40_bonus1 / combo_h45_bonus1 / combo_b25_h45 + overrides`，下一轮只围绕该邻域缩窄搜索
+- 若 phase-1 能稳化但 phase-2 没提升，下一轮继续搜执行层 `single_stock_cap / turnover_threshold / ema_*`
+- 若 phase-1 也稳不住，下一轮不要继续堆 `liquidity_plus`，应切回新的信号方向
+
+# TX1 autoresearch 可信度修复与实用化迭代
+
+- [x] 输出 Spec 第 1 段：现状分析，明确“为什么三轮后仍对 TX1 帮助有限”的根因边界
+- [x] 输出 Spec 第 2 段：方案选项与推荐，明确先修 replay 可信度、再收缩 phase-1、再重构 phase-2 的实现顺序
+- [x] 输出 Spec 第 3 段：风险、验证口径与预算策略，明确什么叫“对 TX1 真有帮助”
+- [x] 等待用户 HARD-GATE 确认
+- [x] 实现 replay 诊断与 `empty_replay` 升级，区分 infra failure 与普通策略失败
+- [x] 收缩 phase-1 稳化搜索空间，只保留对当前 anchor 有信息增量的候选
+- [x] 重构 phase-2 为少量可解释、必须可执行的 TX1 replay probe
+- [x] 调整 budget loop，避免“候选扫空即结束”伪装成“预算已充分利用”
+- [x] 补充 focused search / runtime / replay 诊断相关回归测试
+- [x] 运行定向验证并在本节末尾记录 review
+
+## Review
+
+- `skyeye/products/tx1/autoresearch/focused_search.py` 已按“诊断优先”重构：
+  - phase-1 收缩为 raw `lgbm` 正则邻域，只保留 `default / heavy_reg / ultra_reg / leaf_guard / slow_lr / tiny_leaf / subsample_guard`
+  - phase-2 round0 收缩为 5 个真实 replay probe：`combo_h45_bonus1`、`combo_h40_bonus1`、以及 `combo_b25_h45` 上的 `single_stock_cap / turnover_threshold / ema` 三类 execution override
+  - `judge_replay_candidate()` 不再把 `num_windows=0` 记成普通 discard，而是升级成 `status=crash, reason_code=replay_infra_failure`
+  - budget loop 在 replay 侧出现 crash 且无法继续扩表时，会把 run 状态标成 `infra_stalled`，不再伪装成正常 `completed`
+- `skyeye/evaluation/rolling_score/engine.py` 现会把窗口级 `mod_results` 和 `failed_windows` 透传出来，autoresearch 可以直接看到回测窗口异常，而不是只看到一串 0 分。
+- 新增 `skyeye/products/tx1/autoresearch/rqalpha_mod_tx1_diagnostics.py`：
+  - 在每个窗口回测 `tear_down` 时导出 `rebalance_checks / executed_rebalances / missing_signal_days / turnover_skips`
+  - focused search 现会把这些诊断汇总成 `replay.diagnostics.health_code`
+- `skyeye/products/tx1/strategies/rolling_score/runtime.py` 修掉了这轮真实链路暴露出的关键兼容性 bug：
+  - `extra.tx1_profile_overrides` 之前只接受原生 `dict`
+  - 真实 RQAlpha 运行时会传 `RqAttrDict`
+  - 这会导致 override replay 在 `init` 阶段整窗崩掉，并伪装成历史 run 里的 `empty_replay`
+  - 现在已兼容 `RqAttrDict/items()` 风格 payload
+- 回归验证：
+  - `env PYTHONPATH=$PWD pytest tests/products/tx1/test_tx1_runtime.py tests/products/tx1/test_autoresearch_focused_search.py -q`
+  - 结果：`17 passed`
+- 真实链路验证：
+  - 命令：`env PYTHONPATH=$PWD MPLCONFIGDIR=/tmp/mplconfig python - <<'PY' ... run_replay_candidate_trial(candidate={'artifact_line_id':'combo_b25_h45','strategy_profile':'smooth','tx1_profile_overrides':{'single_stock_cap':0.08}}) ... PY`
+  - 结果：`num_windows=37`、`failed_window_count=0`、`health_code=ok`、`executed_rebalances_total=394`、`active_window_count=29`
+  - 产物：`skyeye/artifacts/experiments/tx1_autoresearch/tx1_diag_probe_cap008/experiments/exp_0001/replay/`
+- 本轮最关键的新发现：
+  - 之前 phase-2 大量 `empty_replay` 并不全是“参数无效”
+  - 至少有一类核心根因是 `tx1_profile_overrides` 的 `RqAttrDict` 兼容性 bug
+  - 这个 bug 修掉后，之前的典型空跑候选 `single_stock_cap=0.08` 已经能完整跑出 37 个窗口，说明 TX1 executable 搜索终于开始变得可信
+
+# TX1 默认策略切换到冠军线 + autoresearch 方向收敛
+
+- [x] 输出 Spec 第 1 段：现状分析，确认当前默认线、冠军线和打分器口径
+- [x] 等待用户确认 Spec 第 1 段
+- [x] 输出 Spec 第 2 段：方案选项与推荐，明确默认切换范围与 autoresearch 新主线
+- [x] 等待用户确认 Spec 第 2 段
+- [x] 输出 Spec 第 3 段：风险、验证口径与实施清单
+- [x] 等待用户 HARD-GATE 确认
+- [x] 把 TX1 默认 profile 从 `turnover_threshold=0.30` 切到 `0.20`
+- [x] 同步更新 TX1 手册中的默认参数口径与历史对比表述
+- [x] 调整 autoresearch todo，明确后续以 `rolling_score` 打分器为主口径，proxy 仅做辅助 pruning
+- [x] 运行定向验证并在本节末尾记录 review
+
+## 下一步 autoresearch 方向
+
+- [x] phase-2 默认锚点切到 `combo_b25_h45@smooth(turnover_threshold=0.20)`
+- [x] phase-2 round0 不再重复评估与默认锚点等价的 no-op override
+- [x] 后续胜负口径以 `rolling_score` 打分器为主：
+  - 综合分 / 稳定分 / `E/M+/M` 等级优先
+  - proxy 结果只用于 pruning、稳化诊断和解释，不再单独决定 champion
+- [x] 下一轮主搜索轴收敛到执行层小邻域：
+  - `turnover_threshold` 先看 `0.15 / 0.25 / 0.30`
+  - 再看 `rebalance_interval`
+  - 再看 `holding_bonus`
+  - `single_stock_cap` 只作为辅轴联动
+
+## Review
+
+- 已把 `skyeye/products/tx1/strategies/rolling_score/profiles/smooth.yaml` 的默认 `turnover_threshold` 从 `0.30` 切到 `0.20`；`baseline.yaml` 保留 `0.30` 作为历史默认对照。
+- 已同步更新 `skyeye/products/tx1/strategies/rolling_score/README.md` 与 `skyeye/products/tx1/PLAYBOOK.md`：
+  - `smooth` 现明确为当前默认执行档位
+  - `baseline` 现明确为历史默认对照档位
+- `skyeye/products/tx1/autoresearch/focused_search.py` 已做两处收敛：
+  - replay candidate 会先剔除与 profile 默认值等价的 no-op override，避免重复 replay
+  - phase-2 round0 不再重复评估 `turnover_threshold=0.20`，改为围绕新默认测试 `turnover_threshold=0.25`
+- 回归验证：
+  - `env PYTHONPATH=$PWD pytest tests/products/tx1/test_tx1_runtime.py tests/products/tx1/test_autoresearch_focused_search.py -q`
+  - 结果：`19 passed`
+- 真实 `rolling_score` 打分器复核：
+  - 命令：`env PYTHONPATH=$PWD MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python - <<'PY' ... run_rolling_backtests(... strategy_profile='smooth' / 'baseline') ... PY`
+  - 默认 `smooth(0.20)`：`composite_score=54.30`、`M+`、`stability_score=2.72`、`annualized_returns=21.19%`、`max_drawdown=13.61%`
+  - 历史 `baseline(0.30)`：`composite_score=46.84`、`M+`、`stability_score=3.41`、`annualized_returns=18.28%`、`max_drawdown=13.76%`
+  - 默认相对历史对照：`综合分 +7.45`、`年化 +2.91pct`、`回撤 -0.15pct`、`Sharpe +0.07`、`稳定分 -0.70`
+- 后续 autoresearch 主方向已经明确：
+  - 主裁决：`rolling_score` 打分器
+  - 主搜索轴：`turnover_threshold` 小邻域、`rebalance_interval`、`holding_bonus`
+  - 辅助口径：proxy / 其他评分器只做 pruning 和诊断，不再单独决定默认线

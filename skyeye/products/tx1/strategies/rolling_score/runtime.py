@@ -8,6 +8,7 @@ cannot be overridden by profiles.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 from rqalpha.environment import Environment
@@ -73,8 +74,10 @@ def build_runtime(
 
     # Load and merge profile
     profile = load_profile(profile_name)
-    if profile_overrides:
-        safe_overrides = {k: v for k, v in profile_overrides.items() if k not in FROZEN_FIELDS}
+    resolved_profile_overrides = dict(_extra_profile_overrides())
+    resolved_profile_overrides.update(profile_overrides or {})
+    if resolved_profile_overrides:
+        safe_overrides = {k: v for k, v in resolved_profile_overrides.items() if k not in FROZEN_FIELDS}
         profile = {**profile, **safe_overrides}
 
     _validate_frozen_runtime_fields(
@@ -133,6 +136,19 @@ def _extra_runtime_value(field_name: str):
     if extra is None:
         return None
     return getattr(extra, field_name, None)
+
+
+def _extra_profile_overrides() -> dict:
+    """从 `config.extra.tx1_profile_overrides` 读取执行层参数覆盖。"""
+    payload = _extra_runtime_value("tx1_profile_overrides")
+    if payload is None:
+        return {}
+    # RQAlpha 会把 extra payload 包成 RqAttrDict，这里按 Mapping 统一兼容。
+    if not isinstance(payload, Mapping) and not hasattr(payload, "items"):
+        raise ValueError("extra.tx1_profile_overrides must be a dict, got: {!r}".format(type(payload)))
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    return {str(key): value for key, value in payload.items()}
 
 
 def _validate_frozen_runtime_fields(

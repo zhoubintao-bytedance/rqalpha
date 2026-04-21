@@ -1,5 +1,6 @@
 import pytest
 
+from rqalpha.utils import RqAttrDict
 from skyeye.products.tx1.strategies.rolling_score import runtime as tx1_runtime
 from skyeye.products.tx1.strategies.rolling_score.runtime import build_runtime
 
@@ -21,6 +22,17 @@ def test_runtime_uses_spec_default_artifact_line_when_not_overridden():
 
     assert runtime["artifact_line_id"] == "combo_b25_h45"
     assert runtime["artifact"]["model_kind"] == "lgbm"
+    assert runtime["profile"]["turnover_threshold"] == 0.20
+
+
+def test_runtime_allows_explicit_baseline_profile_for_historical_control():
+    runtime = build_runtime(
+        strategy_id="tx1.rolling_score",
+        profile_name="baseline",
+    )
+
+    assert runtime["profile"]["profile"] == "baseline"
+    assert runtime["profile"]["turnover_threshold"] == 0.30
 
 
 def test_runtime_allows_env_override_for_artifact_line(monkeypatch):
@@ -78,3 +90,113 @@ def test_runtime_rejects_profile_artifact_line_override():
             artifact_line="baseline_linear",
             profile_overrides={"artifact_line_id": "baseline_tree"},
         )
+
+
+def test_runtime_allows_extra_profile_overrides(monkeypatch):
+    class _Extra:
+        tx1_profile_overrides = {
+            "single_stock_cap": 0.08,
+            "ema_halflife": 8,
+        }
+
+    class _Config:
+        extra = _Extra()
+
+    class _Env:
+        config = _Config()
+
+    monkeypatch.setattr(
+        tx1_runtime.Environment,
+        "get_instance",
+        classmethod(lambda cls: _Env()),
+    )
+
+    runtime = build_runtime(
+        strategy_id="tx1.rolling_score",
+        artifact_line="baseline_linear",
+    )
+
+    assert runtime["profile"]["single_stock_cap"] == 0.08
+    assert runtime["profile"]["ema_halflife"] == 8
+
+
+def test_runtime_rejects_non_dict_extra_profile_overrides(monkeypatch):
+    class _Extra:
+        tx1_profile_overrides = "bad"
+
+    class _Config:
+        extra = _Extra()
+
+    class _Env:
+        config = _Config()
+
+    monkeypatch.setattr(
+        tx1_runtime.Environment,
+        "get_instance",
+        classmethod(lambda cls: _Env()),
+    )
+
+    with pytest.raises(ValueError, match="tx1_profile_overrides must be a dict"):
+        build_runtime(
+            strategy_id="tx1.rolling_score",
+            artifact_line="baseline_linear",
+        )
+
+
+def test_runtime_accepts_rqattrdict_extra_profile_overrides(monkeypatch):
+    class _Extra:
+        tx1_profile_overrides = RqAttrDict(
+            {"single_stock_cap": 0.08, "turnover_threshold": 0.20}
+        )
+
+    class _Config:
+        extra = _Extra()
+
+    class _Env:
+        config = _Config()
+
+    monkeypatch.setattr(
+        tx1_runtime.Environment,
+        "get_instance",
+        classmethod(lambda cls: _Env()),
+    )
+
+    runtime = build_runtime(
+        strategy_id="tx1.rolling_score",
+        artifact_line="baseline_linear",
+    )
+
+    assert runtime["profile"]["single_stock_cap"] == 0.08
+    assert runtime["profile"]["turnover_threshold"] == 0.20
+
+
+def test_runtime_ignores_frozen_fields_from_extra_profile_overrides(monkeypatch):
+    class _Extra:
+        tx1_profile_overrides = {
+            "benchmark": "000905.XSHG",
+            "artifact_line_id": "baseline_tree",
+            "single_stock_cap": 0.07,
+        }
+
+    class _Config:
+        extra = _Extra()
+
+    class _Env:
+        config = _Config()
+
+    monkeypatch.setattr(
+        tx1_runtime.Environment,
+        "get_instance",
+        classmethod(lambda cls: _Env()),
+    )
+
+    runtime = build_runtime(
+        strategy_id="tx1.rolling_score",
+        artifact_line="baseline_linear",
+    )
+
+    assert runtime["benchmark"] == "000300.XSHG"
+    assert runtime["artifact_line_id"] == "baseline_linear"
+    assert runtime["profile"]["single_stock_cap"] == 0.07
+    assert runtime["profile"]["benchmark"] == "000300.XSHG"
+    assert runtime["profile"].get("artifact_line_id") is None
