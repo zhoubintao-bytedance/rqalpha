@@ -164,6 +164,28 @@ LGBM_REGULARIZATION_PROFILES = {
         "early_stopping_rounds": 40,
     },
 }
+REPLAY_PROFILE_SEQUENCE = (
+    "smooth",
+    "baseline",
+    "soft_sticky",
+    "sticky",
+    "ultra_sticky",
+)
+REPLAY_ARTIFACT_SEQUENCE = (
+    "combo_b25_h45",
+    "combo_h45_bonus1",
+    "combo_h40_bonus1",
+)
+SEARCH_TIER_RANK = {
+    "high": 3,
+    "medium": 2,
+    "backfill": 1,
+}
+PHASE2_FREEZE_LIMIT = 3
+PHASE1_FREEZE_LIMIT = 2
+BACKFILL_MIN_REMAINING_RATIO = 0.20
+REPLAY_SOURCE_RECORD_LIMIT = 4
+PROFILE_SEED_SOURCE_LIMIT = 3
 
 
 def _dedupe_features(features: list[str]) -> list[str]:
@@ -198,6 +220,7 @@ def _candidate(
     artifact_line_id: str | None = None,
     strategy_profile: str | None = None,
     tx1_profile_overrides: dict[str, Any] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """统一构造 focused search 候选定义，避免字段散落。"""
     return {
@@ -215,6 +238,7 @@ def _candidate(
         "artifact_line_id": artifact_line_id,
         "strategy_profile": strategy_profile,
         "tx1_profile_overrides": dict(tx1_profile_overrides or {}),
+        **dict(extra_metadata or {}),
     }
 
 
@@ -270,7 +294,62 @@ def _build_proxy_candidate(
         features=_liquidity_plus_features(),
         model=model_payload,
         preprocessing=DEFAULT_PREPROCESSING if use_preprocessing else None,
+        extra_metadata={"reg_profile": str(reg_profile or "default")},
     )
+
+
+def _build_proxy_anchor_candidate(*, model_kind: str) -> dict[str, Any]:
+    """构造 phase-1 proxy anchor 的标准候选定义，供 baseline 和去重共用。"""
+    return _candidate(
+        "liquidity_plus_anchor",
+        phase="phase1",
+        evaluation_mode="proxy",
+        family="stabilization_anchor",
+        description="phase-1 稳化搜索锚点：liquidity_plus 默认 {} + 默认预处理关闭。".format(
+            str(model_kind)
+        ),
+        search_round=0,
+        features=_liquidity_plus_features(),
+        model={"kind": str(model_kind)},
+    )
+
+
+def _is_proxy_anchor_equivalent(candidate: dict[str, Any]) -> bool:
+    """判断 phase-1 候选是否与 proxy anchor 完全等价，避免白跑 no-op。"""
+    if str(candidate.get("phase") or "") != "phase1":
+        return False
+    model_kind = str((candidate.get("model") or {}).get("kind") or "lgbm")
+    return _candidate_signature(candidate) == _candidate_signature(
+        _build_proxy_anchor_candidate(model_kind=model_kind)
+    )
+
+
+def _neighbor_reg_profiles(reg_profile: str) -> list[str]:
+    """为 phase-1 frontier 候选挑选少量最相近的正则邻域。"""
+    adjacency = {
+        "default": ["heavy_reg", "slow_lr"],
+        "heavy_reg": ["default", "ultra_reg", "leaf_guard"],
+        "ultra_reg": ["heavy_reg", "tiny_leaf"],
+        "leaf_guard": ["slow_lr", "subsample_guard"],
+        "slow_lr": ["leaf_guard", "subsample_guard"],
+        "tiny_leaf": ["ultra_reg", "subsample_guard"],
+        "subsample_guard": ["slow_lr", "tiny_leaf"],
+    }
+    return list(adjacency.get(str(reg_profile or "default"), ["heavy_reg", "slow_lr"]))
+
+
+def _unique_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按候选签名去重，避免同轮补量自己撞自己。"""
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate)
+        signature = _candidate_signature(candidate)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        ordered.append(candidate)
+    return ordered
 
 
 def build_liquidity_focus_candidates(
@@ -279,23 +358,163 @@ def build_liquidity_focus_candidates(
     frontier_entries: list[dict[str, Any]] | None = None,
     tried_signatures: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """构造 phase-1 稳化搜索候选，只保留 raw lgbm 正则邻域。"""
-    del frontier_entries, tried_signatures
+    """构造 phase-1 稳化搜索候选，预算充裕时围绕 frontier 做低成本补量。"""
+    del tried_signatures
     phase_schedule = {
         0: ["default", "heavy_reg", "ultra_reg"],
         1: ["leaf_guard", "slow_lr"],
         2: ["tiny_leaf", "subsample_guard"],
     }
     profiles = list(phase_schedule.get(int(round_index), []))
-    return [
-        _build_proxy_candidate(
-            round_index=round_index,
-            model_kind="lgbm",
-            reg_profile=profile_name,
-            use_preprocessing=False,
+    if profiles:
+        return [
+            candidate
+            for profile_name in profiles
+            for candidate in [
+                _build_proxy_candidate(
+                    round_index=round_index,
+                    model_kind="lgbm",
+                    reg_profile=profile_name,
+                    use_preprocessing=False,
+                )
+            ]
+            if not _is_proxy_anchor_equivalent(candidate)
+        ]
+
+    frontier_records = list(frontier_entries or [])
+    if not frontier_records:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for record in frontier_records[:3]:
+        source_candidate = dict(record.get("candidate") or {})
+        model_kind = str((source_candidate.get("model") or {}).get("kind") or "lgbm")
+        reg_profile = str(source_candidate.get("reg_profile") or "default")
+        use_preprocessing = bool(
+            (source_candidate.get("preprocessing") or {}).get("enabled", False)
         )
-        for profile_name in profiles
+        if not use_preprocessing:
+            candidates.append(
+                _build_proxy_candidate(
+                    round_index=round_index,
+                    model_kind=model_kind,
+                    reg_profile=reg_profile,
+                    use_preprocessing=True,
+                )
+            )
+        for neighbor_profile in _neighbor_reg_profiles(reg_profile):
+            candidates.append(
+                _build_proxy_candidate(
+                    round_index=round_index,
+                    model_kind=model_kind,
+                    reg_profile=neighbor_profile,
+                    use_preprocessing=use_preprocessing,
+                )
+            )
+    return [
+        candidate
+        for candidate in _unique_candidates(candidates)
+        if not _is_proxy_anchor_equivalent(candidate)
     ]
+
+
+def _neighbor_replay_profiles(profile_name: str) -> list[str]:
+    """返回最接近当前执行档位的 profile 邻域，避免无脑跨层级乱跳。"""
+    adjacency = {
+        "smooth": ["baseline", "soft_sticky"],
+        "baseline": ["smooth", "soft_sticky"],
+        "soft_sticky": ["smooth", "sticky"],
+        "sticky": ["soft_sticky", "ultra_sticky"],
+        "ultra_sticky": ["sticky"],
+    }
+    resolved = str(profile_name or "smooth")
+    return list(adjacency.get(resolved, ["smooth", "baseline"]))
+
+
+def _build_replay_profile_seed_candidates(
+    *,
+    round_index: int,
+    replay_entries: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """围绕已验证可执行的 artifact/profile 邻域补充少量 profile seed。"""
+    source_candidates: list[dict[str, Any]] = []
+    if replay_entries:
+        for record in list(replay_entries or []):
+            if not _replay_record_is_expandable(record):
+                continue
+            source_candidates.append(dict(record.get("candidate") or {}))
+            if len(source_candidates) >= PROFILE_SEED_SOURCE_LIMIT:
+                break
+    if not source_candidates:
+        source_candidates = [
+            {
+                "artifact_line_id": "combo_b25_h45",
+                "strategy_profile": "smooth",
+            }
+        ]
+
+    candidates: list[dict[str, Any]] = []
+    for source_candidate in source_candidates:
+        artifact_line_id = str(
+            source_candidate.get("artifact_line_id") or "combo_b25_h45"
+        )
+        profile_name = str(source_candidate.get("strategy_profile") or "smooth")
+        for neighbor_profile in _neighbor_replay_profiles(profile_name):
+            candidates.append(
+                _build_replay_candidate(
+                    round_index=round_index,
+                    artifact_line_id=artifact_line_id,
+                    strategy_profile=neighbor_profile,
+                    description=(
+                        "围绕 {} 的执行档位邻域补充 profile seed，优先验证最接近的可执行档位。"
+                    ).format(artifact_line_id),
+                )
+            )
+    return _unique_candidates(candidates)
+
+
+def _build_replay_artifact_backfill_candidates(
+    *,
+    round_index: int,
+    replay_entries: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """在高价值方向不足时，用同 profile 的 artifact 邻域做少量 backfill。"""
+    source_candidates: list[dict[str, Any]] = []
+    if replay_entries:
+        for record in list(replay_entries or []):
+            if not _replay_record_is_expandable(record):
+                continue
+            source_candidates.append(dict(record.get("candidate") or {}))
+            if len(source_candidates) >= 2:
+                break
+    if not source_candidates:
+        source_candidates = [
+            {
+                "artifact_line_id": "combo_b25_h45",
+                "strategy_profile": "smooth",
+            }
+        ]
+
+    candidates: list[dict[str, Any]] = []
+    for source_candidate in source_candidates:
+        artifact_line_id = str(
+            source_candidate.get("artifact_line_id") or "combo_b25_h45"
+        )
+        profile_name = str(source_candidate.get("strategy_profile") or "smooth")
+        for candidate_artifact in REPLAY_ARTIFACT_SEQUENCE:
+            if candidate_artifact == artifact_line_id:
+                continue
+            candidates.append(
+                _build_replay_candidate(
+                    round_index=round_index,
+                    artifact_line_id=candidate_artifact,
+                    strategy_profile=profile_name,
+                    description=(
+                        "围绕 {} 的高价值执行档位回补 artifact 邻域，避免预算早停。"
+                    ).format(profile_name),
+                )
+            )
+    return _unique_candidates(candidates)
 
 
 def _format_override_value(value: Any) -> str:
@@ -541,7 +760,7 @@ def build_replay_search_candidates(
         return []
 
     candidates: list[dict[str, Any]] = []
-    for record in healthy_records[:2]:
+    for record in healthy_records[:REPLAY_SOURCE_RECORD_LIMIT]:
         candidates.extend(
             _build_replay_probe_neighbors(
                 round_index=round_index,
@@ -1352,6 +1571,333 @@ def judge_replay_candidate(
     }
 
 
+def _resolve_round_cap(
+    *,
+    requested_rounds: int,
+    max_runtime_hours: float,
+    phase: str,
+) -> int:
+    """按预算自动放大 round cap，避免 8h 任务仍被 4h 默认轮数截断。"""
+    safe_hours = max(float(max_runtime_hours), 0.0)
+    if str(phase) == "phase2":
+        auto_rounds = max(4, int(np.ceil(safe_hours * 1.25)))
+    else:
+        auto_rounds = max(3, int(np.ceil(safe_hours / 2.0)) + 2)
+    return max(int(requested_rounds), int(auto_rounds))
+
+
+def _remaining_budget_ratio(*, started_at: datetime, deadline_at: datetime) -> float:
+    """估算剩余预算占比，用来决定是否继续做 backfill。"""
+    total_seconds = max((deadline_at - started_at).total_seconds(), 0.0)
+    if total_seconds <= 0:
+        return 0.0
+    remaining_seconds = max((deadline_at - datetime.now()).total_seconds(), 0.0)
+    return float(min(1.0, max(0.0, remaining_seconds / total_seconds)))
+
+
+def _search_axis_key(candidate: dict[str, Any]) -> str:
+    """把候选归并到稳定的搜索轴，用于做收益递减剪枝。"""
+    explicit_axis = candidate.get("search_axis")
+    if explicit_axis:
+        return str(explicit_axis)
+
+    phase = str(candidate.get("phase") or "")
+    if phase == "phase2":
+        artifact_line_id = str(candidate.get("artifact_line_id") or "combo_b25_h45")
+        profile_name = str(candidate.get("strategy_profile") or "smooth")
+        overrides = dict(candidate.get("tx1_profile_overrides") or {})
+        keys = set(overrides)
+        if not keys:
+            if profile_name != "smooth":
+                return "phase2:{}:profile_seed:{}".format(
+                    artifact_line_id, profile_name
+                )
+            if artifact_line_id != "combo_b25_h45":
+                return "phase2:artifact_probe:{}:{}".format(
+                    artifact_line_id, profile_name
+                )
+            return "phase2:{}:{}:anchor".format(artifact_line_id, profile_name)
+        if keys == {"turnover_threshold"}:
+            axis_name = "turnover_threshold"
+        elif keys == {"single_stock_cap"}:
+            axis_name = "single_stock_cap"
+        elif keys <= {"ema_halflife", "ema_min_weight"}:
+            axis_name = "ema"
+        elif keys == {"single_stock_cap", "turnover_threshold"}:
+            axis_name = "turnover_cap_combo"
+        elif "ema_halflife" in keys or "ema_min_weight" in keys:
+            axis_name = "ema_combo"
+        else:
+            axis_name = "multi_axis"
+        return "phase2:{}:{}:{}".format(artifact_line_id, profile_name, axis_name)
+
+    model_kind = str((candidate.get("model") or {}).get("kind") or "lgbm")
+    reg_profile = str(candidate.get("reg_profile") or "default")
+    preprocessing_enabled = bool(
+        (candidate.get("preprocessing") or {}).get("enabled", False)
+    )
+    return "phase1:{}:{}:{}".format(
+        model_kind,
+        reg_profile,
+        "preproc" if preprocessing_enabled else "raw",
+    )
+
+
+def _candidate_priority_hint(candidate: dict[str, Any]) -> float:
+    """给候选一个静态先验优先级，优先搜索最有希望的执行方向。"""
+    phase = str(candidate.get("phase") or "")
+    if phase == "phase2":
+        artifact_line_id = str(candidate.get("artifact_line_id") or "combo_b25_h45")
+        profile_name = str(candidate.get("strategy_profile") or "smooth")
+        axis_key = _search_axis_key(candidate)
+        artifact_bonus = {
+            "combo_b25_h45": 32.0,
+            "combo_h45_bonus1": 18.0,
+            "combo_h40_bonus1": 14.0,
+        }.get(artifact_line_id, 8.0)
+        profile_bonus = {
+            "smooth": 24.0,
+            "baseline": 18.0,
+            "soft_sticky": 12.0,
+            "sticky": 8.0,
+            "ultra_sticky": 4.0,
+        }.get(profile_name, 2.0)
+        axis_bonus = 0.0
+        if axis_key.endswith(":anchor"):
+            axis_bonus = 30.0
+        elif axis_key.endswith(":turnover_threshold"):
+            axis_bonus = 34.0
+        elif axis_key.endswith(":turnover_cap_combo"):
+            axis_bonus = 30.0
+        elif axis_key.endswith(":single_stock_cap"):
+            axis_bonus = 24.0
+        elif axis_key.endswith(":ema"):
+            axis_bonus = 18.0
+        elif ":profile_seed:" in axis_key:
+            axis_bonus = 14.0
+        elif "artifact_probe" in axis_key:
+            axis_bonus = 10.0
+        else:
+            axis_bonus = 6.0
+        return artifact_bonus + profile_bonus + axis_bonus
+
+    reg_profile = str(candidate.get("reg_profile") or "default")
+    reg_bonus = {
+        "default": 18.0,
+        "heavy_reg": 16.0,
+        "ultra_reg": 14.0,
+        "slow_lr": 12.0,
+        "leaf_guard": 10.0,
+        "subsample_guard": 8.0,
+        "tiny_leaf": 6.0,
+    }.get(reg_profile, 4.0)
+    preprocessing_bonus = 6.0 if bool(
+        (candidate.get("preprocessing") or {}).get("enabled", False)
+    ) else 0.0
+    return reg_bonus + preprocessing_bonus
+
+
+def _entry_value_score(entry: dict[str, Any]) -> float:
+    """把 leaderboard entry 映射成可比较的价值分，用于扩表排序和剪枝。"""
+    status = str(entry.get("status") or "")
+    phase = str(entry.get("phase") or "")
+    score_delta = dict(entry.get("score_delta") or {})
+    metrics = dict(entry.get("metrics") or {})
+    if phase == "phase2":
+        status_bonus = {
+            "champion": 120.0,
+            "keep": 82.0,
+            "discard": 8.0,
+            "crash": -80.0,
+            "invalid": -90.0,
+        }.get(status, 0.0)
+        return (
+            status_bonus
+            + float(score_delta.get("composite_score", 0.0)) * 12.0
+            + float(score_delta.get("annualized_returns", 0.0)) * 600.0
+            - float(score_delta.get("max_drawdown", 0.0)) * 300.0
+            + float(score_delta.get("stability_score", 0.0)) * 2.0
+            - float(len(entry.get("risk_codes") or [])) * 2.0
+            + float(metrics.get("composite_score", 0.0)) * 0.1
+        )
+    status_bonus = {
+        "frontier_seed": 42.0,
+        "discard": 4.0,
+        "crash": -40.0,
+        "invalid": -50.0,
+    }.get(status, 0.0)
+    return (
+        status_bonus
+        + float(score_delta.get("net_mean_return", 0.0)) * 50000.0
+        - float(score_delta.get("max_drawdown", 0.0)) * 300.0
+        + float(score_delta.get("stability_score", 0.0)) * 2.5
+        + float(metrics.get("stability_score", 0.0)) * 0.2
+    )
+
+
+def _axis_state_default(phase: str) -> dict[str, Any]:
+    """返回搜索轴的默认状态。"""
+    return {
+        "phase": str(phase),
+        "total_evaluated": 0,
+        "positive_hits": 0,
+        "keep_hits": 0,
+        "champion_hits": 0,
+        "best_value_score": float("-inf"),
+        "last_value_score": float("-inf"),
+        "no_improvement_streak": 0,
+        "frozen": False,
+        "last_status": "",
+        "last_reason_code": "",
+    }
+
+
+def _entry_is_positive(entry: dict[str, Any]) -> bool:
+    """判断 entry 是否足以说明该搜索轴仍然值得继续投入。"""
+    status = str(entry.get("status") or "")
+    phase = str(entry.get("phase") or "")
+    if phase == "phase2":
+        return status in {"champion", "keep"}
+    return status == "frontier_seed"
+
+
+def _update_axis_state(axis_states: dict[str, dict[str, Any]], entry: dict[str, Any]) -> None:
+    """用最新 entry 更新搜索轴状态，支持收益递减剪枝。"""
+    axis_key = str(entry.get("search_axis") or "")
+    if not axis_key:
+        return
+    phase = str(entry.get("phase") or "")
+    state = axis_states.setdefault(axis_key, _axis_state_default(phase))
+    value_score = _entry_value_score(entry)
+    is_positive = _entry_is_positive(entry)
+
+    state["total_evaluated"] = int(state.get("total_evaluated", 0)) + 1
+    state["last_status"] = str(entry.get("status") or "")
+    state["last_reason_code"] = str(entry.get("reason_code") or "")
+    state["last_value_score"] = float(value_score)
+    state["best_value_score"] = max(
+        float(state.get("best_value_score", float("-inf"))),
+        float(value_score),
+    )
+
+    if str(entry.get("status") or "") == "champion":
+        state["champion_hits"] = int(state.get("champion_hits", 0)) + 1
+    if str(entry.get("status") or "") == "keep":
+        state["keep_hits"] = int(state.get("keep_hits", 0)) + 1
+
+    if is_positive:
+        state["positive_hits"] = int(state.get("positive_hits", 0)) + 1
+        state["no_improvement_streak"] = 0
+    else:
+        state["no_improvement_streak"] = int(
+            state.get("no_improvement_streak", 0)
+        ) + 1
+
+    if int(state.get("champion_hits", 0)) > 0:
+        state["frozen"] = False
+        return
+
+    freeze_limit = PHASE2_FREEZE_LIMIT if phase == "phase2" else PHASE1_FREEZE_LIMIT
+    if int(state.get("positive_hits", 0)) > 0:
+        freeze_limit += 1
+
+    state["frozen"] = bool(
+        int(state.get("no_improvement_streak", 0)) >= freeze_limit
+        and float(state.get("best_value_score", float("-inf"))) < 95.0
+    )
+
+
+def _candidate_priority_score(
+    *,
+    candidate: dict[str, Any],
+    axis_states: dict[str, dict[str, Any]],
+    tier: str,
+    remaining_budget_ratio: float,
+) -> float:
+    """综合静态先验和历史收益给候选排优先级。"""
+    axis_key = _search_axis_key(candidate)
+    state = dict(axis_states.get(axis_key) or {})
+    if bool(state.get("frozen", False)):
+        return float("-inf")
+
+    tier_bonus = {
+        "high": 90.0,
+        "medium": 55.0,
+        "backfill": 20.0,
+    }.get(str(tier), 0.0)
+    score = tier_bonus + _candidate_priority_hint(candidate)
+    score += float(candidate.get("source_value_score", 0.0)) * 0.35
+    if state:
+        score += float(state.get("best_value_score", 0.0)) * 0.12
+        score -= float(state.get("no_improvement_streak", 0)) * 9.0
+    score -= float(candidate.get("search_round") or 0) * 3.0
+    if str(tier) == "backfill" and remaining_budget_ratio < BACKFILL_MIN_REMAINING_RATIO:
+        score -= 120.0
+    return float(score)
+
+
+def _annotate_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    tier: str,
+    seed_reason: str,
+    axis_states: dict[str, dict[str, Any]],
+    remaining_budget_ratio: float,
+    source_entry: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """给候选附加搜索轴/优先级元数据，供调度器统一排序。"""
+    annotated: list[dict[str, Any]] = []
+    source_value_score = (
+        _entry_value_score(source_entry) if source_entry is not None else 0.0
+    )
+    parent_signature = (
+        str(source_entry.get("candidate_signature") or "")
+        if source_entry is not None
+        else ""
+    )
+    for raw_candidate in list(candidates or []):
+        candidate = dict(raw_candidate)
+        candidate["search_axis"] = _search_axis_key(candidate)
+        candidate["search_tier"] = str(tier)
+        candidate["seed_reason"] = str(seed_reason)
+        if parent_signature:
+            candidate["parent_signature"] = parent_signature
+        if source_entry is not None:
+            candidate["source_value_score"] = float(source_value_score)
+        priority_score = _candidate_priority_score(
+            candidate=candidate,
+            axis_states=axis_states,
+            tier=tier,
+            remaining_budget_ratio=remaining_budget_ratio,
+        )
+        if priority_score == float("-inf"):
+            continue
+        candidate["search_priority"] = float(priority_score)
+        annotated.append(candidate)
+    return annotated
+
+
+def _sort_candidate_queue(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按优先级稳定排序候选队列。"""
+    return sorted(
+        list(candidates or []),
+        key=lambda item: (
+            -float(item.get("search_priority", 0.0)),
+            -int(SEARCH_TIER_RANK.get(str(item.get("search_tier") or ""), 0)),
+            str(item.get("id") or ""),
+        ),
+    )
+
+
+def _extend_candidate_queue(
+    queue: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把新候选并入已有队列并重新排序。"""
+    merged = list(queue or []) + list(candidates or [])
+    return _sort_candidate_queue(merged)
+
+
 def _candidate_signature(candidate: dict[str, Any]) -> str:
     """对候选关键字段做稳定序列化，用于扩表去重。"""
     payload = {
@@ -1409,6 +1955,11 @@ def _build_leaderboard_entry(
         "artifact_line_id": candidate.get("artifact_line_id"),
         "strategy_profile": candidate.get("strategy_profile"),
         "profile_overrides": dict(candidate.get("tx1_profile_overrides") or {}),
+        "search_axis": str(candidate.get("search_axis") or _search_axis_key(candidate)),
+        "search_tier": str(candidate.get("search_tier") or ""),
+        "search_priority": float(candidate.get("search_priority", 0.0) or 0.0),
+        "seed_reason": str(candidate.get("seed_reason") or ""),
+        "parent_signature": str(candidate.get("parent_signature") or ""),
         "risk_codes": list(_metric(summary, "replay", "risk_codes", default=[])),
         "num_windows": int(_metric(summary, "replay", "num_windows", default=0)),
         "replay_health_code": str(
@@ -1521,6 +2072,8 @@ def _build_partial_result(
     status: str,
     stabilization_rounds_started: int,
     replay_rounds_started: int,
+    stop_reason_detail: str | None = None,
+    search_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造可持续落盘的 focused search 状态快照。"""
     now = datetime.now()
@@ -1533,6 +2086,7 @@ def _build_partial_result(
         "run_root": str(run_root),
         "search_name": "liquidity_focus_2phase_budget",
         "status": str(status),
+        "stop_reason_detail": str(stop_reason_detail or status),
         "started_at": started_at.isoformat(),
         "deadline_at": deadline_at.isoformat(),
         "updated_at": now.isoformat(),
@@ -1544,6 +2098,7 @@ def _build_partial_result(
         "leaderboard": sorted_leaderboard,
         "frontier": frontier_entries[:10],
         "champion": deepcopy(champion_entry),
+        "search_diagnostics": deepcopy(search_diagnostics or {}),
         "phase_progress": {
             "stabilization_rounds_started": int(stabilization_rounds_started),
             "replay_rounds_started": int(replay_rounds_started),
@@ -1565,6 +2120,17 @@ def _build_partial_result(
             "phase2_evaluated": _count_phase_entries(
                 sorted_leaderboard, phase="phase2"
             ),
+            "high_value_queue_size": int(
+                (search_diagnostics or {}).get("high_value_queue_size", 0)
+            ),
+            "medium_value_queue_size": int(
+                (search_diagnostics or {}).get("medium_value_queue_size", 0)
+            ),
+            "backfill_queue_size": int(
+                (search_diagnostics or {}).get("backfill_queue_size", 0)
+            ),
+            "axes_total": int((search_diagnostics or {}).get("axes_total", 0)),
+            "axes_frozen": int((search_diagnostics or {}).get("axes_frozen", 0)),
         },
     }
 
@@ -1583,17 +2149,126 @@ def _build_candidate_labeled_df(
 def _register_candidates(
     candidates: list[dict[str, Any]],
     discovered_signatures: set[str],
+    dedupe_stats: dict[str, int] | None = None,
+    blocked_signatures: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """把新一轮候选做去重注册，避免 budget loop 来回踩同一配置。"""
     fresh_candidates: list[dict[str, Any]] = []
+    reserved_signatures = set(blocked_signatures or set())
     for raw_candidate in candidates:
         candidate = dict(raw_candidate)
         signature = _candidate_signature(candidate)
-        if signature in discovered_signatures:
+        if signature in reserved_signatures or signature in discovered_signatures:
+            if dedupe_stats is not None:
+                dedupe_stats["duplicate_skips"] = int(
+                    dedupe_stats.get("duplicate_skips", 0)
+                ) + 1
             continue
         discovered_signatures.add(signature)
         fresh_candidates.append(candidate)
     return fresh_candidates
+
+
+def _build_search_diagnostics(
+    *,
+    axis_states: dict[str, dict[str, Any]],
+    high_value_queue: list[dict[str, Any]],
+    medium_value_queue: list[dict[str, Any]],
+    backfill_queue: list[dict[str, Any]],
+    dedupe_stats: dict[str, int],
+    remaining_budget_ratio: float,
+) -> dict[str, Any]:
+    """汇总预算优先搜索的当前状态，便于解释为什么继续搜或为什么停。"""
+    ranked_axes = sorted(
+        axis_states.items(),
+        key=lambda item: (
+            bool((item[1] or {}).get("frozen", False)),
+            -float((item[1] or {}).get("best_value_score", float("-inf"))),
+            -int((item[1] or {}).get("positive_hits", 0)),
+        ),
+    )
+    return {
+        "high_value_queue_size": int(len(high_value_queue or [])),
+        "medium_value_queue_size": int(len(medium_value_queue or [])),
+        "backfill_queue_size": int(len(backfill_queue or [])),
+        "axes_total": int(len(axis_states)),
+        "axes_frozen": int(
+            sum(1 for state in axis_states.values() if bool(state.get("frozen", False)))
+        ),
+        "duplicate_skips": int(dedupe_stats.get("duplicate_skips", 0)),
+        "remaining_budget_ratio": round(float(remaining_budget_ratio), 4),
+        "top_axes": [
+            {
+                "axis": str(axis_key),
+                "phase": str(state.get("phase") or ""),
+                "best_value_score": round(
+                    float(state.get("best_value_score", float("-inf"))), 4
+                ),
+                "positive_hits": int(state.get("positive_hits", 0)),
+                "no_improvement_streak": int(
+                    state.get("no_improvement_streak", 0)
+                ),
+                "frozen": bool(state.get("frozen", False)),
+                "last_status": str(state.get("last_status") or ""),
+                "last_reason_code": str(state.get("last_reason_code") or ""),
+            }
+            for axis_key, state in ranked_axes[:12]
+        ],
+    }
+
+
+def _rank_replay_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按历史收益价值排序 replay 记录，优先围绕更有信息量的方向扩表。"""
+    return sorted(
+        list(records or []),
+        key=lambda item: (
+            -_entry_value_score(dict(item.get("entry") or {})),
+            -float(
+                _metric(item.get("summary") or {}, "replay", "composite_score")
+            ),
+            float(_metric(item.get("summary") or {}, "portfolio", "max_drawdown")),
+        ),
+    )
+
+
+def _rank_frontier_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按价值分排序 phase-1 frontier，避免 phase-1 backfill 乱跳。"""
+    return sorted(
+        list(records or []),
+        key=lambda item: -_entry_value_score(dict(item.get("entry") or {})),
+    )
+
+
+def _split_replay_candidates_by_tier(
+    candidates: list[dict[str, Any]],
+    *,
+    remaining_budget_ratio: float,
+) -> dict[str, list[dict[str, Any]]]:
+    """把 replay 候选拆成高价值 / 中价值 / 回补三层队列。"""
+    buckets = {"high": [], "medium": [], "backfill": []}
+    for candidate in list(candidates or []):
+        axis_key = _search_axis_key(candidate)
+        artifact_line_id = str(candidate.get("artifact_line_id") or "combo_b25_h45")
+        if axis_key.endswith(":turnover_threshold") or axis_key.endswith(
+            ":turnover_cap_combo"
+        ):
+            buckets["high"].append(candidate)
+        elif axis_key.endswith(":single_stock_cap") and artifact_line_id == "combo_b25_h45":
+            buckets["high"].append(candidate)
+        elif axis_key.endswith(":ema") and artifact_line_id == "combo_b25_h45":
+            buckets["medium"].append(candidate)
+        elif ":profile_seed:" in axis_key:
+            target_bucket = (
+                "medium"
+                if remaining_budget_ratio >= BACKFILL_MIN_REMAINING_RATIO
+                else "backfill"
+            )
+            buckets[target_bucket].append(candidate)
+        elif "artifact_probe" in axis_key:
+            buckets["medium"].append(candidate)
+        else:
+            buckets["backfill"].append(candidate)
+    return buckets
 
 
 def build_default_run_tag(now: datetime | None = None) -> str:
@@ -1640,6 +2315,16 @@ def run_liquidity_focus_search(
     started_at = datetime.now()
     safe_hours = max(float(max_runtime_hours), 0.0)
     deadline_at = started_at + timedelta(hours=safe_hours)
+    effective_max_stabilization_rounds = _resolve_round_cap(
+        requested_rounds=max_stabilization_rounds,
+        max_runtime_hours=safe_hours,
+        phase="phase1",
+    )
+    effective_max_replay_rounds = _resolve_round_cap(
+        requested_rounds=max_replay_rounds,
+        max_runtime_hours=safe_hours,
+        phase="phase2",
+    )
 
     if raw_df is None:
         raw_df = build_research_raw_df(
@@ -1658,21 +2343,15 @@ def run_liquidity_focus_search(
     champion_entry: dict[str, Any] | None = None
     frontier_records: list[dict[str, Any]] = []
     replay_records: list[dict[str, Any]] = []
+    axis_states: dict[str, dict[str, Any]] = {}
     discovered_signatures: set[str] = set()
+    dedupe_stats = {"duplicate_skips": 0}
     next_experiment_index = 0
     evaluated = 0
     status = "running"
+    stop_reason_detail = "initializing"
 
-    proxy_anchor_candidate = _candidate(
-        "liquidity_plus_anchor",
-        phase="phase1",
-        evaluation_mode="proxy",
-        family="stabilization_anchor",
-        description="phase-1 稳化搜索锚点：liquidity_plus 默认 lgbm + 默认预处理关闭。",
-        search_round=0,
-        features=_liquidity_plus_features(),
-        model={"kind": str(model_kind)},
-    )
+    proxy_anchor_candidate = _build_proxy_anchor_candidate(model_kind=str(model_kind))
     proxy_anchor_summary = run_focused_candidate_trial(
         run_root=run_root,
         experiment_index=next_experiment_index,
@@ -1692,18 +2371,44 @@ def run_liquidity_focus_search(
         "metrics": _build_entry_metrics(proxy_anchor_summary),
     }
     next_experiment_index += 1
+    blocked_signatures = {_candidate_signature(proxy_anchor_candidate)}
 
     stabilization_rounds_started = 1
     replay_rounds_started = 0
     phase1_round_index = 0
     phase2_round_index = 0
-    phase1_queue = _register_candidates(
-        build_liquidity_focus_candidates(round_index=0),
-        discovered_signatures,
+    phase1_queue = _sort_candidate_queue(
+        _annotate_candidates(
+            _register_candidates(
+                build_liquidity_focus_candidates(round_index=0),
+                discovered_signatures,
+                dedupe_stats,
+                blocked_signatures=blocked_signatures,
+            ),
+            tier="medium",
+            seed_reason="phase1_round0_seed",
+            axis_states=axis_states,
+            remaining_budget_ratio=1.0,
+        )
     )
-    phase2_queue: list[dict[str, Any]] = []
+    high_value_queue: list[dict[str, Any]] = []
+    medium_value_queue: list[dict[str, Any]] = []
+    backfill_queue: list[dict[str, Any]] = []
     replay_anchor_ready = False
     best_replay_summary: dict[str, Any] | None = None
+
+    def _current_search_diagnostics() -> dict[str, Any]:
+        return _build_search_diagnostics(
+            axis_states=axis_states,
+            high_value_queue=high_value_queue,
+            medium_value_queue=medium_value_queue,
+            backfill_queue=backfill_queue,
+            dedupe_stats=dedupe_stats,
+            remaining_budget_ratio=_remaining_budget_ratio(
+                started_at=started_at,
+                deadline_at=deadline_at,
+            ),
+        )
 
     partial = _build_partial_result(
         run_tag=run_tag,
@@ -1718,13 +2423,79 @@ def run_liquidity_focus_search(
         status="running",
         stabilization_rounds_started=stabilization_rounds_started,
         replay_rounds_started=replay_rounds_started,
+        stop_reason_detail=stop_reason_detail,
+        search_diagnostics=_current_search_diagnostics(),
     )
     _write_outputs(run_root, partial)
 
     while True:
         did_work = False
+        remaining_budget_ratio = _remaining_budget_ratio(
+            started_at=started_at,
+            deadline_at=deadline_at,
+        )
 
-        if phase1_queue:
+        if replay_anchor_ready and (
+            high_value_queue or medium_value_queue or backfill_queue
+        ):
+            if high_value_queue:
+                candidate = high_value_queue.pop(0)
+                active_queue_name = "high"
+            elif medium_value_queue:
+                candidate = medium_value_queue.pop(0)
+                active_queue_name = "medium"
+            else:
+                candidate = backfill_queue.pop(0)
+                active_queue_name = "backfill"
+            replay_summary = run_replay_candidate_trial(
+                run_root=run_root,
+                experiment_index=next_experiment_index,
+                candidate=candidate,
+                cash=replay_cash,
+                selected_indices=replay_selected_indices,
+            )
+            replay_decision = judge_replay_candidate(
+                replay_summary,
+                baseline_summary=_metric(
+                    baselines,
+                    "phase2_replay",
+                    "summary",
+                    default={},
+                ),
+                best_summary=best_replay_summary
+                or _metric(
+                    baselines,
+                    "phase2_replay",
+                    "summary",
+                    default={},
+                ),
+            )
+            entry = _build_leaderboard_entry(
+                candidate=candidate,
+                summary=replay_summary,
+                decision=replay_decision,
+                stage_reached="replay",
+            )
+            leaderboard.append(entry)
+            replay_records.append(
+                {
+                    "candidate": dict(candidate),
+                    "summary": dict(replay_summary),
+                    "entry": dict(entry),
+                }
+            )
+            _update_axis_state(axis_states, entry)
+            if replay_decision.get("status") == "champion":
+                best_replay_summary = dict(replay_summary)
+                champion_entry = dict(entry)
+            next_experiment_index += 1
+            evaluated += 1
+            did_work = True
+            stop_reason_detail = "phase2_{}_candidate_evaluated".format(
+                active_queue_name
+            )
+
+        elif phase1_queue:
             candidate = phase1_queue.pop(0)
             candidate_labeled_df = _build_candidate_labeled_df(labeled_df, candidate)
             smoke_summary = run_focused_candidate_trial(
@@ -1747,14 +2518,14 @@ def run_liquidity_focus_search(
                 stage="smoke",
             )
             if smoke_decision.get("status") != "keep":
-                leaderboard.append(
-                    _build_leaderboard_entry(
-                        candidate=candidate,
-                        summary=smoke_summary,
-                        decision=smoke_decision,
-                        stage_reached="smoke",
-                    )
+                smoke_entry = _build_leaderboard_entry(
+                    candidate=candidate,
+                    summary=smoke_summary,
+                    decision=smoke_decision,
+                    stage_reached="smoke",
                 )
+                leaderboard.append(smoke_entry)
+                _update_axis_state(axis_states, smoke_entry)
             else:
                 full_summary = run_focused_candidate_trial(
                     run_root=run_root,
@@ -1788,9 +2559,11 @@ def run_liquidity_focus_search(
                             "entry": dict(entry),
                         }
                     )
+                _update_axis_state(axis_states, entry)
             next_experiment_index += 1
             evaluated += 1
             did_work = True
+            stop_reason_detail = "phase1_candidate_evaluated"
 
         elif not replay_anchor_ready:
             replay_anchor_candidate = _build_replay_candidate(
@@ -1814,118 +2587,191 @@ def run_liquidity_focus_search(
             best_replay_summary = dict(replay_anchor_summary)
             next_experiment_index += 1
             replay_anchor_ready = True
-            phase2_queue = _register_candidates(
+            round0_primary = _register_candidates(
                 build_replay_search_candidates(round_index=0),
                 discovered_signatures,
+                dedupe_stats,
+                blocked_signatures=blocked_signatures,
             )
-            replay_rounds_started = 1 if phase2_queue else 0
+            round0_profile_seeds = _register_candidates(
+                _build_replay_profile_seed_candidates(round_index=0),
+                discovered_signatures,
+                dedupe_stats,
+                blocked_signatures=blocked_signatures,
+            )
+            round0_backfill = _register_candidates(
+                _build_replay_artifact_backfill_candidates(round_index=0),
+                discovered_signatures,
+                dedupe_stats,
+                blocked_signatures=blocked_signatures,
+            )
+            for candidate_batch, seed_reason in [
+                (round0_primary, "phase2_round0_primary"),
+                (round0_profile_seeds, "phase2_round0_profile_seed"),
+                (round0_backfill, "phase2_round0_artifact_backfill"),
+            ]:
+                buckets = _split_replay_candidates_by_tier(
+                    candidate_batch,
+                    remaining_budget_ratio=remaining_budget_ratio,
+                )
+                high_value_queue = _extend_candidate_queue(
+                    high_value_queue,
+                    _annotate_candidates(
+                        buckets["high"],
+                        tier="high",
+                        seed_reason=seed_reason,
+                        axis_states=axis_states,
+                        remaining_budget_ratio=remaining_budget_ratio,
+                    ),
+                )
+                medium_value_queue = _extend_candidate_queue(
+                    medium_value_queue,
+                    _annotate_candidates(
+                        buckets["medium"],
+                        tier="medium",
+                        seed_reason=seed_reason,
+                        axis_states=axis_states,
+                        remaining_budget_ratio=remaining_budget_ratio,
+                    ),
+                )
+                backfill_queue = _extend_candidate_queue(
+                    backfill_queue,
+                    _annotate_candidates(
+                        buckets["backfill"],
+                        tier="backfill",
+                        seed_reason=seed_reason,
+                        axis_states=axis_states,
+                        remaining_budget_ratio=remaining_budget_ratio,
+                    ),
+                )
+            replay_rounds_started = 1 if (
+                high_value_queue or medium_value_queue or backfill_queue
+            ) else 0
             did_work = True
-
-        elif phase2_queue:
-            candidate = phase2_queue.pop(0)
-            replay_summary = run_replay_candidate_trial(
-                run_root=run_root,
-                experiment_index=next_experiment_index,
-                candidate=candidate,
-                cash=replay_cash,
-                selected_indices=replay_selected_indices,
-            )
-            replay_decision = judge_replay_candidate(
-                replay_summary,
-                baseline_summary=_metric(
-                    baselines,
-                    "phase2_replay",
-                    "summary",
-                    default={},
-                ),
-                best_summary=best_replay_summary or _metric(
-                    baselines,
-                    "phase2_replay",
-                    "summary",
-                    default={},
-                ),
-            )
-            entry = _build_leaderboard_entry(
-                candidate=candidate,
-                summary=replay_summary,
-                decision=replay_decision,
-                stage_reached="replay",
-            )
-            leaderboard.append(entry)
-            replay_records.append(
-                {
-                    "candidate": dict(candidate),
-                    "summary": dict(replay_summary),
-                    "entry": dict(entry),
-                }
-            )
-            if replay_decision.get("status") == "champion":
-                best_replay_summary = dict(replay_summary)
-                champion_entry = dict(entry)
-            next_experiment_index += 1
-            evaluated += 1
-            did_work = True
+            stop_reason_detail = "phase2_anchor_ready"
 
         else:
             expanded = False
 
-            if replay_anchor_ready and phase2_round_index + 1 < max_replay_rounds:
+            if replay_anchor_ready and phase2_round_index + 1 < effective_max_replay_rounds:
                 next_round = phase2_round_index + 1
-                ranked_replay_records = sorted(
-                    replay_records,
-                    key=lambda item: (
-                        -float(
-                            _metric(
-                                item.get("summary") or {},
-                                "replay",
-                                "composite_score",
-                            )
-                        ),
-                        float(
-                            _metric(
-                                item.get("summary") or {},
-                                "portfolio",
-                                "max_drawdown",
-                            )
-                        ),
-                        -float(
-                            _metric(
-                                item.get("summary") or {},
-                                "replay",
-                                "stability_score",
-                            )
-                        ),
-                    ),
+                ranked_replay_records = _rank_replay_records(replay_records)
+                queue_before = (
+                    len(high_value_queue)
+                    + len(medium_value_queue)
+                    + len(backfill_queue)
                 )
-                next_candidates = _register_candidates(
+                round_primary = _register_candidates(
                     build_replay_search_candidates(
                         round_index=next_round,
                         replay_entries=ranked_replay_records,
                         tried_signatures=discovered_signatures,
                     ),
                     discovered_signatures,
+                    dedupe_stats,
+                    blocked_signatures=blocked_signatures,
                 )
-                if next_candidates:
+                round_profile_seeds = _register_candidates(
+                    _build_replay_profile_seed_candidates(
+                        round_index=next_round,
+                        replay_entries=ranked_replay_records,
+                    ),
+                    discovered_signatures,
+                    dedupe_stats,
+                    blocked_signatures=blocked_signatures,
+                )
+                round_backfill = _register_candidates(
+                    _build_replay_artifact_backfill_candidates(
+                        round_index=next_round,
+                        replay_entries=ranked_replay_records,
+                    ),
+                    discovered_signatures,
+                    dedupe_stats,
+                    blocked_signatures=blocked_signatures,
+                )
+                for candidate_batch, seed_reason in [
+                    (round_primary, "phase2_round{}_primary".format(next_round)),
+                    (
+                        round_profile_seeds,
+                        "phase2_round{}_profile_seed".format(next_round),
+                    ),
+                    (
+                        round_backfill,
+                        "phase2_round{}_artifact_backfill".format(next_round),
+                    ),
+                ]:
+                    buckets = _split_replay_candidates_by_tier(
+                        candidate_batch,
+                        remaining_budget_ratio=remaining_budget_ratio,
+                    )
+                    high_value_queue = _extend_candidate_queue(
+                        high_value_queue,
+                        _annotate_candidates(
+                            buckets["high"],
+                            tier="high",
+                            seed_reason=seed_reason,
+                            axis_states=axis_states,
+                            remaining_budget_ratio=remaining_budget_ratio,
+                        ),
+                    )
+                    medium_value_queue = _extend_candidate_queue(
+                        medium_value_queue,
+                        _annotate_candidates(
+                            buckets["medium"],
+                            tier="medium",
+                            seed_reason=seed_reason,
+                            axis_states=axis_states,
+                            remaining_budget_ratio=remaining_budget_ratio,
+                        ),
+                    )
+                    backfill_queue = _extend_candidate_queue(
+                        backfill_queue,
+                        _annotate_candidates(
+                            buckets["backfill"],
+                            tier="backfill",
+                            seed_reason=seed_reason,
+                            axis_states=axis_states,
+                            remaining_budget_ratio=remaining_budget_ratio,
+                        ),
+                    )
+                queue_after = (
+                    len(high_value_queue)
+                    + len(medium_value_queue)
+                    + len(backfill_queue)
+                )
+                if queue_after > queue_before:
                     phase2_round_index = next_round
                     replay_rounds_started += 1
-                    phase2_queue = next_candidates
                     expanded = True
+                    stop_reason_detail = "phase2_expanded_round_{}".format(next_round)
 
-            if (not expanded) and phase1_round_index + 1 < max_stabilization_rounds:
+            if (not expanded) and phase1_round_index + 1 < effective_max_stabilization_rounds:
                 next_round = phase1_round_index + 1
                 next_candidates = _register_candidates(
                     build_liquidity_focus_candidates(
                         round_index=next_round,
-                        frontier_entries=frontier_records,
+                        frontier_entries=_rank_frontier_records(frontier_records),
                         tried_signatures=discovered_signatures,
                     ),
                     discovered_signatures,
+                    dedupe_stats,
+                    blocked_signatures=blocked_signatures,
                 )
                 if next_candidates:
+                    phase1_queue = _extend_candidate_queue(
+                        phase1_queue,
+                        _annotate_candidates(
+                            next_candidates,
+                            tier="backfill" if replay_anchor_ready else "medium",
+                            seed_reason="phase1_round{}_frontier".format(next_round),
+                            axis_states=axis_states,
+                            remaining_budget_ratio=remaining_budget_ratio,
+                        ),
+                    )
                     phase1_round_index = next_round
                     stabilization_rounds_started += 1
-                    phase1_queue = next_candidates
                     expanded = True
+                    stop_reason_detail = "phase1_expanded_round_{}".format(next_round)
 
             if not expanded:
                 replay_crash_count = int(
@@ -1938,8 +2784,10 @@ def run_liquidity_focus_search(
                 )
                 if replay_crash_count > 0:
                     status = "infra_stalled"
+                    stop_reason_detail = "replay_infra_failures_blocked_budget_loop"
                 else:
-                    status = "completed"
+                    status = "value_pool_exhausted"
+                    stop_reason_detail = "all_value_queues_exhausted"
                 break
             did_work = True
 
@@ -1956,12 +2804,15 @@ def run_liquidity_focus_search(
             status="running",
             stabilization_rounds_started=stabilization_rounds_started,
             replay_rounds_started=replay_rounds_started,
+            stop_reason_detail=stop_reason_detail,
+            search_diagnostics=_current_search_diagnostics(),
         )
         _write_outputs(run_root, partial)
 
         # 时间预算是上限而不是硬停点，因此只在当前单元工作完成后检查。
         if did_work and datetime.now() >= deadline_at:
             status = "time_budget_reached"
+            stop_reason_detail = "wall_clock_budget_reached"
             break
 
     result = _build_partial_result(
@@ -1977,6 +2828,8 @@ def run_liquidity_focus_search(
         status=status,
         stabilization_rounds_started=stabilization_rounds_started,
         replay_rounds_started=replay_rounds_started,
+        stop_reason_detail=stop_reason_detail,
+        search_diagnostics=_current_search_diagnostics(),
     )
     _write_outputs(run_root, result)
     return result

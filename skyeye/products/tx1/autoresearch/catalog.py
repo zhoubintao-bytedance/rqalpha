@@ -161,9 +161,16 @@ def build_candidate_config(
 ):
     """把候选定义展开成 `main(...)` 可直接消费的配置。"""
     candidate = dict(candidate)
+    candidate_model = deepcopy(candidate.get("model") or {})
+    resolved_model = {
+        "kind": str(candidate_model.get("kind") or model_kind),
+    }
+    if candidate_model.get("params") is not None:
+        # 候选级模型参数优先于全局默认，便于 autoresearch 显式搜索正则强度。
+        resolved_model["params"] = deepcopy(candidate_model.get("params") or {})
     config = {
         "experiment_name": "tx1_autoresearch_{}".format(candidate["id"]),
-        "model": {"kind": model_kind},
+        "model": resolved_model,
         "features": list(candidate["features"]),
         "labels": {
             "transform": label_transform,

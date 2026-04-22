@@ -93,15 +93,25 @@ def _replay_summary(
 
 def test_build_liquidity_focus_candidates_targets_stabilization_grid():
     candidates = focused_search.build_liquidity_focus_candidates()
+    anchor_signature = focused_search._candidate_signature(
+        focused_search._build_proxy_anchor_candidate(model_kind="lgbm")
+    )
 
-    assert len(candidates) == 3
+    assert len(candidates) == 2
     assert {candidate["phase"] for candidate in candidates} == {"phase1"}
     assert {candidate["evaluation_mode"] for candidate in candidates} == {"proxy"}
+    assert {
+        str(candidate.get("reg_profile")) for candidate in candidates
+    } == {"heavy_reg", "ultra_reg"}
     assert {
         (candidate.get("model") or {}).get("kind") for candidate in candidates
     } == {"lgbm"}
     assert all(
         not (candidate.get("preprocessing") or {}).get("enabled", False)
+        for candidate in candidates
+    )
+    assert all(
+        focused_search._candidate_signature(candidate) != anchor_signature
         for candidate in candidates
     )
     assert any((candidate.get("model") or {}).get("params") for candidate in candidates)
@@ -141,6 +151,146 @@ def test_build_replay_probe_neighbors_skips_anchor_equivalent_noop_override():
         candidate.get("tx1_profile_overrides") == {"turnover_threshold": 0.20}
         for candidate in neighbors
     )
+
+
+def test_build_liquidity_focus_candidates_uses_frontier_entries_for_backfill():
+    candidates = focused_search.build_liquidity_focus_candidates(
+        round_index=3,
+        frontier_entries=[
+            {
+                "candidate": {
+                    "reg_profile": "default",
+                    "model": {"kind": "lgbm"},
+                    "preprocessing": None,
+                }
+            }
+        ],
+    )
+
+    assert any(
+        (candidate.get("preprocessing") or {}).get("enabled", False)
+        for candidate in candidates
+    )
+    assert {"default", "heavy_reg", "slow_lr"} <= {
+        str(candidate.get("reg_profile"))
+        for candidate in candidates
+    }
+
+
+def test_build_liquidity_focus_candidates_backfill_skips_proxy_anchor_equivalent_neighbor():
+    candidates = focused_search.build_liquidity_focus_candidates(
+        round_index=3,
+        frontier_entries=[
+            {
+                "candidate": {
+                    "reg_profile": "heavy_reg",
+                    "model": {"kind": "lgbm"},
+                    "preprocessing": None,
+                }
+            }
+        ],
+    )
+
+    anchor_signature = focused_search._candidate_signature(
+        focused_search._build_proxy_anchor_candidate(model_kind="lgbm")
+    )
+    assert all(
+        focused_search._candidate_signature(candidate) != anchor_signature
+        for candidate in candidates
+    )
+    assert {
+        str(candidate.get("reg_profile")) for candidate in candidates
+    } == {"heavy_reg", "ultra_reg", "leaf_guard"}
+
+
+def test_build_replay_profile_seed_candidates_prefers_neighbor_profiles():
+    candidates = focused_search._build_replay_profile_seed_candidates(
+        round_index=1,
+        replay_entries=[
+            {
+                "candidate": {
+                    "artifact_line_id": "combo_b25_h45",
+                    "strategy_profile": "smooth",
+                },
+                "entry": {"status": "keep"},
+                "summary": {"replay": {"num_windows": 5}},
+            }
+        ],
+    )
+
+    assert {"baseline", "soft_sticky"} <= {
+        candidate["strategy_profile"] for candidate in candidates
+    }
+    assert not any(candidate["strategy_profile"] == "smooth" for candidate in candidates)
+
+
+def test_update_axis_state_freezes_unproductive_phase2_axis():
+    axis_key = "phase2:combo_b25_h45:smooth:turnover_threshold"
+    axis_states = {}
+    entry = {
+        "phase": "phase2",
+        "status": "discard",
+        "reason_code": "replay_no_material_improvement",
+        "search_axis": axis_key,
+        "score_delta": {},
+        "metrics": {
+            "composite_score": 50.0,
+            "net_mean_return": 0.10,
+            "max_drawdown": 0.08,
+            "stability_score": 3.0,
+        },
+        "risk_codes": [],
+    }
+
+    for _ in range(3):
+        focused_search._update_axis_state(axis_states, entry)
+
+    assert axis_states[axis_key]["frozen"] is True
+    assert axis_states[axis_key]["no_improvement_streak"] == 3
+
+
+def test_resolve_round_cap_expands_for_longer_budgets():
+    assert (
+        focused_search._resolve_round_cap(
+            requested_rounds=4,
+            max_runtime_hours=8.0,
+            phase="phase2",
+        )
+        > 4
+    )
+    assert (
+        focused_search._resolve_round_cap(
+            requested_rounds=3,
+            max_runtime_hours=8.0,
+            phase="phase1",
+        )
+        > 3
+    )
+
+
+def test_register_candidates_skips_blocked_proxy_anchor_signature():
+    discovered_signatures = set()
+    dedupe_stats = {"duplicate_skips": 0}
+    proxy_anchor = focused_search._build_proxy_anchor_candidate(model_kind="lgbm")
+    duplicate_candidate = focused_search._build_proxy_candidate(
+        round_index=0,
+        model_kind="lgbm",
+        reg_profile="default",
+        use_preprocessing=False,
+    )
+
+    fresh_candidates = focused_search._register_candidates(
+        [duplicate_candidate],
+        discovered_signatures,
+        dedupe_stats,
+        blocked_signatures={
+            focused_search._candidate_signature(proxy_anchor),
+        },
+    )
+
+    assert fresh_candidates == []
+    assert discovered_signatures == set()
+    assert dedupe_stats["duplicate_skips"] == 1
 
 
 def test_apply_cross_section_filter_keeps_only_rows_above_per_date_median():
@@ -563,6 +713,16 @@ def test_run_liquidity_focus_search_runs_two_phase_budget_loop(monkeypatch, tmp_
     )
     monkeypatch.setattr(
         focused_search,
+        "_build_replay_profile_seed_candidates",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        focused_search,
+        "_build_replay_artifact_backfill_candidates",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        focused_search,
         "run_focused_candidate_trial",
         _fake_run_focused_candidate_trial,
     )
@@ -593,7 +753,8 @@ def test_run_liquidity_focus_search_runs_two_phase_budget_loop(monkeypatch, tmp_
         max_replay_rounds=2,
     )
 
-    assert result["status"] == "completed"
+    assert result["status"] == "value_pool_exhausted"
+    assert result["stop_reason_detail"] == "all_value_queues_exhausted"
     assert result["phase_progress"]["stabilization_rounds_started"] == 2
     assert result["phase_progress"]["replay_rounds_started"] == 2
     assert result["candidates_total"] == 4
@@ -602,6 +763,7 @@ def test_run_liquidity_focus_search_runs_two_phase_budget_loop(monkeypatch, tmp_
     assert result["baselines"]["phase2_replay"]["candidate_id"].startswith("replay_r0_combo_b25_h45_smooth")
     assert result["champion"]["candidate_id"] == "replay_b"
     assert result["frontier"][0]["candidate_id"] == "phase1_a"
+    assert result["search_diagnostics"]["axes_total"] >= 2
 
     run_root = tmp_path / "runs" / "demo"
     assert (run_root / "focused_results.json").exists()
@@ -610,6 +772,8 @@ def test_run_liquidity_focus_search_runs_two_phase_budget_loop(monkeypatch, tmp_
     payload = json.loads((run_root / "focused_results.json").read_text(encoding="utf-8"))
     assert payload["leaderboard"][0]["candidate_id"] == "replay_b"
     assert {entry["evaluation_mode"] for entry in payload["leaderboard"]} == {"proxy", "replay"}
+    assert payload["status"] == "value_pool_exhausted"
+    assert payload["search_diagnostics"]["high_value_queue_size"] == 0
     assert phase_calls[:4] == [
         ("proxy", "tx1_autoresearch_liquidity_plus_anchor", "proxy_anchor"),
         ("proxy", "tx1_autoresearch_phase1_a", "smoke"),

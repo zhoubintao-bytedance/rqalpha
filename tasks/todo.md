@@ -1233,3 +1233,128 @@
   - 主裁决：`rolling_score` 打分器
   - 主搜索轴：`turnover_threshold` 小邻域、`rebalance_interval`、`holding_bonus`
   - 辅助口径：proxy / 其他评分器只做 pruning 和诊断，不再单独决定默认线
+
+# TX1 live package 2026-04-21 刷新
+
+- [x] 核对最新 commit 改动与 live package 配置链路，确认哪些参数会进入产包
+- [x] 选择当前最新可用 TX1 实验并重建 live package
+- [x] 运行 live advisor / 检查 manifest 与组件，验证新包日期、参数边界和可用性
+- [x] 在本节末尾记录 review
+
+## Review
+
+- 最新 commit `a9289ed0` 实际改动的是执行层默认 profile：
+  - `skyeye/products/tx1/strategies/rolling_score/profiles/smooth.yaml`
+  - `turnover_threshold: 0.30 -> 0.20`
+- 当前 live package 生产链路仍只从研究实验配置里带出 `portfolio_policy` 的这几项：
+  - `buy_top_k`
+  - `hold_top_k`
+  - `rebalance_interval`
+  - `holding_bonus`
+- 也就是说，这次 commit 里的执行层参数 `turnover_threshold / single_stock_cap` 目前不会自动进 live package；本轮重建后 `portfolio_policy.json` 仍是：
+  - `{'buy_top_k': 25, 'hold_top_k': 45, 'rebalance_interval': 20, 'holding_bonus': 0.5}`
+- 本轮先基于当前最新研究实验 `skyeye/artifacts/experiments/tx1/tx1_refresh_20260413_lgbm/experiment.json` 重建了两版包：
+  - 对齐实验日期的保守包：`tx1_canary_live_tx1_refresh_20260413_lgbm_20260313`
+  - 按当前本地最新数据终点 `2026-04-21` 重建的最新包：`tx1_canary_live_tx1_refresh_20260413_lgbm_20260323`
+- 最终最新 live package：
+  - 路径：`skyeye/artifacts/packages/tx1/tx1_canary_live_tx1_refresh_20260413_lgbm_20260323`
+  - `package_type=canary_live`
+  - `fit_end_date=2026-03-23`
+  - `data_end_date=2026-04-21`
+  - `evidence_end_date=2026-03-23`
+- 真实 CLI smoke：
+  - 命令：`env PYTHONPATH=/home/tiger/rqalpha MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python -m skyeye.products.tx1.run_live_advisor --package-id tx1_canary_live_tx1_refresh_20260413_lgbm_20260323 --packages-root skyeye/artifacts/packages/tx1 --trade-date 2026-04-21 --top-k 3 --universe-cache-root /tmp/tx1_live_universe_cache --format json`
+  - 结果：`status=ok`
+  - `requested_trade_date=latest_available_trade_date=score_date=raw_data_end_date=2026-04-21`
+  - `model_freshness` / `evidence_freshness` 为 `warning`，`gap_days=21`，未 stop-serve
+  - Top3：`300433.XSHE`、`601985.XSHG`、`600028.XSHG`
+
+# TX1 autoresearch 预算优先自动扩表版
+
+- [x] 输出 Spec 第 1 段：现状分析，确认当前 focused runner 为什么提前跑完，以及哪些扩表边界在过早耗尽候选
+- [x] 等待用户确认 Spec 第 1 段
+- [x] 输出 Spec 第 2 段：方案选项与推荐，明确如何在“不浪费算力”的前提下把 wall-clock 预算尽量吃满
+- [x] 等待用户确认 Spec 第 2 段
+- [x] 输出 Spec 第 3 段：风险、停止条件、验证口径与实现清单
+- [x] 等待用户 HARD-GATE 确认
+- [x] 实现 focused_search.py 预算优先自动扩表：高价值种子排序、收益递减剪枝、阶段化候选池补量
+- [x] 按需要调整 4h runner 参数与结果落盘字段，显式区分 budget 用尽 / 候选池耗尽 / 价值阈值停机
+- [x] 补充 focused search 回归测试：覆盖扩表策略、去重策略、低价值剪枝和 4h/8h 预算行为
+- [x] 运行定向验证并在本节末尾记录 review
+
+## Review
+
+- `skyeye/products/tx1/autoresearch/focused_search.py` 已从“候选扫空就 completed”改成预算优先调度：
+  - phase-2 现在拆成 `high / medium / backfill` 三层队列，优先消费最可能带来收益的 replay 候选
+  - 新增搜索轴识别、轴级价值分和收益递减冻结逻辑；同一方向连续多次无材料性改进后会被 `frozen`
+  - replay 扩表不再只围绕固定 `top2`，而是放宽到最多 `top4` 健康源，再叠加 profile seed 和 artifact backfill
+  - phase-1 在固定三轮之外，允许围绕已有 frontier 做有限、低成本的 preprocessing / 邻近正则补量
+- 结果落盘语义已升级：
+  - 新增 `stop_reason_detail`
+  - 新增 `search_diagnostics`
+  - `phase_progress` 新增 `high_value_queue_size / medium_value_queue_size / backfill_queue_size / axes_total / axes_frozen`
+  - 候选池提前耗尽时不再写模糊的 `completed`，而是写 `value_pool_exhausted`
+  - budget 用尽仍写 `time_budget_reached`
+  - replay 链路异常仍写 `infra_stalled`
+- `tests/products/tx1/test_autoresearch_focused_search.py` 已补充覆盖：
+  - phase-1 frontier backfill
+  - replay profile seed
+  - 低价值 phase-2 轴冻结
+  - 长预算 round cap 自动放大
+  - budget loop 新状态 `value_pool_exhausted` 和 `search_diagnostics`
+- 定向验证：
+  - `env PYTHONPATH=/home/tiger/rqalpha /home/tiger/miniconda3/bin/python -m py_compile skyeye/products/tx1/autoresearch/focused_search.py tests/products/tx1/test_autoresearch_focused_search.py`
+  - `env PYTHONPATH=/home/tiger/rqalpha MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python -m pytest tests/products/tx1/test_autoresearch_focused_search.py -q`
+  - 结果：`11 passed`
+  - `env PYTHONPATH=/home/tiger/rqalpha MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python -m pytest tests/products/tx1/test_tx1_runtime.py tests/products/tx1/test_autoresearch_focused_search.py tests/products/tx1/test_run_autoresearch.py tests/products/tx1/test_autoresearch_search.py -q`
+  - 结果：`41 passed`
+  - `env PYTHONPATH=/home/tiger/rqalpha MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python skyeye/tmp/run_tx1_autoresearch_4h.py --help`
+  - 结果：CLI 正常打印 help
+
+# TX1 autoresearch phase-1 anchor 等价候选去重
+
+- [x] 修复 `focused_search.py`：避免 phase-1 生成或注册与 proxy anchor 等价的 `default/raw` no-op 候选
+- [x] 补充 focused search 回归测试：覆盖 round-0 seed 和 frontier backfill 两条链路
+- [x] 运行定向验证并在本节末尾记录 review
+
+## Review
+
+- `skyeye/products/tx1/autoresearch/focused_search.py` 现已把 proxy anchor 抽成统一 helper，并在两层拦住 anchor 等价候选：
+  - `build_liquidity_focus_candidates()` 在 round-0 seed 和 frontier backfill 生成后，都会过滤掉与 proxy anchor 完全等价的 `default/raw` no-op 候选
+  - `_register_candidates()` 新增 `blocked_signatures`，runner 会把 proxy anchor 签名作为保留签名传入，防止未来别的扩表路径再次把同一配置塞回 phase-1 队列
+- 这次修复后，phase-1 不会再白跑与 anchor 完全相同的一轮 smoke/full，也不会再把这个 no-op 候选错误写成 `frontier_seed`
+- `tests/products/tx1/test_autoresearch_focused_search.py` 已新增/更新覆盖：
+  - round-0 seed 不再产出 anchor 等价候选
+  - heavy_reg frontier backfill 不再回补出 anchor 等价的 `default/raw`
+  - `_register_candidates()` 会跳过被 proxy anchor 签名拦住的重复候选
+- 定向验证：
+  - `env PYTHONPATH=/home/tiger/rqalpha /home/tiger/miniconda3/bin/python -m py_compile skyeye/products/tx1/autoresearch/focused_search.py tests/products/tx1/test_autoresearch_focused_search.py`
+  - 结果：通过
+  - `env PYTHONPATH=/home/tiger/rqalpha MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python -m pytest tests/products/tx1/test_autoresearch_focused_search.py -q`
+  - 结果：`13 passed, 1 warning`
+  - `env PYTHONPATH=/home/tiger/rqalpha MPLCONFIGDIR=/tmp/mplconfig /home/tiger/miniconda3/bin/python -m pytest tests/products/tx1/test_autoresearch_search.py -q`
+  - 结果：`1 passed, 1 warning`
+
+# TX1 autoresearch 8h 过夜 run 复盘
+
+- [x] 核对 `tx1_autoresearch_8h_20260421_233939` 最终状态与运行时长
+- [x] 汇总 replay / proxy 候选结果，确认是否出现新 champion
+- [x] 记录本轮有效发现与下一轮搜索边界
+
+## Review
+
+- 过夜 run：
+  - 路径：`skyeye/artifacts/experiments/tx1_autoresearch/tx1_autoresearch_8h_20260421_233939`
+  - 开始时间：`2026-04-21 23:39:40 +0800`
+  - 最后更新时间：`2026-04-22 01:42:28 +0800`
+  - 实际运行时长：`122.8` 分钟
+  - 结束状态：`value_pool_exhausted`
+  - 停止原因：`all_value_queues_exhausted`
+- 本轮搜索一共发现 `30` 个候选，实际评估 `28` 个；没有出现新的 `keep` 或 `champion`。
+- phase-2 replay 的最优结果仍停在默认 `combo_b25_h45@smooth` 锚点附近；`single_stock_cap=0.08` 与 anchor 的 `composite_score=54.088157`、`net_mean_return=0.210980`、`max_drawdown=0.136182` 完全一致，说明这组执行层 override 在当前 replay 链路里没有形成可观测增益。
+- 多个 replay 邻域表现出“名义不同、结果等价”的特征：
+  - `single_stock_cap=0.07 / 0.08 / 0.09` 完全等价
+  - `baseline profile` 与 `smooth + turnover_threshold=0.30` 完全等价
+  - `turnover_threshold=0.25` 与 `single_stock_cap=0.09 + turnover_threshold=0.25` 完全等价
+- phase-1 proxy 稳化线只产出了 `frontier_seed`，没有突破 baseline；继续叠加 preprocessing 后反而退化，`slow_lr_preproc` / `ultra_reg_preproc` 都触发了 `guardrail_failed`。
+- 这轮夜跑的主要价值是压缩无效搜索空间，而不是发现新默认线；下一轮需要优先扩 artifact family 或真实会改变执行语义的搜索轴，而不是继续在 `combo_b25_h45 + smooth` 的近邻上重复枚举。
