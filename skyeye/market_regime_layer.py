@@ -492,6 +492,22 @@ def _compute_direction_label_and_scores(
     }
     direction = _weighted_avg(direction_components, cfg.direction_weights)
 
+    # 计算 ATR 绝对值（供 factor_layer 复用）
+    atr_value = None
+    if high_s is not None and low_s is not None:
+        h = pd.Series(high_s).astype(float)
+        l = pd.Series(low_s).astype(float)
+        prev_close = close.shift(1)
+        tr = np.maximum.reduce(
+            [
+                (h - l).to_numpy(dtype=float),
+                (h - prev_close).abs().to_numpy(dtype=float),
+                (l - prev_close).abs().to_numpy(dtype=float),
+            ]
+        )
+        atr_series = pd.Series(_wilder_smooth(tr, cfg.atr_window), index=close.index)
+        atr_value = _safe_float(atr_series.iloc[-1])
+
     diag.update(
         {
             "trendiness_components": trendiness_components,
@@ -499,6 +515,9 @@ def _compute_direction_label_and_scores(
             "adx": adx,
             "hurst": hurst,
             "atr_ratio": atr_ratio,
+            "atr_value": atr_value,  # ATR 绝对值（供 factor_layer 复用）
+            "macd_histogram_value": _safe_float(macd_hist.iloc[-1]) if macd_hist is not None else None,  # MACD histogram 当前值
+            "rsrs_zscore": rsrs,  # RSRS zscore（供 factor_layer 复用）
             "direction": direction,
             "trendiness": trendiness,
         }
