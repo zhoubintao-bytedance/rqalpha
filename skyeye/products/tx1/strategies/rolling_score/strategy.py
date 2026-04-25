@@ -13,6 +13,7 @@ from rqalpha.environment import Environment
 
 from skyeye.products.tx1.strategies.rolling_score.replay import (
     build_execution_universe,
+    check_stop_loss,
     compute_turnover_ratio,
     sanitize_target_weights,
     smooth_target_weights,
@@ -51,7 +52,18 @@ def init(context):
         "executed_rebalances": 0,
         "missing_signal_days": 0,
         "turnover_skips": 0,
+        "stop_loss_triggers": 0,
+        "stop_loss_sells": 0,
     }
+
+    # Stop-loss configuration
+    context.tx1_stop_loss_pct = float(
+        context.tx1_profile.get("stop_loss_pct", 0) or 0
+    )
+    context.tx1_stop_loss_cooldown_days = int(
+        context.tx1_profile.get("stop_loss_cooldown_days", 0) or 0
+    )
+    context.tx1_stop_loss_cooldown: dict[str, str] = {}
 
     logger.info(
         (
@@ -95,6 +107,24 @@ def before_trading(context):
             min_weight=context.tx1_ema_min_weight,
         )
 
+    # Filter out stocks in stop-loss cooldown period
+    if context.tx1_stop_loss_cooldown_days > 0 and context.tx1_stop_loss_cooldown:
+        trade_date_str = _current_trade_date().strftime("%Y-%m-%d")
+        cooled = []
+        for stock_id, stop_date in context.tx1_stop_loss_cooldown.items():
+            days_since = _trading_days_between(stop_date, trade_date_str)
+            if days_since >= context.tx1_stop_loss_cooldown_days:
+                cooled.append(stock_id)
+        for stock_id in cooled:
+            del context.tx1_stop_loss_cooldown[stock_id]
+
+        if context.tx1_stop_loss_cooldown:
+            tradable_target = {
+                sid: w
+                for sid, w in tradable_target.items()
+                if sid not in context.tx1_stop_loss_cooldown
+            }
+
     context.tx1_pending_target = tradable_target
 
     current_weights = _current_portfolio_weights(context)
@@ -110,6 +140,27 @@ def handle_bar(context, bar_dict):
         return
     context.tx1_last_execution_date = trade_date
 
+    # ① Stop-loss check: sell before regular rebalance
+    if context.tx1_stop_loss_pct > 0:
+        positions = context.portfolio.positions
+        stop_ids = check_stop_loss(positions, context.tx1_stop_loss_pct)
+        if stop_ids:
+            context.tx1_diagnostics["stop_loss_triggers"] += len(stop_ids)
+            for order_book_id in stop_ids:
+                position = positions[order_book_id]
+                quantity = getattr(position, "quantity", 0) or 0
+                if quantity > 0:
+                    order_shares(order_book_id, -quantity)
+                    context.tx1_diagnostics["stop_loss_sells"] += 1
+                    if context.tx1_stop_loss_cooldown_days > 0:
+                        context.tx1_stop_loss_cooldown[order_book_id] = trade_date
+            logger.info(
+                "TX1 stop-loss triggered: {} stocks on {}".format(
+                    len(stop_ids), trade_date
+                )
+            )
+
+    # ② Regular rebalance
     target_portfolio = context.tx1_pending_target
     if target_portfolio is None:
         return
@@ -178,3 +229,23 @@ def _previous_trading_date_text() -> str:
         Environment.get_instance().trading_dt
     )
     return previous.date().strftime("%Y-%m-%d")
+
+
+def _trading_days_between(start_date_str: str, end_date_str: str) -> int:
+    """Count trading days between two date strings (exclusive of both endpoints)."""
+    from datetime import datetime
+
+    env = Environment.get_instance()
+    start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+
+    # Count trading dates from start+1 to end-1 (exclusive both ends)
+    count = 0
+    current = start
+    while current < end:
+        next_td = env.data_proxy.get_next_trading_date(current)
+        if next_td is None or next_td.date() >= end:
+            break
+        count += 1
+        current = next_td.date()
+    return count

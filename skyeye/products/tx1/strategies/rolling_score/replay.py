@@ -90,6 +90,56 @@ def smooth_target_weights(
     return (normalized, dict(new_state))
 
 
+def check_stop_loss(
+    positions: Mapping,
+    stop_loss_pct: float,
+) -> list[str]:
+    """Return order_book_ids whose unrealized loss exceeds the threshold.
+
+    For each position with quantity > 0:
+        unrealized_pnl = (last_price - avg_price) / avg_price
+        if unrealized_pnl < -stop_loss_pct → trigger stop loss.
+
+    Returns a list of order_book_ids to sell immediately.
+
+    TODO(future): Re-evaluate stop-loss for concentrated portfolios (5-10 stocks).
+    Rolling-score experiments (2019-02 ~ 2026-01, 25 windows) show that per-stock
+    stop-loss is net-negative for TX1's current 25-45 stock diversified portfolio:
+
+      baseline (no stop-loss):  composite 50.4, stability 3,  annual 20.9%, sharpe 0.79
+      8%  stop-loss:            composite 47.1, stability 0,  annual 19.4%, sharpe 0.66
+      12% stop-loss:            composite 44.6, stability 0,  annual 19.7%, sharpe 0.67
+
+    Key findings:
+    - Per-stock stop-loss in a diversified portfolio amplifies drawdowns in weak
+      markets (worst quarter -29 vs -3 without stop-loss).
+    - After stop-loss, capital IS redeployed via order_target_portfolio, but the
+      replacement stocks also tend to decline in weak markets, while the cooldown
+      period (5 days) blocks re-entry on rebounds.
+    - A single stock's 8% loss on a ~4% weight only costs the portfolio ~0.3%,
+      but the stop-loss chain reaction (missed rebound + replacement cost) often
+      exceeds that.
+    - Stop-loss may work better for concentrated portfolios or with market-regime
+      gating (only activate when the broad market is in a downtrend).
+    """
+    if stop_loss_pct <= 0:
+        return []
+
+    triggers: list[str] = []
+    for order_book_id, position in positions.items():
+        quantity = getattr(position, "quantity", 0) or 0
+        if quantity <= 0:
+            continue
+        avg_price = float(getattr(position, "avg_price", 0.0) or 0.0)
+        last_price = float(getattr(position, "last_price", 0.0) or 0.0)
+        if avg_price <= 0 or last_price <= 0:
+            continue
+        unrealized_pnl = (last_price - avg_price) / avg_price
+        if unrealized_pnl < -stop_loss_pct:
+            triggers.append(order_book_id)
+    return triggers
+
+
 def build_execution_universe(
     target_weights: Mapping[str, float] | None,
     current_holdings: Mapping[str, float] | Iterable[str] | None,

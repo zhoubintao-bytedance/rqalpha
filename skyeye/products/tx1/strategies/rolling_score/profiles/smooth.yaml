@@ -11,3 +11,5 @@ stamp_tax_rate: 0.0005
 slippage_bps: 5.0
 ema_halflife: 5
 ema_min_weight: 0.005
+stop_loss_pct: 0
+stop_loss_cooldown_days: 0
