@@ -71,6 +71,45 @@ FUNDAMENTAL_FEATURE_COLUMNS = [
     "pcf_ratio_ttm",
 ]
 
+FACTOR_LAYER_COLUMNS = [
+    # momentum (always)
+    "fl_mom",
+    "fl_roc",
+    "fl_bias",
+    # oscillator (always)
+    "fl_rsi",
+    # oscillator (high+low)
+    "fl_kdj_k",
+    "fl_kdj_d",
+    "fl_kdj_j",
+    "fl_cci",
+    # trend (always)
+    "fl_macd",
+    "fl_ma_5",
+    "fl_ma_10",
+    "fl_ma_20",
+    "fl_ma_60",
+    "fl_ema_12",
+    "fl_ema_26",
+    # trend (high+low)
+    "fl_adx",
+    "fl_rsrs",
+    # volatility (always)
+    "fl_bbands_upper",
+    "fl_bbands_middle",
+    "fl_bbands_lower",
+    "fl_bbands_width",
+    # volatility (high+low)
+    "fl_atr",
+    "fl_dc_upper",
+    "fl_dc_lower",
+    "fl_dc_middle",
+    # volume
+    "fl_obv",
+    "fl_obv_ma",
+    "fl_mfi",
+]
+
 FEATURE_GROUPS = {
     "baseline_4f": list(BASELINE_4F_COLUMNS),
     "baseline": list(BASELINE_FEATURE_COLUMNS),
@@ -81,6 +120,7 @@ FEATURE_GROUPS = {
     "baseline_5f": list(BASELINE_5F_COLUMNS),
     "elite_ohlcv": list(ELITE_OHLCV_COLUMNS),
     "fundamental": list(FUNDAMENTAL_FEATURE_COLUMNS),
+    "factor_layer": list(FACTOR_LAYER_COLUMNS),
 }
 
 FEATURE_LIBRARY = {

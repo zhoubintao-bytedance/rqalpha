@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 
+import logging
+
 import numpy as np
 import pandas as pd
 
-from skyeye.products.tx1.evaluator import CANDIDATE_FEATURE_COLUMNS, FUNDAMENTAL_FEATURE_COLUMNS
+from skyeye.factor_layer.core import compute_all_factor_series
+from skyeye.products.tx1.evaluator import CANDIDATE_FEATURE_COLUMNS, FACTOR_LAYER_COLUMNS, FUNDAMENTAL_FEATURE_COLUMNS
 
+logger = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = ("date", "order_book_id", "close", "volume", "benchmark_close")
 
@@ -111,6 +115,21 @@ class DatasetBuilder(object):
                 asset_df["amihud_daily"] = asset_df["return_1d"].abs() / asset_df["total_turnover"].clip(lower=1.0)
                 asset_df["amihud_20d"] = asset_df["amihud_daily"].rolling(window=20, min_periods=20).mean()
 
+            # --- factor layer indicators (per-instrument, full time series) ---
+            try:
+                fl_high = asset_df["high"] if "high" in raw_df.columns else None
+                fl_low = asset_df["low"] if "low" in raw_df.columns else None
+                fl_series = compute_all_factor_series(
+                    close=asset_df["close"],
+                    high=fl_high,
+                    low=fl_low,
+                    volume=asset_df["volume"],
+                )
+                for col in fl_series.columns:
+                    asset_df[col] = fl_series[col].values
+            except Exception:
+                logger.debug("factor layer skipped for %s", asset_df["order_book_id"].iloc[0], exc_info=True)
+
             parts.append(asset_df)
 
         dataset = pd.concat(parts, ignore_index=True)
@@ -129,6 +148,8 @@ class DatasetBuilder(object):
             "volume",
         ]
         ordered_columns.extend(CANDIDATE_FEATURE_COLUMNS)
+        fl_cols_in_dataset = [c for c in FACTOR_LAYER_COLUMNS if c in dataset.columns]
+        ordered_columns.extend(fl_cols_in_dataset)
         if "sector" in dataset.columns:
             ordered_columns.append("sector")
 

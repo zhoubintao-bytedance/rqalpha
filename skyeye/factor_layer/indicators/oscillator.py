@@ -10,34 +10,71 @@ from skyeye.factor_layer.utils import add_factor_from_series, wilder_smooth
 if TYPE_CHECKING:
     from skyeye.market_regime_layer import MarketRegime
 
+_FL_RSI = "fl_rsi"
+_FL_KDJ_K = "fl_kdj_k"
+_FL_KDJ_D = "fl_kdj_d"
+_FL_KDJ_J = "fl_kdj_j"
+_FL_CCI = "fl_cci"
 
-def compute_oscillator_factors(
-    bars: pd.DataFrame, cfg: FactorLayerConfig, regime: "MarketRegime | None" = None
-) -> dict[str, dict[str, float]]:
-    close = pd.Series(bars["close"], dtype=float)
-    factors: dict[str, dict[str, float]] = {}
+
+def _compute_oscillator_raw(
+    close: pd.Series,
+    high: pd.Series | None,
+    low: pd.Series | None,
+    cfg: FactorLayerConfig,
+) -> dict[str, pd.Series]:
+    close = pd.Series(close, dtype=float)
+    result: dict[str, pd.Series] = {}
 
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
     rs = wilder_smooth(gain, cfg.rsi_period) / wilder_smooth(loss, cfg.rsi_period)
-    add_factor_from_series(factors, "RSI", 100.0 - 100.0 / (1.0 + rs), cfg.percentile_window)
+    result[_FL_RSI] = 100.0 - 100.0 / (1.0 + rs)
 
-    if {"high", "low"}.issubset(bars.columns):
-        high = pd.Series(bars["high"], dtype=float)
-        low = pd.Series(bars["low"], dtype=float)
-        highest = high.rolling(cfg.kdj_n).max()
-        lowest = low.rolling(cfg.kdj_n).min()
+    if high is not None and low is not None:
+        high_s = pd.Series(high, dtype=float)
+        low_s = pd.Series(low, dtype=float)
+        highest = high_s.rolling(cfg.kdj_n).max()
+        lowest = low_s.rolling(cfg.kdj_n).min()
         rsv = (close - lowest) / (highest - lowest) * 100.0
         k = rsv.ewm(alpha=1.0 / cfg.kdj_m1, adjust=False).mean()
         d = k.ewm(alpha=1.0 / cfg.kdj_m2, adjust=False).mean()
-        add_factor_from_series(factors, "KDJ_K", k, cfg.percentile_window)
-        add_factor_from_series(factors, "KDJ_D", d, cfg.percentile_window)
-        add_factor_from_series(factors, "KDJ_J", 3.0 * k - 2.0 * d, cfg.percentile_window)
+        result[_FL_KDJ_K] = k
+        result[_FL_KDJ_D] = d
+        result[_FL_KDJ_J] = 3.0 * k - 2.0 * d
 
-        typical_price = (high + low + close) / 3.0
+        typical_price = (high_s + low_s + close) / 3.0
         ma = typical_price.rolling(cfg.cci_period).mean()
         md = (typical_price - ma).abs().rolling(cfg.cci_period).mean()
-        add_factor_from_series(factors, "CCI", (typical_price - ma) / (0.015 * md), cfg.percentile_window)
+        result[_FL_CCI] = (typical_price - ma) / (0.015 * md)
 
+    return result
+
+
+def compute_oscillator_series(
+    close: pd.Series,
+    high: pd.Series | None = None,
+    low: pd.Series | None = None,
+    cfg: FactorLayerConfig | None = None,
+) -> pd.DataFrame:
+    cfg = cfg or FactorLayerConfig()
+    raw = _compute_oscillator_raw(close, high, low, cfg)
+    return pd.DataFrame(raw, index=close.index)
+
+
+def compute_oscillator_factors(
+    bars: pd.DataFrame, cfg: FactorLayerConfig, regime: "MarketRegime | None" = None
+) -> dict[str, dict[str, float]]:
+    close = pd.Series(bars["close"], dtype=float)
+    high = pd.Series(bars["high"], dtype=float) if "high" in bars.columns else None
+    low = pd.Series(bars["low"], dtype=float) if "low" in bars.columns else None
+    raw = _compute_oscillator_raw(close, high, low, cfg)
+    factors: dict[str, dict[str, float]] = {}
+    add_factor_from_series(factors, "RSI", raw[_FL_RSI], cfg.percentile_window)
+    if _FL_KDJ_K in raw:
+        add_factor_from_series(factors, "KDJ_K", raw[_FL_KDJ_K], cfg.percentile_window)
+        add_factor_from_series(factors, "KDJ_D", raw[_FL_KDJ_D], cfg.percentile_window)
+        add_factor_from_series(factors, "KDJ_J", raw[_FL_KDJ_J], cfg.percentile_window)
+        add_factor_from_series(factors, "CCI", raw[_FL_CCI], cfg.percentile_window)
     return factors

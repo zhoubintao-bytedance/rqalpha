@@ -4,11 +4,11 @@ import pandas as pd
 
 from skyeye.data.facade import DataFacade
 from skyeye.factor_layer.config import FactorLayerConfig
-from skyeye.factor_layer.indicators.momentum import compute_momentum_factors
-from skyeye.factor_layer.indicators.oscillator import compute_oscillator_factors
-from skyeye.factor_layer.indicators.trend import compute_trend_factors
-from skyeye.factor_layer.indicators.volatility import compute_volatility_factors
-from skyeye.factor_layer.indicators.volume import compute_volume_factors
+from skyeye.factor_layer.indicators.momentum import compute_momentum_factors, compute_momentum_series
+from skyeye.factor_layer.indicators.oscillator import compute_oscillator_factors, compute_oscillator_series
+from skyeye.factor_layer.indicators.trend import compute_trend_factors, compute_trend_series
+from skyeye.factor_layer.indicators.volatility import compute_volatility_factors, compute_volatility_series
+from skyeye.factor_layer.indicators.volume import compute_volume_factors, compute_volume_series
 from skyeye.factor_layer.result import FactorLayerResult
 from skyeye.factor_layer.utils import normalize_benchmark_bars
 from skyeye.market_regime_layer import (
@@ -34,6 +34,37 @@ CATEGORY_COMPUTERS = {
     "volume": ("volume_factors", compute_volume_factors),
 }
 
+def _compute_momentum_series_from_parts(close, _high, _low, _volume, cfg):
+    return compute_momentum_series(close, cfg)
+
+
+def _compute_oscillator_series_from_parts(close, high, low, _volume, cfg):
+    return compute_oscillator_series(close, high, low, cfg)
+
+
+def _compute_trend_series_from_parts(close, high, low, _volume, cfg):
+    return compute_trend_series(close, high, low, cfg)
+
+
+def _compute_volatility_series_from_parts(close, high, low, _volume, cfg):
+    return compute_volatility_series(close, high, low, cfg)
+
+
+def _compute_volume_series_from_parts(close, high, low, volume, cfg):
+    return compute_volume_series(close, volume, high, low, cfg)
+
+
+# All categories computed unconditionally for per-instrument DatasetBuilder use.
+_SERIES_COMPUTERS = {
+    "momentum": _compute_momentum_series_from_parts,
+    "oscillator": _compute_oscillator_series_from_parts,
+    "trend": _compute_trend_series_from_parts,
+    "volatility": _compute_volatility_series_from_parts,
+    "volume": _compute_volume_series_from_parts,
+}
+
+FACTOR_LAYER_COLUMNS: list[str] = []
+
 
 def _select_factor_categories(regime_label: str) -> tuple[str, str]:
     return REGIME_FACTOR_CATEGORIES[str(regime_label)]
@@ -43,7 +74,35 @@ def _empty_result(regime: MarketRegime) -> FactorLayerResult:
     return FactorLayerResult(regime=regime)
 
 
-def compute_factors(benchmark_bars, regime: MarketRegime, cfg: FactorLayerConfig | None = None) -> FactorLayerResult:
+def compute_all_factor_series(
+    close: pd.Series,
+    *,
+    high: pd.Series | None = None,
+    low: pd.Series | None = None,
+    volume: pd.Series | None = None,
+    cfg: FactorLayerConfig | None = None,
+) -> pd.DataFrame:
+    """Compute all factor layer indicators for a single instrument as full time series.
+
+    Returns a DataFrame with columns like ``fl_mom``, ``fl_rsi``, ``fl_macd``, …
+    covering all five categories (momentum, oscillator, trend, volatility, volume).
+    Unlike the benchmark-facing ``compute_factors``, this does not apply regime
+    filtering or percentile bucketing.
+    """
+    cfg = cfg or FactorLayerConfig()
+    frames = []
+    for _category, computer in _SERIES_COMPUTERS.items():
+        df = computer(close, high, low, volume, cfg)
+        if df is not None and not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame(index=close.index)
+    return pd.concat(frames, axis=1).reindex(close.index)
+
+
+def compute_factors(
+    benchmark_bars, regime: MarketRegime, cfg: FactorLayerConfig | None = None
+) -> FactorLayerResult:
     cfg = cfg or FactorLayerConfig()
     bars = normalize_benchmark_bars(benchmark_bars)
     if bars.empty or "close" not in bars.columns:
@@ -58,7 +117,7 @@ def compute_factors(benchmark_bars, regime: MarketRegime, cfg: FactorLayerConfig
     }
     for category in _select_factor_categories(regime.regime):
         field_name, computer = CATEGORY_COMPUTERS[category]
-        payload[field_name] = computer(bars, cfg, regime=regime)  # 传递 regime 参数
+        payload[field_name] = computer(bars, cfg, regime=regime)
     return FactorLayerResult(regime=regime, **payload)
 
 
