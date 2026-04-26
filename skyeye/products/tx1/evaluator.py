@@ -110,6 +110,49 @@ FACTOR_LAYER_COLUMNS = [
     "fl_mfi",
 ]
 
+ELITE_FACTOR_COLUMNS = [
+    # NOTE: 2026-04-26 全量实验结论 — 因子层不产生额外 alpha。
+    #
+    # 在 300 只股票、14 folds 的 LGBM 滚动窗口实验中，baseline_5f（5 个特征）
+    # 对比 baseline_5f + 9 个自研 fl_* 因子层的效果如下：
+    #
+    #   变体                     Rank IC  Spread   NetRet/日  MaxDD  滚打分
+    #   ──────────────────────── ───────  ──────   ────────   ─────  ──────
+    #   baseline_5f             0.0568   0.0128   0.000315   5.5%   60.0 [E]
+    #   factor_layer_elite      0.0569   0.0152   0.000432   5.0%   54.6 [M+]
+    #   factor_layer_regime_aware 0.0500 0.0110   0.000333   4.5%   (未跑)
+    #   factor_layer_elite_preproc 0.0458 0.0063   0.000180   5.5%   (未跑)
+    #
+    # IC 持平说明没挖出新 alpha；regime 条件选因子和 preprocessing 都倒退；
+    # 滚动打分器（rolling_score CLI）也确认 5 因子版本优于因子层版本。
+    #
+    # 结论：fl_* 技术指标在当前框架下是噪声，不值得加入 TX1 特征集。
+    #
+    # momentum: fl_bias only (orthogonal to mom_40d, drop fl_roc/fl_mom)
+    "fl_bias",
+    # oscillator: fl_rsi + fl_kdj_k only (drop KDJ_D/J and CCI)
+    "fl_rsi",
+    "fl_kdj_k",
+    # trend: fl_macd (direction) + fl_adx (strength), drop MA/EMA lines
+    "fl_macd",
+    "fl_adx",
+    # volatility: fl_bbands_width (relative) + fl_atr (absolute)
+    "fl_bbands_width",
+    "fl_atr",
+    # volume: fl_obv + fl_mfi, drop fl_obv_ma
+    "fl_obv",
+    "fl_mfi",
+]
+
+REGIME_FACTOR_MAPPING = {
+    "bull_co_move":    ["fl_macd", "fl_adx", "fl_obv", "fl_mfi"],
+    "bull_rotation":   ["fl_bias", "fl_macd", "fl_adx"],
+    "range_co_move":   ["fl_rsi", "fl_kdj_k", "fl_bbands_width", "fl_atr"],
+    "range_rotation":  ["fl_bias", "fl_rsi", "fl_kdj_k"],
+    "bear_co_move":    ["fl_bbands_width", "fl_atr", "fl_obv", "fl_mfi"],
+    "bear_rotation":   ["fl_bias", "fl_bbands_width", "fl_atr"],
+}
+
 FEATURE_GROUPS = {
     "baseline_4f": list(BASELINE_4F_COLUMNS),
     "baseline": list(BASELINE_FEATURE_COLUMNS),
@@ -121,6 +164,7 @@ FEATURE_GROUPS = {
     "elite_ohlcv": list(ELITE_OHLCV_COLUMNS),
     "fundamental": list(FUNDAMENTAL_FEATURE_COLUMNS),
     "factor_layer": list(FACTOR_LAYER_COLUMNS),
+    "factor_layer_elite": list(ELITE_FACTOR_COLUMNS),
 }
 
 FEATURE_LIBRARY = {
@@ -188,7 +232,7 @@ def evaluate_predictions(prediction_df, top_k=20):
             continue
         pred_rank = day_df["prediction"].rank(method="average")
         label_rank = day_df["label_return_raw"].rank(method="average")
-        rank_ic = float(pred_rank.corr(label_rank, method="pearson"))
+        rank_ic = float(np.corrcoef(pred_rank.values, label_rank.values)[0, 1])
         if np.isfinite(rank_ic):
             rank_ics.append(rank_ic)
         ranked = day_df.sort_values("prediction", ascending=False)

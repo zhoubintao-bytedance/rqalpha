@@ -26,6 +26,7 @@ DEFAULT_DATA_END = "2026-03-06"
 UNIVERSE_SIZE = 300
 DATA_FACADE = DataFacade()
 BAR_FIELDS = ["close", "volume", "total_turnover"]
+STOCK_BAR_FIELDS = ["close", "volume", "total_turnover", "high", "low"]
 MARKET_CAP_COLUMNS = ("circulating_market_cap", "market_capitalization", "market_cap")
 
 
@@ -203,10 +204,10 @@ def _load_all_stocks(universe: list[str], start_date: pd.Timestamp, end_date: pd
         universe,
         start_date,
         end_date,
-        fields=BAR_FIELDS,
+        fields=STOCK_BAR_FIELDS,
         adjust_type="pre",
     )
-    stocks_df = _normalize_daily_bars(bars, BAR_FIELDS)
+    stocks_df = _normalize_daily_bars(bars, STOCK_BAR_FIELDS)
     if stocks_df.empty:
         raise RuntimeError("No stocks loaded")
     counts = stocks_df.groupby("order_book_id").size()

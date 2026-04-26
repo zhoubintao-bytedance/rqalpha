@@ -10,6 +10,43 @@ from skyeye.products.tx1.evaluator import CANDIDATE_FEATURE_COLUMNS, FACTOR_LAYE
 
 logger = logging.getLogger(__name__)
 
+
+def _compute_regime_map(benchmark_close_series):
+    """Compute market regime label per date from benchmark close data.
+
+    Uses the same ``compute_market_regime`` logic as the formal regime layer,
+    but with only close data (no industry/rotation detection). Falls back to
+    ``"range_co_move"`` on any error or insufficient data.
+
+    Returns a dict mapping pd.Timestamp -> regime label string.
+    """
+    try:
+        from skyeye.market_regime_layer import compute_market_regime
+    except ImportError:
+        logger.debug("market_regime_layer unavailable, regime column skipped")
+        return {}
+
+    bench = benchmark_close_series.dropna().sort_index()
+    if len(bench) < 20:
+        return {}
+
+    dates = sorted(set(bench.index) | set(benchmark_close_series.index))
+    regime_map = {}
+
+    for date in dates:
+        lookback = bench[bench.index <= date].tail(250)
+        if len(lookback) < 60:
+            regime_map[date] = "range_co_move"
+            continue
+        try:
+            bench_bars = pd.DataFrame({"close": lookback.values}, index=lookback.index)
+            result = compute_market_regime(bench_bars, industry_close=None)
+            regime_map[date] = result.regime
+        except Exception:
+            regime_map[date] = "range_co_move"
+
+    return regime_map
+
 REQUIRED_COLUMNS = ("date", "order_book_id", "close", "volume", "benchmark_close")
 
 # Optional columns for extended features (gracefully skipped if absent)
@@ -153,4 +190,21 @@ class DatasetBuilder(object):
         if "sector" in dataset.columns:
             ordered_columns.append("sector")
 
-        return dataset.loc[:, [c for c in ordered_columns if c in dataset.columns]]
+        # --- market regime column ---
+        bench_series = raw_df[["date", "benchmark_close"]].drop_duplicates(subset=["date"])
+        bench_series = bench_series.set_index("date")["benchmark_close"]
+        regime_map = _compute_regime_map(bench_series)
+        if regime_map:
+            dataset["regime"] = dataset["date"].map(regime_map)
+            logger.info("regime column added (%d unique dates classified)", len(regime_map))
+            ordered_columns.append("regime")
+        else:
+            logger.debug("regime column skipped")
+
+        seen = set()
+        deduped_cols = []
+        for c in ordered_columns:
+            if c in dataset.columns and c not in seen:
+                deduped_cols.append(c)
+                seen.add(c)
+        return dataset.loc[:, deduped_cols]

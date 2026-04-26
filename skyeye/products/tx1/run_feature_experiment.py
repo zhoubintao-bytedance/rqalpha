@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -22,11 +23,13 @@ from skyeye.products.tx1.evaluator import (
     BASELINE_FEATURE_COLUMNS,
     BASELINE_5F_COLUMNS,
     CANDIDATE_FEATURE_COLUMNS,
+    ELITE_FACTOR_COLUMNS,
     ELITE_OHLCV_COLUMNS,
     FEATURE_LIBRARY,
     FUNDAMENTAL_FEATURE_COLUMNS,
     LIQUIDITY_FEATURE_COLUMNS,
     MOMENTUM_FEATURE_COLUMNS,
+    REGIME_FACTOR_MAPPING,
     RISK_FEATURE_COLUMNS,
     TREND_FEATURE_COLUMNS,
     build_portfolio_returns,
@@ -39,6 +42,9 @@ from skyeye.products.tx1.portfolio_proxy import PortfolioProxy
 from skyeye.products.tx1.preprocessor import FeaturePreprocessor
 from skyeye.products.tx1.run_baseline_experiment import build_raw_df, _get_liquid_universe
 from skyeye.products.tx1.splitter import WalkForwardSplitter
+
+
+logger = logging.getLogger(__name__)
 
 
 MODEL_CONFIG = {
@@ -218,6 +224,39 @@ def build_variants():
                 "holding_bonus": 1.0,
             },
         },
+        {
+            "name": "factor_layer_elite",
+            "purpose": (
+                "Baseline 5f plus 9 curated factor-layer indicators (6 categories: "
+                "momentum, oscillator, trend, volatility, volume). "
+                "All elite factors used regardless of market regime; establishes "
+                "whether factor-layer signals add value at all."
+            ),
+            "features": _dedupe(list(BASELINE_5F_COLUMNS) + list(ELITE_FACTOR_COLUMNS)),
+            "preprocess": None,
+        },
+        {
+            "name": "factor_layer_regime_aware",
+            "purpose": (
+                "Baseline 5f plus regime-conditional elite factors. "
+                "Non-regime factors are NaN-masked per date so LGBM only learns "
+                "from factors that are meaningful in the current market environment."
+            ),
+            "features": _dedupe(list(BASELINE_5F_COLUMNS) + list(ELITE_FACTOR_COLUMNS)),
+            "preprocess": None,
+            "regime_mask": True,
+        },
+        {
+            "name": "factor_layer_elite_preproc",
+            "purpose": (
+                "Baseline 5f plus 9 curated factor-layer indicators with cross-sectional "
+                "winsorize+neutralize+zscore preprocessing applied. Factor-layer signals "
+                "are inherently noisy; preprocessing suppresses sector/size bias and "
+                "clips extremes to improve signal-to-noise ratio."
+            ),
+            "features": _dedupe(list(BASELINE_5F_COLUMNS) + list(ELITE_FACTOR_COLUMNS)),
+            "preprocess": dict(DEFAULT_PREPROCESS_CONFIG),
+        },
     ]
 
 
@@ -275,6 +314,37 @@ def _apply_universe_filter(df, universe_filter):
     return pd.concat(filtered_parts, ignore_index=True)
 
 
+def _apply_regime_mask(df, feature_columns):
+    """NaN-mask factor-layer columns that don't apply to the current regime.
+
+    For each date, only the elite factors listed in REGIME_FACTOR_MAPPING for
+    the current regime are retained; all other elite factor columns are set to NaN.
+    LGBM natively learns to ignore NaN-valued features.
+    """
+    if "regime" not in df.columns:
+        logger.warning("regime column missing, skipping regime mask")
+        return df
+
+    elite_cols = [c for c in ELITE_FACTOR_COLUMNS if c in feature_columns]
+    if not elite_cols:
+        return df
+
+    mask_count = 0
+    for date, day_df in df.groupby("date"):
+        regime = day_df["regime"].iloc[0]
+        selected = REGIME_FACTOR_MAPPING.get(regime, [])
+        if not selected:
+            selected = list(REGIME_FACTOR_MAPPING.get("range_co_move", []))
+        for col in elite_cols:
+            if col not in selected:
+                df.loc[day_df.index, col] = np.nan
+                mask_count += 1
+
+    if mask_count:
+        logger.info("regime mask applied: %d column-date combinations set to NaN", mask_count)
+    return df
+
+
 def run_variant(
     labeled_df,
     variant,
@@ -321,6 +391,10 @@ def run_variant(
         retained_ratio = float(len(variant_df) / pre_filter_count) if pre_filter_count else 0.0
         print(f"Universe filter applied: {pre_filter_count} -> {len(variant_df)} rows ({retained_ratio:.1%} retained)")
     variant_df = variant_df.sort_values(["date", "order_book_id"]).reset_index(drop=True)
+
+    if variant.get("regime_mask"):
+        _apply_regime_mask(variant_df, available_features)
+
     folds = splitter.split(variant_df)
     if max_folds is not None:
         folds = folds[:max_folds]
@@ -460,9 +534,12 @@ def compute_single_factor_ic(labeled_df, features):
         for _, day_df in factor_frame.groupby("date"):
             if len(day_df) < 10:
                 continue
-            pred_rank = day_df[feature].rank(method="average")
+            pred_series = day_df[feature]
+            if isinstance(pred_series, pd.DataFrame):
+                pred_series = pred_series.iloc[:, 0]
+            pred_rank = pred_series.rank(method="average")
             label_rank = day_df["label_return_raw"].rank(method="average")
-            ic = float(pred_rank.corr(label_rank, method="pearson"))
+            ic = float(np.corrcoef(pred_rank.values, label_rank.values)[0, 1])
             if np.isfinite(ic):
                 ics.append(ic)
         if ics:
