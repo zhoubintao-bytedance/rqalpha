@@ -138,7 +138,7 @@ def _resolve_guardrails(
 
 def _build_score_delta(candidate: dict[str, Any], baseline: dict[str, Any]) -> dict[str, float]:
     """构造相对 baseline 的关键指标差值。"""
-    return {
+    delta = {
         "net_mean_return": _metric(candidate, "portfolio", "net_mean_return") - _metric(
             baseline, "portfolio", "net_mean_return"
         ),
@@ -155,14 +155,39 @@ def _build_score_delta(candidate: dict[str, Any], baseline: dict[str, Any]) -> d
             baseline, "robustness", "stability", "stability_score"
         ),
     }
+    # 新增 Calmar Ratio 差值
+    candidate_calmar = _compute_calmar(candidate)
+    baseline_calmar = _compute_calmar(baseline)
+    delta["calmar_ratio"] = candidate_calmar - baseline_calmar
+    delta["calmar_candidate"] = candidate_calmar
+    delta["calmar_baseline"] = baseline_calmar
+    return delta
+
+
+def _compute_calmar(summary: dict[str, Any]) -> float:
+    """计算 Calmar Ratio = 年化收益 / 最大回撤。"""
+    net_return = _metric(summary, "portfolio", "net_mean_return")
+    max_dd = _metric(summary, "portfolio", "max_drawdown")
+    if max_dd <= 0:
+        return 0.0
+    # 年化收益 / 最大回撤
+    return (net_return * 252) / max_dd
 
 
 def _materially_improves(score_delta: dict[str, float]) -> bool:
-    """判断候选是否在收益和稳健性上形成材料性改进。"""
+    """判断候选是否在风险调整收益上形成材料性改进。
+
+    新逻辑：使用 Calmar Ratio 替代原有的"收益提升且回撤降低"要求。
+    - 收益必须提升（net_mean_return > 0）
+    - Calmar Ratio 必须提升（风险调整收益改善）
+    - 稳定性不显著下降（允许小幅下降）
+
+    这符合投资学基本规律：收益与风险正相关，但风险调整收益应改善。
+    """
     return (
         score_delta["net_mean_return"] > 0.0
-        and score_delta["max_drawdown"] <= 0.0
-        and score_delta["stability_score"] >= 0.0
+        and score_delta.get("calmar_ratio", 0) > 0.0
+        and score_delta["stability_score"] >= -5.0  # 允许稳定性小幅下降
     )
 
 

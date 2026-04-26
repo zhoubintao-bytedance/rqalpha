@@ -7,7 +7,7 @@ from pathlib import Path
 
 from skyeye.products.tx1.autoresearch.catalog import DEFAULT_CATALOG_NAME
 from skyeye.products.tx1.autoresearch.loop import run_loop
-from skyeye.products.tx1.autoresearch.search import run_catalog_search
+from skyeye.products.tx1.autoresearch.search import run_catalog_search, run_three_phase_portfolio_search
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +38,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="可选，运行无需 workspace patch 的候选 catalog 搜索；默认 catalog 为 {}".format(DEFAULT_CATALOG_NAME),
     )
+    parser.add_argument(
+        "--portfolio-grid",
+        action="store_true",
+        help="运行三阶段Portfolio参数网格搜索（粗粒度探索 -> 中粒度筛选 -> 滚动打分验证）",
+    )
+    parser.add_argument(
+        "--top-n-refined",
+        type=int,
+        default=2,
+        help="阶段0筛选后进入阶段1的候选数量（默认2）",
+    )
+    parser.add_argument(
+        "--top-n-final",
+        type=int,
+        default=5,
+        help="阶段1筛选后进入阶段2滚动打分的候选数量（默认5）",
+    )
     return parser
 
 
@@ -45,7 +62,24 @@ def main(argv=None) -> int:
     """解析 CLI 参数并启动 autoresearch 主循环。"""
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.search_catalog is not None:
+
+    if args.portfolio_grid:
+        # 三阶段Portfolio参数网格搜索
+        result = run_three_phase_portfolio_search(
+            run_tag=args.run_tag,
+            runs_root=Path(args.runs_root),
+            universe_size=int(args.universe_size),
+            start_date=args.start_date,
+            end_date=args.end_date,
+            model_kind=args.model_kind,
+            label_transform=args.label_transform,
+            horizon_days=int(args.horizon_days),
+            top_n_for_refined=int(args.top_n_refined),
+            top_n_for_final=int(args.top_n_final),
+            smoke_max_folds=args.smoke_max_folds,
+            full_max_folds=args.full_max_folds,
+        )
+    elif args.search_catalog is not None:
         catalog_name = args.search_catalog or DEFAULT_CATALOG_NAME
         result = run_catalog_search(
             run_tag=args.run_tag,

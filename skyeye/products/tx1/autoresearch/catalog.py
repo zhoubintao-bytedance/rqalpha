@@ -13,6 +13,8 @@ from skyeye.products.tx1.evaluator import (
 
 
 DEFAULT_CATALOG_NAME = "risk_reward_v1"
+PORTFOLIO_COARSE_CATALOG_NAME = "portfolio_coarse_v1"
+PORTFOLIO_REFINED_CATALOG_NAME = "portfolio_refined_v1"
 
 
 def _dedupe_features(features):
@@ -44,9 +46,118 @@ def _build_candidate(
     }
 
 
-def build_candidate_catalog(catalog_name=DEFAULT_CATALOG_NAME):
-    """返回本轮 autoresearch 要遍历的候选集合。"""
+def build_portfolio_coarse_catalog():
+    """阶段0：粗粒度探索，快速锁定参数区间。
+
+    buy_top_k: [5, 15, 25]，步长10
+    hold_top_k: [15, 30, 45]，步长15
+    有效组合：约8个
+    预计耗时：~8分钟
+    """
+    baseline_features = list(BASELINE_5F_COLUMNS)
+    candidates = []
+
+    buy_range = [5, 15, 25]
+    hold_range = [15, 30, 45]
+
+    for buy_k in buy_range:
+        for hold_k in hold_range:
+            if hold_k < buy_k:
+                continue
+            candidates.append(_build_candidate(
+                "coarse_b{}_h{}".format(buy_k, hold_k),
+                description="粗粒度探索: buy_top_k={}, hold_top_k={}".format(buy_k, hold_k),
+                features=baseline_features,
+                portfolio={
+                    "buy_top_k": buy_k,
+                    "hold_top_k": hold_k,
+                    "rebalance_interval": 20,
+                    "holding_bonus": 0.5,
+                },
+            ))
+    return candidates
+
+
+def build_portfolio_refined_catalog(top_candidates):
+    """阶段1：基于阶段0结果生成中粒度候选集。
+
+    从Top2候选提取邻域范围，步长更细：
+    - buy_top_k 步长2
+    - hold_top_k 步长5
+
+    Args:
+        top_candidates: 阶段0的Top候选列表，至少包含portfolio参数
+
+    Returns:
+        中粒度候选列表，约20个组合
+    """
+    baseline_features = list(BASELINE_5F_COLUMNS)
+
+    if not top_candidates:
+        # 如果没有传入候选，使用默认范围
+        buy_values = [12, 15, 18, 22, 25, 28]
+        hold_values = [25, 30, 35, 40, 45]
+    else:
+        # 从Top候选提取邻域范围
+        buy_values = set()
+        hold_values = set()
+
+        for c in top_candidates:
+            params = c.get("portfolio", {})
+            buy_k = params.get("buy_top_k", 25)
+            hold_k = params.get("hold_top_k", 45)
+
+            # 扩展邻域：buy_top_k ±6，步长2
+            for delta in range(-6, 7, 2):
+                buy_values.add(buy_k + delta)
+            # 扩展邻域：hold_top_k ±10，步长5
+            for delta in range(-10, 11, 5):
+                hold_values.add(hold_k + delta)
+
+        # 过滤有效范围
+        buy_values = sorted([v for v in buy_values if 5 <= v <= 30])
+        hold_values = sorted([v for v in hold_values if 10 <= v <= 50])
+
+    candidates = []
+    for buy_k in buy_values:
+        for hold_k in hold_values:
+            if hold_k < buy_k:
+                continue
+            candidates.append(_build_candidate(
+                "refined_b{}_h{}".format(buy_k, hold_k),
+                description="中粒度筛选: buy_top_k={}, hold_top_k={}".format(buy_k, hold_k),
+                features=baseline_features,
+                portfolio={
+                    "buy_top_k": buy_k,
+                    "hold_top_k": hold_k,
+                    "rebalance_interval": 20,
+                    "holding_bonus": 0.5,
+                },
+            ))
+    return candidates
+
+
+def build_candidate_catalog(catalog_name=DEFAULT_CATALOG_NAME, top_candidates=None):
+    """返回本轮 autoresearch 要遍历的候选集合。
+
+    Args:
+        catalog_name: catalog名称，支持以下值：
+            - "risk_reward_v1": 默认风险收益搜索catalog
+            - "portfolio_coarse_v1": 粗粒度portfolio参数探索
+            - "portfolio_refined_v1": 中粒度portfolio参数筛选
+        top_candidates: 仅用于portfolio_refined_v1，传入阶段0的Top候选
+    """
     name = str(catalog_name or DEFAULT_CATALOG_NAME)
+
+    # 粗粒度portfolio参数探索
+    if name == PORTFOLIO_COARSE_CATALOG_NAME:
+        return build_portfolio_coarse_catalog()
+
+    # 中粒度portfolio参数筛选
+    if name == PORTFOLIO_REFINED_CATALOG_NAME:
+        return build_portfolio_refined_catalog(top_candidates)
+
+    # 默认catalog
     if name != DEFAULT_CATALOG_NAME:
         raise ValueError("unknown TX1 autoresearch catalog: {}".format(name))
 
