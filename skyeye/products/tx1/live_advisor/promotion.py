@@ -187,6 +187,10 @@ def promote_experiment_to_live_package(
         "multi_output_enabled": bool(config.get("multi_output", {}).get("enabled", False)),
     }
     portfolio_policy = dict(config.get("portfolio", {}))
+    costs = config.get("costs", {})
+    portfolio_policy["commission_rate"] = costs.get("commission_rate", 0.0008)
+    portfolio_policy["stamp_tax_rate"] = costs.get("stamp_tax_rate", 0.0005)
+    portfolio_policy["slippage_bps"] = costs.get("slippage_bps", 5.0)
     canary_reason = _build_canary_reason(gate_summary)
     evidence_end_date = training["fit_end_date"]
     if isinstance(recent_canary_bundle, dict):

@@ -18,7 +18,7 @@ from skyeye.products.tx1.live_advisor.runtime_gates import (
 from skyeye.products.tx1.live_advisor.snapshot import build_live_snapshot
 from skyeye.products.tx1.portfolio_proxy import PortfolioProxy
 from skyeye.products.tx1.preprocessor import FeaturePreprocessor
-from skyeye.products.tx1.strategies.rolling_score.replay import compute_turnover_ratio
+from skyeye.products.tx1.strategies.rolling_score.replay import apply_single_stock_cap, compute_turnover_ratio, smooth_target_weights
 
 
 DATA_FACADE = DataFacade()
@@ -45,6 +45,7 @@ class LiveAdvisorService(object):
         universe_cache_root=None,
         current_holdings=None,
         last_rebalance_date=None,
+        previous_target_weights=None,
     ) -> dict:
         """基于 promoted package 生成指定交易日的推荐卡片。"""
         package_payload = load_live_package(package_ref, packages_root=self.packages_root)
@@ -179,6 +180,7 @@ class LiveAdvisorService(object):
             current_holdings=current_holdings,
             last_rebalance_date=last_rebalance_date,
             trade_date=snapshot["trade_date"],
+            previous_target_weights=previous_target_weights,
         )
         result = {
             "status": "ok",
@@ -274,6 +276,7 @@ class LiveAdvisorService(object):
         current_holdings=None,
         last_rebalance_date=None,
         trade_date=None,
+        previous_target_weights=None,
     ) -> dict:
         """基于组合规则和当前持仓，生成调仓建议与目标权重。"""
         current_weights = {
@@ -288,6 +291,7 @@ class LiveAdvisorService(object):
                 for order_book_id, weight in current_weights.items()
             }
 
+        single_stock_cap = portfolio_policy.get("single_stock_cap")
         proxy = PortfolioProxy(
             buy_top_k=portfolio_policy.get("buy_top_k", 25),
             hold_top_k=portfolio_policy.get("hold_top_k", 45),
@@ -312,7 +316,45 @@ class LiveAdvisorService(object):
                 order_book_id: float(weight) * scale
                 for order_book_id, weight in target_weights.items()
             }
+
+        # EMA smoothing
+        ema_halflife = float(portfolio_policy.get("ema_halflife", 0) or 0)
+        ema_min_weight = float(portfolio_policy.get("ema_min_weight", 0.005) or 0.005)
+        ema_state = None
+        if ema_halflife > 0 and target_weights and previous_target_weights:
+            target_weights, ema_state = smooth_target_weights(
+                target_weights,
+                previous_target_weights,
+                halflife=ema_halflife,
+                min_weight=ema_min_weight,
+            )
+
+        # Single stock cap (applied after EMA when weights may be unequal)
+        if single_stock_cap is not None and target_weights:
+            cap_value = float(single_stock_cap)
+            if cap_value > 0:
+                target_weights = apply_single_stock_cap(target_weights, cap_value)
+
         estimated_turnover = compute_turnover_ratio(current_weights, target_weights)
+
+        # Turnover threshold check
+        turnover_threshold = float(portfolio_policy.get("turnover_threshold", 0.0) or 0.0)
+        skip_rebalance = False
+        if turnover_threshold > 0 and rebalance_due and estimated_turnover < turnover_threshold:
+            skip_rebalance = True
+
+        # Estimated trading costs
+        commission_rate = float(portfolio_policy.get("commission_rate", 0.0) or 0.0)
+        stamp_tax_rate = float(portfolio_policy.get("stamp_tax_rate", 0.0) or 0.0)
+        slippage_bps = float(portfolio_policy.get("slippage_bps", 0.0) or 0.0)
+        estimated_costs = _estimate_trading_costs(
+            current_weights=current_weights,
+            target_weights=target_weights,
+            commission_rate=commission_rate,
+            stamp_tax_rate=stamp_tax_rate,
+            slippage_bps=slippage_bps,
+        )
+
         min_weight = float(portfolio_policy.get("min_weight", 0.0) or 0.0)
         max_turnover = portfolio_policy.get("max_turnover")
         max_turnover = float(max_turnover) if max_turnover is not None else None
@@ -333,6 +375,8 @@ class LiveAdvisorService(object):
             execution_blockers.append("turnover_limit_exceeded")
         if not preflight_checks["position_count_ok"]["passed"]:
             execution_blockers.append("position_count_exceeded")
+        if skip_rebalance:
+            execution_blockers.append("turnover_below_threshold")
         action_rows = []
         for order_book_id in sorted(set(current_weights) | set(target_weights)):
             current_weight = float(current_weights.get(order_book_id, 0.0))
@@ -357,8 +401,15 @@ class LiveAdvisorService(object):
                     "delta_weight": delta_weight,
                 }
             )
+        if skip_rebalance:
+            advice_level = "skipped"
+        elif execution_blockers:
+            advice_level = "blocked"
+        else:
+            advice_level = "ok"
         return {
             "rebalance_due": bool(rebalance_due),
+            "skip_rebalance": skip_rebalance,
             "last_rebalance_date": last_rebalance_date,
             "current_weights": current_weights,
             "target_weights": target_weights,
@@ -368,9 +419,11 @@ class LiveAdvisorService(object):
             },
             "estimated_turnover": float(estimated_turnover),
             "cash_buffer": float(cash_buffer),
+            "estimated_costs": estimated_costs,
+            "ema_state": ema_state,
             "preflight_checks": preflight_checks,
             "execution_blockers": execution_blockers,
-            "advice_level": "blocked" if execution_blockers else "ok",
+            "advice_level": advice_level,
             "actions": action_rows,
         }
 
@@ -452,3 +505,36 @@ def _call_with_supported_kwargs(func, *args, **kwargs):
         if key in parameters
     }
     return func(*args, **supported_kwargs)
+
+
+def _estimate_trading_costs(
+    *,
+    current_weights: dict[str, float],
+    target_weights: dict[str, float],
+    commission_rate: float,
+    stamp_tax_rate: float,
+    slippage_bps: float,
+) -> dict:
+    """估算从当前持仓调整到目标权重的交易成本。"""
+    total_buy = 0.0
+    total_sell = 0.0
+    all_ids = set(current_weights) | set(target_weights)
+    for order_book_id in all_ids:
+        current_w = float(current_weights.get(order_book_id, 0.0))
+        target_w = float(target_weights.get(order_book_id, 0.0))
+        delta = target_w - current_w
+        if delta > 0:
+            total_buy += delta
+        elif delta < 0:
+            total_sell += abs(delta)
+    commission_cost = (total_buy + total_sell) * commission_rate
+    stamp_tax_cost = total_sell * stamp_tax_rate
+    slippage_cost = (total_buy + total_sell) * slippage_bps / 10000.0
+    return {
+        "total_buy_weight": float(total_buy),
+        "total_sell_weight": float(total_sell),
+        "commission_cost": float(commission_cost),
+        "stamp_tax_cost": float(stamp_tax_cost),
+        "slippage_cost": float(slippage_cost),
+        "total_estimated_cost": float(commission_cost + stamp_tax_cost + slippage_cost),
+    }
