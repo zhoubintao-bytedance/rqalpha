@@ -17,10 +17,12 @@ signal_inputs:
 positioning_rule: Top25买入、Top45持有、跌出Top45退出，equal-weight + 持仓延续加分 + 月度重平衡（20交易日）。
 risk_controls:
   - single_stock_cap
-  - turnover_threshold
+  - turnover_threshold (50%)
+  - min_rebalance_interval (15个交易日)
+  - min_trade_value (15000元)
   - tradability_filter
   - holding_bonus
-rebalance_frequency: monthly
+rebalance_frequency: monthly (最小间隔15个交易日)
 expected_good_regimes:
   - 横截面分化明显的震荡市
   - 动量因子有效的趋势市

@@ -558,13 +558,16 @@ def flatten_trades(trades_df):
         side = row["side"]
         price = row["last_price"]
         qty = row["last_quantity"]
+        transaction_cost = float(row.get("transaction_cost", 0.0) or 0.0)
 
         if ob_id not in holdings:
             holdings[ob_id] = {"quantity": 0, "cost": 0.0, "realized_pnl": 0.0}
         h = holdings[ob_id]
 
         if side == "BUY":
-            h["cost"] += price * qty
+            # trade 记录来自 sys_analyser 时通常带有 transaction_cost（佣金+税费等）
+            # 买入时将交易成本计入持仓成本，否则后续均价/已实现盈亏会偏高。
+            h["cost"] += price * qty + transaction_cost
             h["quantity"] += qty
             records.append({
                 "order_book_id": ob_id,
@@ -575,6 +578,7 @@ def flatten_trades(trades_df):
                 "quantity": qty,
                 "amount": price * qty,
                 "pnl": None,
+                "transaction_cost": transaction_cost,
                 "holding_qty": h["quantity"],
                 "holding_cost": h["cost"],
                 "realized_pnl": h["realized_pnl"],
@@ -583,7 +587,12 @@ def flatten_trades(trades_df):
         elif side == "SELL":
             sell_qty = min(qty, h["quantity"])
             avg_cost = h["cost"] / h["quantity"] if h["quantity"] > 0 else 0
-            pnl = (price - avg_cost) * sell_qty
+            # 卖出时从已实现盈亏中扣除卖出交易成本。
+            # 若 sell_qty < qty（异常数据/超卖保护），按数量比例分摊本笔交易成本。
+            sell_cost = transaction_cost
+            if qty:
+                sell_cost = transaction_cost * (sell_qty / qty)
+            pnl = (price - avg_cost) * sell_qty - sell_cost
             h["realized_pnl"] += pnl
             total_realized_pnl += pnl
             h["cost"] -= avg_cost * sell_qty
@@ -597,6 +606,7 @@ def flatten_trades(trades_df):
                 "quantity": sell_qty,
                 "amount": price * sell_qty,
                 "pnl": pnl,
+                "transaction_cost": sell_cost,
                 "holding_qty": h["quantity"],
                 "holding_cost": h["cost"],
                 "realized_pnl": h["realized_pnl"],

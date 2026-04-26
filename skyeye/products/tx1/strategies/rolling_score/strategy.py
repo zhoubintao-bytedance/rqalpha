@@ -42,6 +42,7 @@ def init(context):
     context.tx1_pending_signal_date = None
     context.tx1_pending_target = None
     context.tx1_last_execution_date = None
+    context.tx1_last_rebalance_date = None
     context.tx1_ema_state = {}
     context.tx1_ema_halflife = float(context.tx1_profile.get("ema_halflife", 0) or 0)
     context.tx1_ema_min_weight = float(
@@ -52,8 +53,11 @@ def init(context):
         "executed_rebalances": 0,
         "missing_signal_days": 0,
         "turnover_skips": 0,
+        "interval_skips": 0,
         "stop_loss_triggers": 0,
         "stop_loss_sells": 0,
+        "filtered_trades": 0,
+        "filtered_value": 0,
     }
 
     # Stop-loss configuration
@@ -65,10 +69,23 @@ def init(context):
     )
     context.tx1_stop_loss_cooldown: dict[str, str] = {}
 
+    # Minimum weight change threshold configuration
+    context.tx1_min_weight_change = float(
+        context.tx1_profile.get("min_weight_change", 0.003) or 0.003
+    )
+    context.tx1_min_trade_value = float(
+        context.tx1_profile.get("min_trade_value", 15000) or 15000
+    )
+
+    # Minimum rebalance interval configuration
+    context.tx1_min_rebalance_interval = int(
+        context.tx1_profile.get("min_rebalance_interval", 15) or 15
+    )
+
     logger.info(
         (
             "TX1 rolling_score initialized: artifact_line={} profile={} signals={} "
-            "signal_range={}~{} model_kind={}"
+            "signal_range={}~{} model_kind={} turnover_threshold={} min_rebalance_interval={} min_trade_value={}"
         ).format(
             runtime["artifact_line_id"],
             runtime["profile"].get("profile"),
@@ -76,6 +93,9 @@ def init(context):
             signal_dates[0] if signal_dates else "-",
             signal_dates[-1] if signal_dates else "-",
             runtime["artifact"].get("model_kind"),
+            context.tx1_profile.get("turnover_threshold", 0.0),
+            context.tx1_min_rebalance_interval,
+            context.tx1_min_trade_value,
         )
     )
 
@@ -165,6 +185,13 @@ def handle_bar(context, bar_dict):
     if target_portfolio is None:
         return
 
+    # Check minimum rebalance interval
+    if context.tx1_min_rebalance_interval > 0 and context.tx1_last_rebalance_date:
+        days_since_last = _trading_days_between(context.tx1_last_rebalance_date, trade_date)
+        if days_since_last < context.tx1_min_rebalance_interval:
+            context.tx1_diagnostics["interval_skips"] += 1
+            return
+
     current_weights = _current_portfolio_weights(context)
     turnover = compute_turnover_ratio(current_weights, target_portfolio)
     turnover_threshold = float(context.tx1_profile.get("turnover_threshold", 0.0) or 0.0)
@@ -173,8 +200,54 @@ def handle_bar(context, bar_dict):
         context.tx1_diagnostics["turnover_skips"] += 1
         return
 
-    order_target_portfolio(target_portfolio)
+    # Filter out small weight changes to avoid inefficient tiny trades
+    total_value = context.portfolio.total_value
+    filtered_target = {}
+    filtered_count = 0
+    filtered_value = 0.0
+
+    for stock_id, target_weight in target_portfolio.items():
+        current_weight = current_weights.get(stock_id, 0)
+        weight_change = abs(target_weight - current_weight)
+        trade_value = weight_change * total_value
+
+        # Keep trade if:
+        # 1. Weight change is large enough
+        # 2. Trade value is large enough
+        # 3. Closing position (target_weight == 0)
+        # 4. Opening position (current_weight == 0)
+        need_trade = (
+            weight_change >= context.tx1_min_weight_change
+            or trade_value >= context.tx1_min_trade_value
+            or target_weight == 0
+            or current_weight == 0
+        )
+
+        if need_trade:
+            filtered_target[stock_id] = target_weight
+        else:
+            filtered_count += 1
+            filtered_value += trade_value
+
+    # Update diagnostics
+    context.tx1_diagnostics["filtered_trades"] += filtered_count
+    context.tx1_diagnostics["filtered_value"] += filtered_value
+
+    if filtered_count > 0:
+        logger.info(
+            "TX1 filtered {} small trades, avg value {:.0f} yuan".format(
+                filtered_count, filtered_value / filtered_count
+            )
+        )
+
+    # Skip if all trades are filtered
+    if not filtered_target:
+        logger.info("TX1 skip rebalance: all trades filtered")
+        return
+
+    order_target_portfolio(filtered_target)
     context.tx1_diagnostics["executed_rebalances"] += 1
+    context.tx1_last_rebalance_date = trade_date
 
 
 def after_trading(context):

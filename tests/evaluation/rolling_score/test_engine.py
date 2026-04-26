@@ -9,13 +9,14 @@ from skyeye.evaluation import rolling_score as strategy_scorer
 from skyeye.evaluation.rolling_score import engine as rolling_engine
 
 
-def _trade(order_book_id, symbol, side, price, quantity, trade_dt):
+def _trade(order_book_id, symbol, side, price, quantity, trade_dt, transaction_cost=0.0):
     return {
         "order_book_id": order_book_id,
         "symbol": symbol,
         "side": side,
         "last_price": price,
         "last_quantity": quantity,
+        "transaction_cost": transaction_cost,
         "trade_dt": pd.Timestamp(trade_dt),
     }
 
@@ -110,6 +111,33 @@ def test_flatten_trades_tracks_portfolio_level_realized_pnl_across_symbols():
     assert records[2]["total_realized_pnl"] == 200.0
     assert records[3]["realized_pnl"] == -100.0
     assert records[3]["total_realized_pnl"] == 100.0
+
+
+def test_flatten_trades_deducts_transaction_cost_from_realized_pnl():
+    trades = _trades_frame(
+        [
+            _trade("000001.XSHE", "平安银行", "BUY", 10.0, 100, "2024-01-03", transaction_cost=3.0),
+            _trade("000001.XSHE", "平安银行", "SELL", 10.05, 100, "2024-01-04", transaction_cost=3.0),
+        ]
+    )
+
+    records = strategy_scorer.flatten_trades(trades)
+    assert records[-1]["realized_pnl"] == pytest.approx(-1.0)
+    assert records[-1]["total_realized_pnl"] == pytest.approx(-1.0)
+
+
+def test_flatten_trades_prorates_transaction_cost_when_sell_qty_is_capped():
+    trades = _trades_frame(
+        [
+            _trade("000001.XSHE", "平安银行", "BUY", 10.0, 50, "2024-01-03"),
+            # last_quantity 故意大于持仓数量，触发 sell_qty = min(qty, holding_qty)
+            _trade("000001.XSHE", "平安银行", "SELL", 10.0, 100, "2024-01-04", transaction_cost=10.0),
+        ]
+    )
+
+    records = strategy_scorer.flatten_trades(trades)
+    assert records[-1]["transaction_cost"] == pytest.approx(5.0)
+    assert records[-1]["pnl"] == pytest.approx(-5.0)
 
 
 def test_parse_runtime_config_args_splits_mod_and_extra_scopes():
