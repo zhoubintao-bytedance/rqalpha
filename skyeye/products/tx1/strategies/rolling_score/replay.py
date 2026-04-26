@@ -29,6 +29,38 @@ def sanitize_target_weights(
     return sanitized
 
 
+def apply_single_stock_cap(
+    weights: dict[str, float],
+    cap: float,
+) -> dict[str, float]:
+    """Cap individual stock weights and redistribute excess to uncapped stocks.
+
+    Iteratively caps any weight exceeding *cap* and redistributes the excess
+    proportionally to stocks below the cap.  After convergence, weights are
+    renormalized to sum to 1.0.
+    """
+    if cap <= 0 or not weights:
+        return dict(weights)
+    result = dict(weights)
+    for _ in range(10):
+        capped = {s: min(w, cap) for s, w in result.items()}
+        excess = sum(result.values()) - sum(capped.values())
+        if excess < 1e-10:
+            break
+        uncapped = {s: w for s, w in capped.items() if w < cap}
+        if not uncapped:
+            break
+        redistribute = excess / len(uncapped)
+        result = {
+            s: min(capped[s] + redistribute, cap) if s in uncapped else capped[s]
+            for s in result
+        }
+    total = sum(result.values())
+    if total > 0:
+        result = {s: w / total for s, w in result.items()}
+    return result
+
+
 def compute_turnover_ratio(
     current_weights: Mapping[str, float] | None,
     target_weights: Mapping[str, float] | None,

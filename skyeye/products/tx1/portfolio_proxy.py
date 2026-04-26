@@ -78,10 +78,11 @@ class PortfolioProxy(object):
         if active_df.empty:
             return {}
         weight = 1.0 / float(len(active_df))
-        return {
+        raw_weights = {
             str(order_book_id): weight
             for order_book_id in active_df["order_book_id"]
         }
+        return raw_weights
 
     @staticmethod
     def _normalize_current_weight_map(current_holdings):
