@@ -47,6 +47,12 @@ DEFAULT_CONFIG = {
         "hold_top_k": 45,
         "rebalance_interval": 20,
         "holding_bonus": 0.5,
+        "single_stock_cap": 0.10,
+        "turnover_threshold": 0.30,
+        "ema_halflife": 5,
+        "ema_min_weight": 0.005,
+        "stop_loss_pct": 0,
+        "stop_loss_cooldown_days": 0,
     },
     "evaluation": {
         "top_k": 20,
