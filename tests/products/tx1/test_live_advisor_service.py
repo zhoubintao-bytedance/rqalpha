@@ -357,3 +357,137 @@ def test_live_advisor_service_marks_portfolio_advice_blocked_when_target_weights
     assert "min_weight_below_threshold" in advice["execution_blockers"]
     assert advice["preflight_checks"]["min_weight_ok"]["passed"] is False
     assert abs(sum(advice["target_weights"].values()) - 0.9) < 1e-9
+
+
+def test_live_advisor_service_applies_single_stock_cap():
+    """验证 single_stock_cap 会限制个股权重上限（EMA产生不等权后cap生效）。"""
+    scored = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-04-10")] * 3,
+            "order_book_id": ["A", "B", "C"],
+            "prediction": [3.0, 2.0, 1.0],
+        }
+    )
+
+    # previous_target has A very heavy, EMA will blend and produce unequal weights
+    # where A may exceed the cap
+    previous_target = {"A": 0.80, "B": 0.10, "C": 0.10}
+
+    advice = LiveAdvisorService._build_portfolio_advice(
+        scored,
+        {
+            "buy_top_k": 3,
+            "hold_top_k": 3,
+            "rebalance_interval": 20,
+            "holding_bonus": 0.0,
+            "ema_halflife": 5,
+            "ema_min_weight": 0.005,
+            "single_stock_cap": 0.40,
+        },
+        current_holdings=None,
+        last_rebalance_date=None,
+        trade_date="2026-04-10",
+        previous_target_weights=previous_target,
+    )
+
+    # After EMA, A's weight should be pulled toward 0.80, then capped at 0.40
+    for weight in advice["target_weights"].values():
+        assert weight <= 0.40 + 1e-9
+    assert abs(sum(advice["target_weights"].values()) - 1.0) < 1e-9
+
+
+def test_live_advisor_service_skips_rebalance_below_turnover_threshold():
+    """验证调仓日换手率低于阈值时跳过调仓。"""
+    scored = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-04-10")] * 3,
+            "order_book_id": ["A", "B", "C"],
+            "prediction": [3.0, 2.0, 1.0],
+        }
+    )
+
+    # First rebalance day (no last_rebalance_date), current holdings almost match target
+    advice = LiveAdvisorService._build_portfolio_advice(
+        scored,
+        {
+            "buy_top_k": 3,
+            "hold_top_k": 3,
+            "rebalance_interval": 20,
+            "holding_bonus": 0.0,
+            "turnover_threshold": 0.50,
+        },
+        current_holdings={"A": 0.33, "B": 0.34, "C": 0.33},
+        last_rebalance_date=None,
+        trade_date="2026-04-10",
+    )
+
+    # rebalance_due=True (first rebalance), but turnover is low
+    assert advice["rebalance_due"] is True
+    assert advice["skip_rebalance"] is True
+    assert advice["advice_level"] == "skipped"
+    assert "turnover_below_threshold" in advice["execution_blockers"]
+
+
+def test_live_advisor_service_applies_ema_smoothing():
+    """验证 EMA 平滑会渐变目标权重。"""
+    scored = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-04-10")] * 3,
+            "order_book_id": ["A", "B", "C"],
+            "prediction": [3.0, 2.0, 1.0],
+        }
+    )
+
+    previous_target = {"A": 0.1, "B": 0.1, "C": 0.8}
+
+    advice = LiveAdvisorService._build_portfolio_advice(
+        scored,
+        {
+            "buy_top_k": 3,
+            "hold_top_k": 3,
+            "rebalance_interval": 1,
+            "holding_bonus": 0.0,
+            "ema_halflife": 5,
+            "ema_min_weight": 0.005,
+        },
+        current_holdings=None,
+        last_rebalance_date=None,
+        trade_date="2026-04-10",
+        previous_target_weights=previous_target,
+    )
+
+    # EMA should blend raw equal-weight with previous state
+    assert advice["ema_state"] is not None
+    # C's weight should be pulled toward 0.8 by EMA (not stay at 1/3)
+    assert advice["target_weights"]["C"] > 1.0 / 3.0
+    assert abs(sum(advice["target_weights"].values()) - 1.0) < 1e-9
+
+
+def test_live_advisor_service_estimates_trading_costs():
+    """验证交易成本估算正确。"""
+    scored = pd.DataFrame(
+        {
+            "date": [pd.Timestamp("2026-04-10")] * 3,
+            "order_book_id": ["A", "B", "C"],
+            "prediction": [3.0, 2.0, 1.0],
+        }
+    )
+
+    advice = LiveAdvisorService._build_portfolio_advice(
+        scored,
+        {
+            "buy_top_k": 3,
+            "hold_top_k": 3,
+            "rebalance_interval": 20,
+            "holding_bonus": 0.0,
+            "commission_rate": 0.0008,
+            "stamp_tax_rate": 0.0005,
+            "slippage_bps": 5.0,
+        },
+        current_holdings={"A": 0.5, "B": 0.5},
+        last_rebalance_date=None,
+        trade_date="2026-04-10",
+    )
+
+    assert advice["estimated_costs"]["total_estimated_cost"] > 0
+    assert advice["estimated_costs"]["commission_cost"] > 0
