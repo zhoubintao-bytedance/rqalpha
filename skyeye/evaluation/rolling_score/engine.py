@@ -405,6 +405,7 @@ def run_rolling_backtests(
     extra_config=None,
     benchmark_id=None,
     return_details=False,
+    include_trade_details=True,
 ):
     """对策略文件执行滚动窗口回测，返回结果列表
 
@@ -499,16 +500,18 @@ def run_rolling_backtests(
                 message += "  [样本不足: {}]".format(sample_diagnostics["warning_text"])
             print(message)
 
-            results.append({
+            window_entry = {
                 "idx": idx,
                 "start": start,
                 "end": end,
                 "summary": summary,
                 "score": window_score,
-                "trades": trades,
-                "sample_diagnostics": sample_diagnostics,
-                "mod_results": extra_results,
-            })
+            }
+            if include_trade_details:
+                window_entry["trades"] = trades
+                window_entry["sample_diagnostics"] = sample_diagnostics
+                window_entry["mod_results"] = extra_results
+            results.append(window_entry)
         except Exception as e:
             print(f"异常: {e}")
             failed += 1
