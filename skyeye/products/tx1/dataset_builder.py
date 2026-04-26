@@ -5,14 +5,21 @@ import logging
 import numpy as np
 import pandas as pd
 
+from skyeye.data.facade import DataFacade
 from skyeye.factor_layer.core import compute_all_factor_series
+from skyeye.market_regime_layer import (
+    compute_market_regime,
+    discover_shenwan_l1_like_indices,
+    normalize_single_instrument_bars,
+    pivot_close_wide,
+)
 from skyeye.products.tx1.evaluator import CANDIDATE_FEATURE_COLUMNS, FACTOR_LAYER_COLUMNS, FUNDAMENTAL_FEATURE_COLUMNS
 
 logger = logging.getLogger(__name__)
 
 
-def _compute_regime_map(benchmark_close_series):
-    """Compute market regime label per date from benchmark close data.
+def _compute_simple_regime_map(benchmark_close_series):
+    """Compute a close-only fallback regime label per date.
 
     Uses the same ``compute_market_regime`` logic as the formal regime layer,
     but with only close data (no industry/rotation detection). Falls back to
@@ -20,17 +27,14 @@ def _compute_regime_map(benchmark_close_series):
 
     Returns a dict mapping pd.Timestamp -> regime label string.
     """
-    try:
-        from skyeye.market_regime_layer import compute_market_regime
-    except ImportError:
-        logger.debug("market_regime_layer unavailable, regime column skipped")
-        return {}
-
-    bench = benchmark_close_series.dropna().sort_index()
+    bench = benchmark_close_series.copy()
+    bench.index = pd.to_datetime(bench.index)
+    bench = bench.dropna().sort_index()
     if len(bench) < 20:
         return {}
 
-    dates = sorted(set(bench.index) | set(benchmark_close_series.index))
+    original_index = pd.to_datetime(pd.Index(benchmark_close_series.index))
+    dates = sorted(set(bench.index) | set(original_index))
     regime_map = {}
 
     for date in dates:
@@ -45,6 +49,93 @@ def _compute_regime_map(benchmark_close_series):
         except Exception:
             regime_map[date] = "range_co_move"
 
+    return regime_map
+
+
+def _compute_regime_map(
+    benchmark_close_series,
+    benchmark_id="000300.XSHG",
+    lookback_calendar_days=1200,
+):
+    """Compute per-date regime labels using the full market regime layer.
+
+    This mirrors ``compute_market_regime_from_data_facade`` semantics, but loads
+    benchmark OHLCV and industry closes once for the full sample window instead
+    of re-fetching data date by date.
+
+    If external data access is unavailable, the builder degrades to the legacy
+    close-only regime map to preserve research continuity.
+    """
+    bench = benchmark_close_series.copy()
+    bench.index = pd.to_datetime(bench.index)
+    bench = bench.dropna().sort_index()
+    if len(bench) < 20:
+        return {}
+
+    original_index = pd.to_datetime(pd.Index(benchmark_close_series.index))
+    sample_dates = pd.DatetimeIndex(sorted(set(bench.index) | set(original_index)))
+    start_ts = sample_dates.min() - pd.Timedelta(days=int(lookback_calendar_days))
+    end_ts = sample_dates.max()
+
+    try:
+        data = DataFacade()
+        bench_raw = data.get_daily_bars(
+            benchmark_id,
+            start_ts.strftime("%Y-%m-%d"),
+            end_ts.strftime("%Y-%m-%d"),
+            fields=["open", "high", "low", "close", "volume"],
+            adjust_type="none",
+        )
+        if bench_raw is None or getattr(bench_raw, "empty", True):
+            logger.warning(
+                "full market regime benchmark data unavailable for %s, fallback to close-only regime",
+                benchmark_id,
+            )
+            return _compute_simple_regime_map(benchmark_close_series)
+        benchmark_bars = normalize_single_instrument_bars(bench_raw, benchmark_id)
+    except Exception:
+        logger.warning(
+            "failed to load benchmark data for full market regime, fallback to close-only regime",
+            exc_info=True,
+        )
+        return _compute_simple_regime_map(benchmark_close_series)
+
+    industry_close = None
+    try:
+        industry_index_ids = discover_shenwan_l1_like_indices()
+        if industry_index_ids:
+            ind_raw = data.get_daily_bars(
+                industry_index_ids,
+                start_ts.strftime("%Y-%m-%d"),
+                end_ts.strftime("%Y-%m-%d"),
+                fields=["close"],
+                adjust_type="none",
+            )
+            if ind_raw is not None and not ind_raw.empty:
+                industry_close = pivot_close_wide(ind_raw)
+    except Exception:
+        logger.warning(
+            "failed to load industry data for full market regime, structure side may degrade to co_move",
+            exc_info=True,
+        )
+
+    regime_map = {}
+    close_only_fallback = None
+    for date in sample_dates:
+        try:
+            bench_window = benchmark_bars.loc[benchmark_bars.index <= date]
+            if bench_window.empty:
+                regime_map[date] = "range_co_move"
+                continue
+            industry_window = None
+            if industry_close is not None:
+                industry_window = industry_close.loc[industry_close.index <= date]
+            result = compute_market_regime(bench_window, industry_close=industry_window)
+            regime_map[date] = result.regime
+        except Exception:
+            if close_only_fallback is None:
+                close_only_fallback = _compute_simple_regime_map(benchmark_close_series)
+            regime_map[date] = close_only_fallback.get(date, "range_co_move")
     return regime_map
 
 REQUIRED_COLUMNS = ("date", "order_book_id", "close", "volume", "benchmark_close")
