@@ -15,7 +15,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from skyeye.market_regime_layer import MarketRegimeConfig, compute_market_regime
+from skyeye.market_regime_layer import (
+    MarketRegimeConfig,
+    compute_market_regime,
+    required_market_regime_history_days,
+)
 
 
 def _make_dates(n: int, start: str = "2020-01-01") -> pd.DatetimeIndex:
@@ -35,16 +39,16 @@ def _make_benchmark_bars(kind: str, n: int = 280, seed: int = 7) -> pd.DataFrame
     dates = _make_dates(n)
 
     if kind == "bull":
-        drift = 0.0018
+        drift = 0.0025
         base = 100.0 * np.exp(drift * t)
-        vol = 0.0025 + 0.0065 * (t / max(1.0, t.max()))
+        vol = 0.003 + 0.0065 * (t / max(1.0, t.max()))
         noise = rng.normal(0.0, 1.0, size=n) * vol
         close = base * (1.0 + noise)
         volume = 1e8 * (1.0 + 0.4 * (t / max(1.0, t.max())))
     elif kind == "bear":
-        drift = -0.0018
+        drift = -0.0025
         base = 120.0 * np.exp(drift * t)
-        vol = 0.0025 + 0.0065 * (t / max(1.0, t.max()))
+        vol = 0.003 + 0.0065 * (t / max(1.0, t.max()))
         noise = rng.normal(0.0, 1.0, size=n) * vol
         close = base * (1.0 + noise)
         volume = 1e8 * (1.0 + 0.4 * (t / max(1.0, t.max())))
@@ -160,6 +164,55 @@ def test_market_regime_degrades_to_strength_zero_when_history_insufficient():
     assert "insufficient_history" in str(regime.diagnostics)
 
 
+def test_market_regime_default_config_prefers_responsive_regime_windows():
+    cfg = MarketRegimeConfig()
+
+    assert cfg.hurst_window == 100
+    assert cfg.rsrs_m == 252
+    assert cfg.boll_percentile_window == 60
+    assert cfg.dispersion_percentile_window == 60
+    assert required_market_regime_history_days(cfg) == 275
+    assert cfg.trendiness_weights["adx_score"] == pytest.approx(0.35)
+    assert cfg.trendiness_weights["hurst_score"] == pytest.approx(0.15)
+    assert cfg.trendiness_weights["boll_width_score"] == pytest.approx(0.20)
+    assert cfg.trendiness_weights["atr_ratio_score"] == pytest.approx(0.15)
+    assert cfg.trendiness_weights["volume_trend_score"] == pytest.approx(0.15)
+    assert sum(cfg.trendiness_weights.values()) == pytest.approx(1.0)
+    # 阈值 0.45 基于 A 股真实数据校准：沪深300 震荡占比约 63.4%，接近 A 股实际 60-70%
+    assert cfg.trendiness_range_threshold == pytest.approx(0.45)
+
+
+def test_market_regime_strength_uses_clamped_geometric_mean(monkeypatch):
+    import skyeye.market_regime_layer as layer
+
+    monkeypatch.setattr(
+        layer,
+        "_compute_direction_label_and_scores",
+        lambda *_args, **_kwargs: ("bull", 0.81, 0.81, {}),
+    )
+    monkeypatch.setattr(
+        layer,
+        "_compute_rotation_score",
+        lambda *_args, **_kwargs: ("rotation", 0.25, {}),
+    )
+
+    regime = compute_market_regime(_make_benchmark_bars("bull"), industry_close=pd.DataFrame({"A": [1.0, 2.0]}))
+
+    assert regime.strength == pytest.approx(math.sqrt(0.81 * 0.25))
+    assert regime.diagnostics["direction_strength"] == pytest.approx(0.81)
+    assert regime.diagnostics["structure_strength"] == pytest.approx(0.25)
+
+    monkeypatch.setattr(
+        layer,
+        "_compute_direction_label_and_scores",
+        lambda *_args, **_kwargs: ("bull", -1e-9, -1e-9, {}),
+    )
+    edge = compute_market_regime(_make_benchmark_bars("bull"), industry_close=pd.DataFrame({"A": [1.0, 2.0]}))
+
+    assert math.isfinite(edge.strength)
+    assert edge.strength == pytest.approx(0.0)
+
+
 @pytest.mark.parametrize(
     "bench_kind,structure_kind,expected",
     [
@@ -170,7 +223,8 @@ def test_market_regime_degrades_to_strength_zero_when_history_insufficient():
     ],
 )
 def test_market_regime_classifies_synthetic_bench_and_structure(bench_kind, structure_kind, expected):
-    bars = _make_benchmark_bars(bench_kind, n=280)
+    sample_days = required_market_regime_history_days(MarketRegimeConfig()) + 60
+    bars = _make_benchmark_bars(bench_kind, n=sample_days)
     industry = _make_industry_close(structure_kind, bars["close"], k=30)
     # co_move 场景下默认不一定能拿到 ad_ratio；即使有，极端宽度（ratio=2/0.5）应更偏 co_move。
     ad_ratio = 2.0 if structure_kind == "co_move" else 1.0
@@ -192,10 +246,10 @@ def test_market_regime_is_order_invariant_on_index():
 
 def test_market_regime_walk_forward_accuracy_on_synthetic_switches():
     """用人为构造的三段行情验证：标签切换应能被多数时间识别出来。"""
-    # 三段：bull(260) -> range(260) -> bear(260)
-    bull = _make_benchmark_bars("bull", n=260, seed=1)
-    rng = _make_benchmark_bars("range", n=260, seed=2)
-    bear = _make_benchmark_bars("bear", n=260, seed=3)
+    # 三段：bull(360) -> range(360) -> bear(360)
+    bull = _make_benchmark_bars("bull", n=360, seed=1)
+    rng = _make_benchmark_bars("range", n=360, seed=2)
+    bear = _make_benchmark_bars("bear", n=360, seed=3)
     # 拼接时保持日期连续
     rng.index = _make_dates(len(rng), start=str(bull.index[-1] + pd.Timedelta(days=1)))
     bear.index = _make_dates(len(bear), start=str(rng.index[-1] + pd.Timedelta(days=1)))
@@ -216,7 +270,7 @@ def test_market_regime_walk_forward_accuracy_on_synthetic_switches():
 
     # 按日滚动计算（从足够长的 warmup 开始）
     cfg = MarketRegimeConfig()
-    warmup = max(cfg.hurst_window, cfg.boll_percentile_window, cfg.ma_long, cfg.return_window) + 30
+    warmup = required_market_regime_history_days(cfg) + 30
     def _ad_ratio_by_phase(ts: pd.Timestamp) -> float:
         # co_move 段更偏“齐涨齐跌”，用极端宽度降低 neutrality；rotation 段用 neutrality=1。
         idx = bars.index.get_indexer([ts], method=None)[0]
@@ -268,9 +322,62 @@ def test_market_regime_stability_on_constant_bull_market():
     bars = _make_benchmark_bars("bull", n=320, seed=9)
     industry = _make_industry_close("co_move", bars["close"], seed=9, k=28)
     cfg = MarketRegimeConfig()
-    warmup = max(cfg.hurst_window, cfg.boll_percentile_window, cfg.ma_long, cfg.return_window) + 30
+    warmup = required_market_regime_history_days(cfg) + 30
     # co_move 下用更偏 co_move 的 ad_ratio（极端宽度），减少结构侧抖动。
     series = _walk_forward_regimes(bars, industry, cfg=cfg, start_at=warmup, lookback=650, ad_ratio=2.0)
     switches = int((series != series.shift(1)).sum())
     # 经验上不应超过 10% 的天数发生切换
     assert switches / max(1, len(series)) <= 0.20
+
+
+@pytest.mark.slow
+def test_trendiness_range_threshold_calibrated_to_a_share():
+    """回归测试：trendiness_range_threshold=0.45 应使沪深300 震荡占比在 55-75% 区间。
+
+    数据论证（2026-04 验证，沪深300 2019-2026 滚动计算）：
+    - threshold=0.35（旧值）：震荡占比 47.7%，远低于 A 股实际 60-70%
+    - threshold=0.45（当前值）：震荡占比 63.4%，接近 A 股实际
+    - threshold=0.50：震荡占比 67.8%，也合理但偏保守
+
+    如果此测试失败，说明阈值变更后震荡占比偏离 A 股实际经验区间，
+    需重新校准并更新此处断言。
+    """
+    try:
+        from skyeye.data.facade import DataFacade
+    except Exception:
+        pytest.skip("DataFacade not available")
+
+    data = DataFacade()
+    bars_raw = data.get_daily_bars(
+        "000300.XSHG", "2018-01-01", "2026-04-25",
+        fields=["open", "high", "low", "close", "volume"],
+    )
+    if bars_raw is None or bars_raw.empty:
+        pytest.skip("沪深300 数据不可用")
+
+    from skyeye.market_regime_layer import (
+        normalize_single_instrument_bars,
+        _compute_direction_label_and_scores,
+    )
+
+    bench = normalize_single_instrument_bars(bars_raw, "000300.XSHG")
+    cfg = MarketRegimeConfig()
+    required_days = required_market_regime_history_days(cfg)
+
+    lookback = 650
+    trendiness_values = []
+    for i in range(required_days + lookback, len(bench) + 1):
+        sub = bench.iloc[i - lookback : i]
+        _label, trendiness, _direction, _diag = _compute_direction_label_and_scores(sub, cfg)
+        if trendiness is not None:
+            trendiness_values.append(trendiness)
+
+    if len(trendiness_values) < 200:
+        pytest.skip("有效 trendiness 样本不足")
+
+    range_ratio = sum(1 for t in trendiness_values if t < cfg.trendiness_range_threshold) / len(trendiness_values)
+    # A 股震荡占比应在 55-75% 区间（基于历史 60-70% 经验值，留一定容差）
+    assert 0.55 <= range_ratio <= 0.75, (
+        f"震荡占比 {range_ratio:.1%} 超出 A 股经验区间 [55%, 75%]，"
+        f"阈值 {cfg.trendiness_range_threshold} 可能需要重新校准"
+    )

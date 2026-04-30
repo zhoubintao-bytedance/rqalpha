@@ -91,6 +91,7 @@ include = ["rqalpha", "rqalpha.*", "skyeye", "skyeye.*"]
     "products/dividend_low_vol/strategies/*/*.md",
     "products/dividend_low_vol/strategies/*/*.yaml",
     "products/dividend_low_vol/strategies/*/profiles/*.yaml",
+    "products/ax1/profiles/*.yaml",
     "reports/*.md",
 ]
 

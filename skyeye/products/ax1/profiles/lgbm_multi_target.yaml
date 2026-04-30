@@ -1,0 +1,240 @@
+product: ax1
+schema_version: 1
+experiment:
+  name: ax1_lgbm_multi_target
+  seed: 20260430
+universe:
+  builder: dynamic
+  etf_first: true
+  layers:
+    core:
+      asset_type: etf
+      exposure_group: broad_beta
+      include:
+        - 510050.XSHG
+        - 510300.XSHG
+        - 510500.XSHG
+        - 512100.XSHG
+        - 588000.XSHG
+    industry:
+      asset_type: etf
+      exposure_group: sector
+      include:
+        - 512800.XSHG
+        - 512880.XSHG
+        - 512000.XSHG
+        - 512070.XSHG
+        - 515000.XSHG
+        - 515260.XSHG
+        - 512480.XSHG
+        - 159995.XSHE
+        - 512760.XSHG
+        - 512720.XSHG
+        - 515050.XSHG
+        - 515880.XSHG
+        - 515790.XSHG
+        - 515030.XSHG
+        - 516160.XSHG
+        - 512170.XSHG
+        - 512010.XSHG
+        - 159929.XSHE
+        - 159928.XSHE
+        - 512690.XSHG
+        - 512400.XSHG
+        - 515220.XSHG
+        - 515210.XSHG
+        - 512980.XSHG
+        - 512660.XSHG
+        - 516970.XSHG
+        - 159865.XSHE
+        - 159611.XSHE
+        - 516110.XSHG
+        - 159819.XSHE
+        - 562500.XSHG
+        - 159639.XSHE
+        - 159870.XSHE
+        - 512200.XSHG
+    style:
+      asset_type: etf
+      exposure_group: style_factor
+      include:
+        - 510880.XSHG
+        - 515180.XSHG
+        - 512890.XSHG
+        - 159901.XSHE
+        - 159902.XSHE
+        - 159949.XSHE
+        - 159915.XSHE
+        - 513050.XSHG
+        - 513130.XSHG
+        - 513100.XSHG
+        - 513500.XSHG
+        - 518880.XSHG
+        - 159985.XSHE
+        - 511010.XSHG
+        - 511260.XSHG
+        - 511220.XSHG
+    stock_satellite:
+      asset_type: stock
+      exposure_group: stock_alpha
+      enabled: false
+      include: []
+      max_count: 12
+labels:
+  return_horizons: [5, 10, 20]
+  stability_horizon: 20
+  volatility_horizons: [10]
+  winsorize_quantiles: [0.01, 0.99]
+  relative_return:
+    enabled: true
+    group_columns: [universe_layer]
+    min_group_count: 2
+    fallback: date
+  trading_days_per_year: 244
+  entry_lag_days: 1
+preprocessor:
+  kind: feature_preprocessor
+  neutralize: true
+  winsorize_scale: 3.5
+  standardize: true
+  min_obs: 5
+  sector_optional: true
+splitter:
+  kind: walk_forward
+  train_end: auto
+  val_months: 1
+  test_months: 1
+  embargo_days: 20
+  n_folds: 6
+  step_months: 1
+model:
+  registry: default
+  kind: lgbm_multi_target
+  feature_set: ax1_unified_v1
+  include_scopes: [common, etf_zscore, regime]
+  training_horizons: [5, 10, 20]
+  risk_horizon: 10
+  stability_horizon: 20
+  liquidity_column: feature_dollar_volume
+  confidence_method: sign_consistency
+  params:
+    objective: regression
+    metric: mae
+    boosting_type: gbdt
+    n_estimators: 150
+    num_leaves: 12
+    max_depth: 4
+    learning_rate: 0.03
+    min_child_samples: 80
+    reg_alpha: 0.3
+    reg_lambda: 2.0
+    subsample: 0.75
+    subsample_freq: 1
+    colsample_bytree: 0.75
+    early_stopping_rounds: 20
+    num_threads: 1
+    deterministic: true
+    force_col_wise: true
+    seed: 20260430
+    feature_fraction_seed: 20260430
+    bagging_seed: 20260430
+    data_random_seed: 20260430
+    verbose: -1
+view_fusion:
+  kind: noop_adjusted_return
+  enabled: false
+  return_column: expected_relative_net_return_10d
+risk_model:
+  kind: statistical_factor
+  lookback_days: 120
+  n_factors: 6
+  shrinkage: 0.30
+  idiosyncratic_floor: 1.0e-8
+optimizer:
+  kind: opportunity_pool_optimizer
+allocation:
+  kind: opportunity_pool_optimizer
+  score_column: expected_relative_net_return_10d
+  allow_gross_underfill: true
+  min_allocatable_score: 0.0
+  cash_fallback:
+    enabled: true
+  layer_exposure_groups:
+    core: broad_beta
+    industry: sector
+    style: style_factor
+    stock_satellite: stock_alpha
+  exposure_groups:
+    broad_beta:
+      max_weight: 0.65
+      score_multiplier: 1.0
+    sector:
+      max_weight: 0.55
+      score_multiplier: 1.0
+    style_factor:
+      max_weight: 0.35
+      score_multiplier: 1.0
+    defensive_cash:
+      max_weight: 0.50
+      score_multiplier: 0.8
+    cross_border:
+      max_weight: 0.25
+      score_multiplier: 0.8
+    commodity:
+      max_weight: 0.20
+      score_multiplier: 0.8
+    stock_alpha:
+      max_weight: 0.0
+      score_multiplier: 0.0
+  execution_drift_buffer: 0.01
+constraints:
+  max_single_weight: 0.25
+  target_gross_exposure: 1.0
+  cash_buffer: 0.02
+  max_turnover: 0.35
+  min_trade_value: 2000
+  max_industry_weight: 0.25
+  max_position_count: 15
+  min_position_count: 1
+  max_portfolio_volatility: 0.30
+costs:
+  enabled: true
+  stock:
+    commission_rate: 0.0008
+    stamp_tax_rate: 0.0005
+    slippage_bps: 5.0
+    impact_bps: 5.0
+    min_commission: 0.0
+  etf:
+    commission_rate: 0.0003
+    stamp_tax_rate: 0.0
+    slippage_bps: 2.0
+    impact_bps: 2.0
+    min_commission: 0.0
+  default_asset_type: stock
+execution:
+  kind: layered_smoother
+  rebalance_days_min: 10
+  rebalance_days_max: 20
+  rebalance_interval: 10
+  min_weight: 0.0
+  min_trade_value: 2000
+  buffer_weight: 0.0
+  no_trade_buffer_weight: 0.0
+  net_alpha_threshold: 0.0
+  net_alpha_column: adjusted_expected_return
+  t_plus_one_lock: true
+  today_buy_weight_column: today_buy_weight
+  participation_rate: 0.05
+  liquidity_column: dollar_volume
+  portfolio_value: 1000000
+  lot_size: 100
+  max_order_count: 12
+  price_column: close
+  execution_lag_days: 1
+evaluation:
+  signal_layer: true
+  portfolio_layer: true
+package:
+  schema_version: 1
+  status: research_package

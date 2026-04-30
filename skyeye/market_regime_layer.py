@@ -59,29 +59,29 @@ class MarketRegimeConfig:
     price_position_window: int = 60
     boll_window: int = 20
     boll_k: float = 2.0
-    boll_percentile_window: int = 120
+    boll_percentile_window: int = 60
     atr_window: int = 14
     atr_ma_window: int = 60
     vol_trend_window: int = 20
-    hurst_window: int = 200
+    hurst_window: int = 100
     hurst_max_lag: int = 20
     rsrs_n: int = 18
-    rsrs_m: int = 600
+    rsrs_m: int = 252
 
     # 结构指标用的窗口
     industry_return_window: int = 5
-    dispersion_percentile_window: int = 120
+    dispersion_percentile_window: int = 60
 
     # -----------------------------
     # 权重（缺失时会自动 renormalize）
     # -----------------------------
     trendiness_weights: dict[str, float] = field(
         default_factory=lambda: {
-            "adx_score": 0.30,
-            "hurst_score": 0.25,
+            "adx_score": 0.35,
+            "hurst_score": 0.15,
             "boll_width_score": 0.20,
             "atr_ratio_score": 0.15,
-            "volume_trend_score": 0.10,
+            "volume_trend_score": 0.15,
         }
     )
     direction_weights: dict[str, float] = field(
@@ -105,9 +105,9 @@ class MarketRegimeConfig:
     # -----------------------------
     # 阈值
     # -----------------------------
-    trendiness_range_threshold: float = 0.35
-    direction_bull_threshold: float = 0.15
-    direction_bear_threshold: float = -0.15
+    trendiness_range_threshold: float = 0.45
+    direction_bull_threshold: float = 0.35
+    direction_bear_threshold: float = -0.35
     rotation_threshold: float = 0.40
 
     # ADX 映射（20~35 映射到 0~1）
@@ -129,6 +129,24 @@ class MarketRegimeConfig:
     ad_ratio_boundary: float = 2.0
 
 
+def required_market_regime_history_days(cfg: MarketRegimeConfig | None = None) -> int:
+    cfg = cfg or MarketRegimeConfig()
+    return int(
+        max(
+            cfg.ma_long,
+            cfg.return_window,
+            cfg.price_position_window,
+            cfg.boll_percentile_window,
+            cfg.hurst_window,
+            cfg.atr_window + cfg.atr_ma_window,
+            cfg.adx_window,
+            cfg.macd_slow + cfg.macd_signal,
+            cfg.rsrs_n + cfg.rsrs_m,
+        )
+        + 5
+    )
+
+
 def _clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, float(x))))
 
@@ -141,6 +159,28 @@ def _safe_float(x: Any) -> float | None:
     if not math.isfinite(v):
         return None
     return float(v)
+
+
+def _safe_pearson_corr(left: pd.Series, right: pd.Series, *, min_count: int) -> float | None:
+    frame = pd.concat(
+        [
+            pd.to_numeric(left, errors="coerce"),
+            pd.to_numeric(right, errors="coerce"),
+        ],
+        axis=1,
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(frame) < int(min_count):
+        return None
+    left_values = frame.iloc[:, 0].to_numpy(dtype=float)
+    right_values = frame.iloc[:, 1].to_numpy(dtype=float)
+    if float(np.nanstd(left_values, ddof=0)) <= 1e-12:
+        return None
+    if float(np.nanstd(right_values, ddof=0)) <= 1e-12:
+        return None
+    corr = float(np.corrcoef(left_values, right_values)[0, 1])
+    if not math.isfinite(corr):
+        return None
+    return corr
 
 
 def _weighted_avg(values: dict[str, float | None], weights: dict[str, float]) -> float | None:
@@ -374,22 +414,19 @@ def _compute_direction_label_and_scores(
     low_s = pd.Series(low).astype(float) if low is not None else None
     vol_s = pd.Series(volume).astype(float) if volume is not None else None
 
-    required = max(
-        cfg.ma_long,
-        cfg.return_window,
-        cfg.price_position_window,
-        cfg.boll_percentile_window,
-        cfg.hurst_window,
-        cfg.atr_window + cfg.atr_ma_window,
-        cfg.adx_window,
-        cfg.macd_slow + cfg.macd_signal,
-    ) + 5
+    required = required_market_regime_history_days(cfg)
     if len(close) < int(required):
         return (
             "range",
             None,
             None,
-            {"reason": "insufficient_history", "need": int(required), "have": int(len(close))},
+            {
+                "reason": "insufficient_history",
+                "need": int(required),
+                "have": int(len(close)),
+                "required_history_days": int(required),
+                "history_days": int(len(close)),
+            },
         )
 
     # -----------------------------
@@ -423,10 +460,9 @@ def _compute_direction_label_and_scores(
     if vol_s is not None and vol_s.notna().sum() >= cfg.vol_trend_window + 2:
         rets = close.pct_change().iloc[-cfg.vol_trend_window :]
         vchg = vol_s.pct_change().iloc[-cfg.vol_trend_window :].replace([np.inf, -np.inf], np.nan)
-        if rets.notna().sum() >= cfg.vol_trend_window * 0.8 and vchg.notna().sum() >= cfg.vol_trend_window * 0.8:
-            corr = float(rets.corr(vchg))
-            if math.isfinite(corr):
-                volume_trend_score = _clamp01(max(corr, 0.0))
+        corr = _safe_pearson_corr(rets, vchg, min_count=int(cfg.vol_trend_window * 0.8))
+        if corr is not None:
+            volume_trend_score = _clamp01(max(corr, 0.0))
 
     trendiness_components = {
         "adx_score": adx_score,
@@ -657,22 +693,26 @@ def compute_market_regime(
     # 合成
     regime: RegimeLabel = f"{direction_label}_{structure_label}"  # type: ignore[assignment]
 
-    # strength：方向强度（趋势 vs 震荡）与结构强度取 min，保守表示“最弱短板”。
+    # strength：方向强度（趋势 vs 震荡）与结构强度先 clamp 到 [0, 1]，
+    # 再取几何平均，避免 min 过度压低 tilt 激活率。
     direction_strength = None
     if trendiness is not None:
-        direction_strength = float(trendiness) if direction_label != "range" else float(1.0 - trendiness)
+        raw_direction_strength = float(trendiness) if direction_label != "range" else float(1.0 - trendiness)
+        direction_strength = _clamp01(raw_direction_strength)
     structure_strength = None
     if rotation_score is not None:
-        structure_strength = float(rotation_score) if structure_label == "rotation" else float(1.0 - rotation_score)
+        raw_structure_strength = float(rotation_score) if structure_label == "rotation" else float(1.0 - rotation_score)
+        structure_strength = _clamp01(raw_structure_strength)
 
     if direction_strength is None or structure_strength is None:
         strength = 0.0
     else:
-        strength = float(min(direction_strength, structure_strength))
+        strength = float(math.sqrt(direction_strength * structure_strength))
 
     diagnostics = {
         "direction_label": direction_label,
         "structure_label": structure_label,
+        "required_history_days": required_market_regime_history_days(cfg),
         "trendiness": trendiness,
         "direction": direction_score,
         "rotation_score": rotation_score,

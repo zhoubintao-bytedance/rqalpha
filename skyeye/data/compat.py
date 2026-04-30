@@ -2,7 +2,7 @@
 """
 AKShare fallback for data not available in rqdatac.
 
-Currently only northbound aggregate net flow needs AKShare.
+Currently northbound aggregate net flow and PMI rely on AKShare fallback.
 """
 
 from __future__ import annotations
@@ -67,3 +67,98 @@ def get_northbound_flow_akshare(
         result["date"] <= pd.Timestamp(str(end_date))
     )
     return result.loc[mask].reset_index(drop=True)
+
+
+def get_macro_pmi_akshare(
+    start_date: DateLike, end_date: DateLike
+) -> Optional[pd.DataFrame]:
+    """Fetch official manufacturing PMI via AKShare.
+
+    Returns DataFrame with columns: ``date``, ``pmi``.
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        logger.warning("akshare not installed, macro PMI unavailable")
+        return None
+
+    candidate_functions = [
+        "macro_china_pmi_yearly",
+        "macro_china_pmi",
+    ]
+
+    for function_name in candidate_functions:
+        fetcher = getattr(ak, function_name, None)
+        if not callable(fetcher):
+            continue
+        try:
+            raw = fetcher()
+        except TypeError:
+            continue
+        except Exception as exc:
+            logger.warning("AKShare PMI fetch failed via %s: %s", function_name, exc)
+            continue
+
+        normalized = _normalize_macro_pmi_frame(raw)
+        if normalized is None or normalized.empty:
+            continue
+
+        mask = (normalized["date"] >= pd.Timestamp(str(start_date))) & (
+            normalized["date"] <= pd.Timestamp(str(end_date))
+        )
+        result = normalized.loc[mask].reset_index(drop=True)
+        if not result.empty:
+            return result
+
+    logger.warning("macro PMI unavailable from AKShare")
+    return None
+
+
+def _normalize_macro_pmi_frame(raw: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    if raw is None or raw.empty:
+        return None
+
+    frame = raw.copy()
+    date_col = None
+    for candidate in ("date", "Date", "日期", "月份", "month"):
+        if candidate in frame.columns:
+            date_col = candidate
+            break
+    if date_col is None:
+        date_col = frame.columns[0]
+
+    pmi_col = None
+    for candidate in (
+        "pmi",
+        "PMI",
+        "制造业PMI",
+        "制造业采购经理指数(%)",
+        "官方制造业PMI",
+        "value",
+        "今值",
+    ):
+        if candidate in frame.columns:
+            pmi_col = candidate
+            break
+
+    if pmi_col is None:
+        numeric_candidates = [
+            column
+            for column in frame.columns
+            if column != date_col and pd.api.types.is_numeric_dtype(frame[column])
+        ]
+        if not numeric_candidates:
+            return None
+        pmi_col = numeric_candidates[0]
+
+    result = pd.DataFrame(
+        {
+            "date": pd.to_datetime(frame[date_col], errors="coerce"),
+            "pmi": pd.to_numeric(frame[pmi_col], errors="coerce"),
+        }
+    )
+    result = result.dropna(subset=["date"])
+    if result.empty:
+        return None
+    result = result.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    return result.reset_index(drop=True)

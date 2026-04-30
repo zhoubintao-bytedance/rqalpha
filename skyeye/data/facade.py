@@ -815,3 +815,567 @@ class DataFacade:
         if self.cache_store is None:
             return None
         return self.cache_store.load_factor_frame(ids, factor_list, start_date, end_date)
+
+    def get_industry(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        source: str = "citics_2019",
+        level: int = 1,
+        date=None,
+    ) -> Optional[pd.DataFrame]:
+        """行业分类轻包装；失败时保持和其他快照接口一致返回 None。"""
+        if self.provider is None:
+            return None
+        try:
+            return self.provider.get_industry(order_book_ids, source=source, level=level, date=date)
+        except Exception as exc:
+            self._raise_if_quota_exceeded(exc)
+            return None
+
+    def is_suspended(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        start_date,
+        end_date,
+    ) -> Optional[pd.DataFrame]:
+        """停牌状态轻包装。"""
+        if self.provider is None:
+            return None
+        try:
+            return self.provider.is_suspended(order_book_ids, start_date=start_date, end_date=end_date)
+        except Exception as exc:
+            self._raise_if_quota_exceeded(exc)
+            return None
+
+    def get_securities_margin(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        start_date,
+        end_date,
+        fields: Optional[Union[str, Sequence[str]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """按 `SQLite -> rqdatac` 顺序读取融资融券数据，复用 factor_values 表缓存。
+
+        Args:
+            order_book_ids: 证券代码或代码列表
+            start_date: 开始日期
+            end_date: 结束日期
+            fields: 字段名或字段列表，如 'margin_balance' 或 ['margin_balance', 'short_balance']
+
+        Returns:
+            长表格式 DataFrame，包含 date, order_book_id 及请求的字段列
+        """
+        ids = self._as_order_book_ids(order_book_ids)
+        field_list = self._as_list(fields, ["margin_balance"])
+        if self.cache_store is None:
+            return None
+
+        # 复用 factor_values 表的缓存机制
+        requested_trading_dates = self._resolve_requested_trading_dates(start_date, end_date)
+        requested_date_keys = [self._normalize_date_key(date) for date in requested_trading_dates]
+        local_payloads = {} if self.cache_store is None else self.cache_store.load_factor_payloads(ids, start_date, end_date)
+
+        # Check for missing dates and fetch online
+        grouped_missing_ids: dict[tuple[tuple[str, str], ...], list[str]] = {}
+        for order_book_id in ids:
+            missing_date_keys = set()
+            for field in field_list:
+                covered = {
+                    date_key
+                    for (payload_order_book_id, date_key), payload in local_payloads.items()
+                    if payload_order_book_id == order_book_id and field in payload
+                }
+                if self.cache_store is not None and requested_date_keys:
+                    covered.update(
+                        self.cache_store.get_covered_dates(
+                            "factor_values",
+                            self._factor_cache_key(order_book_id, field),
+                            requested_date_keys,
+                        )
+                    )
+                missing_date_keys.update(date_key for date_key in requested_date_keys if date_key not in covered)
+            missing_ranges = tuple(self._group_missing_ranges(requested_date_keys, missing_date_keys))
+            if missing_ranges:
+                grouped_missing_ids.setdefault(missing_ranges, []).append(order_book_id)
+
+        for missing_ranges, missing_ids in grouped_missing_ids.items():
+            for range_start, range_end in missing_ranges:
+                    try:
+                        # Direct call to rqalpha.apis (provider doesn't have this method)
+                        from rqalpha.apis import get_securities_margin
+
+                        raw_frame = get_securities_margin(
+                            missing_ids[0] if len(missing_ids) == 1 else missing_ids,
+                            start_date=range_start,
+                            end_date=range_end,
+                            fields=field_list[0] if len(field_list) == 1 else field_list,
+                            expect_df=True,
+                        )
+                        normalized = self._normalize_online_factor_frame(raw_frame, missing_ids, field_list)
+                        if self.cache_store is not None and normalized is not None and not normalized.empty:
+                            self.cache_store.save_factor_values(normalized, source="rqdatac")
+                        for order_book_id in missing_ids:
+                            delivered_date_keys = self._extract_row_date_keys(normalized, order_book_id)
+                            row_count = len(delivered_date_keys) if delivered_date_keys else 0
+                            if self.cache_store is not None:
+                                for field in field_list:
+                                    cache_key = self._factor_cache_key(order_book_id, field)
+                                    if delivered_date_keys and field in normalized.columns:
+                                        delivered_ranges = self._group_missing_ranges(requested_date_keys, delivered_date_keys)
+                                        for covered_start, covered_end in delivered_ranges:
+                                            self.cache_store.mark_coverage(
+                                                "factor_values",
+                                                cache_key,
+                                                covered_start,
+                                                covered_end,
+                                                row_count=row_count,
+                                                source="rqdatac",
+                                            )
+                                    self.cache_store.record_fetch_audit(
+                                        "factor_values",
+                                        cache_key,
+                                        start_date=range_start,
+                                        end_date=range_end,
+                                        source="rqdatac",
+                                        row_count=row_count,
+                                        status="success",
+                                    )
+                    except Exception as exc:
+                        if self.cache_store is not None:
+                            for order_book_id in missing_ids:
+                                for field in field_list:
+                                    self.cache_store.record_fetch_audit(
+                                        "factor_values",
+                                        self._factor_cache_key(order_book_id, field),
+                                        start_date=range_start,
+                                        end_date=range_end,
+                                        source="rqdatac",
+                                        row_count=0,
+                                        status="error",
+                                        error_type=exc.__class__.__name__,
+                                        error_message=str(exc),
+                                    )
+                        self._raise_if_quota_exceeded(exc)
+
+            if self.cache_store is not None:
+                local_payloads = self.cache_store.load_factor_payloads(ids, start_date, end_date)
+
+        if self.cache_store is None:
+            return None
+        return self.cache_store.load_factor_frame(ids, field_list, start_date, end_date)
+
+    def get_stock_connect(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        start_date,
+        end_date,
+        fields: Optional[Union[str, Sequence[str]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """按 `SQLite -> rqdatac` 顺序读取北向资金数据，复用 factor_values 表缓存。
+
+        Args:
+            order_book_ids: 股票代码或代码列表
+            start_date: 开始日期
+            end_date: 结束日期
+            fields: 字段名或字段列表，如 'shares_holding' 或 ['shares_holding', 'holding_ratio']
+
+        Returns:
+            长表格式 DataFrame，包含 date, order_book_id 及请求的字段列
+        """
+        ids = self._as_order_book_ids(order_book_ids)
+        field_list = self._as_list(fields, ["shares_holding", "holding_ratio"])
+        if self.cache_store is None:
+            return None
+
+        # 复用 factor_values 表的缓存机制
+        requested_trading_dates = self._resolve_requested_trading_dates(start_date, end_date)
+        requested_date_keys = [self._normalize_date_key(date) for date in requested_trading_dates]
+        local_payloads = {} if self.cache_store is None else self.cache_store.load_factor_payloads(ids, start_date, end_date)
+
+        # Check for missing dates and fetch online
+        grouped_missing_ids: dict[tuple[tuple[str, str], ...], list[str]] = {}
+        for order_book_id in ids:
+            missing_date_keys = set()
+            for field in field_list:
+                covered = {
+                    date_key
+                    for (payload_order_book_id, date_key), payload in local_payloads.items()
+                    if payload_order_book_id == order_book_id and field in payload
+                }
+                if self.cache_store is not None and requested_date_keys:
+                    covered.update(
+                        self.cache_store.get_covered_dates(
+                            "factor_values",
+                            self._factor_cache_key(order_book_id, field),
+                            requested_date_keys,
+                        )
+                    )
+                missing_date_keys.update(date_key for date_key in requested_date_keys if date_key not in covered)
+            missing_ranges = tuple(self._group_missing_ranges(requested_date_keys, missing_date_keys))
+            if missing_ranges:
+                grouped_missing_ids.setdefault(missing_ranges, []).append(order_book_id)
+
+        for missing_ranges, missing_ids in grouped_missing_ids.items():
+            for range_start, range_end in missing_ranges:
+                    try:
+                        # Direct call to rqalpha.apis (provider doesn't have this method)
+                        from rqalpha.apis import get_stock_connect
+
+                        raw_frame = get_stock_connect(
+                            missing_ids[0] if len(missing_ids) == 1 else missing_ids,
+                            start_date=range_start,
+                            end_date=range_end,
+                            fields=field_list,
+                            expect_df=True,
+                        )
+                        normalized = self._normalize_online_factor_frame(raw_frame, missing_ids, field_list)
+                        if self.cache_store is not None and normalized is not None and not normalized.empty:
+                            self.cache_store.save_factor_values(normalized, source="rqdatac")
+                        for order_book_id in missing_ids:
+                            delivered_date_keys = self._extract_row_date_keys(normalized, order_book_id)
+                            row_count = len(delivered_date_keys) if delivered_date_keys else 0
+                            if self.cache_store is not None:
+                                for field in field_list:
+                                    cache_key = self._factor_cache_key(order_book_id, field)
+                                    if delivered_date_keys and field in normalized.columns:
+                                        delivered_ranges = self._group_missing_ranges(requested_date_keys, delivered_date_keys)
+                                        for covered_start, covered_end in delivered_ranges:
+                                            self.cache_store.mark_coverage(
+                                                "factor_values",
+                                                cache_key,
+                                                covered_start,
+                                                covered_end,
+                                                row_count=row_count,
+                                                source="rqdatac",
+                                            )
+                                    self.cache_store.record_fetch_audit(
+                                        "factor_values",
+                                        cache_key,
+                                        start_date=range_start,
+                                        end_date=range_end,
+                                        source="rqdatac",
+                                        row_count=row_count,
+                                        status="success",
+                                    )
+                    except Exception as exc:
+                        if self.cache_store is not None:
+                            for order_book_id in missing_ids:
+                                for field in field_list:
+                                    self.cache_store.record_fetch_audit(
+                                        "factor_values",
+                                        self._factor_cache_key(order_book_id, field),
+                                        start_date=range_start,
+                                        end_date=range_end,
+                                        source="rqdatac",
+                                        row_count=0,
+                                        status="error",
+                                        error_type=exc.__class__.__name__,
+                                        error_message=str(exc),
+                                    )
+                        self._raise_if_quota_exceeded(exc)
+
+            if self.cache_store is not None:
+                local_payloads = self.cache_store.load_factor_payloads(ids, start_date, end_date)
+
+        if self.cache_store is None:
+            return None
+        return self.cache_store.load_factor_frame(ids, field_list, start_date, end_date)
+
+    def get_pit_financials(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        fields: Union[str, Sequence[str]],
+        count: int = 4,
+        statements: str = "latest",
+    ) -> Optional[pd.DataFrame]:
+        """读取 Point-in-time 财务数据，使用 snapshot_cache 表缓存。
+
+        Args:
+            order_book_ids: 股票代码或代码列表
+            fields: 财务字段名或字段列表，如 'net_profit' 或 ['net_profit', 'total_owner_equities']
+            count: 获取最近几个季度的数据，默认4
+            statements: 'latest' 使用最新发布的数据，'all' 返回所有版本
+
+        Returns:
+            DataFrame 包含财务数据
+        """
+        ids = self._as_order_book_ids(order_book_ids)
+        field_list = self._as_list(fields, [])
+        if not field_list:
+            raise ValueError("fields parameter is required for get_pit_financials")
+
+        # 使用 snapshot_cache 表存储 PIT 财务数据
+        # cache_key 格式: {count}__{statements}__{field_list_hash}
+        import hashlib
+        field_hash = hashlib.md5("|".join(sorted(field_list)).encode()).hexdigest()[:8]
+        cache_key = f"pit_fin_{count}_{statements}_{field_hash}"
+
+        # 尝试从缓存加载
+        if self.cache_store is not None:
+            cached_frame, covered = self.cache_store.load_snapshot_frame("pit_financials", cache_key)
+            if cached_frame is not None and not cached_frame.empty:
+                # 过滤出请求的order_book_ids
+                if "order_book_id" in cached_frame.columns:
+                    filtered = cached_frame[cached_frame["order_book_id"].isin(ids)]
+                    if not filtered.empty:
+                        return filtered
+            if covered:
+                return pd.DataFrame()
+
+        # 在线获取数据
+        try:
+            # Direct call to rqalpha.apis (provider doesn't have this method)
+            from rqalpha.apis import get_pit_financials_ex
+
+            result = get_pit_financials_ex(
+                order_book_ids=ids,
+                fields=field_list,
+                count=count,
+                statements=statements,
+            )
+
+            if result is not None and not result.empty:
+                # 标准化格式
+                if isinstance(result.index, pd.MultiIndex):
+                    result = result.reset_index()
+
+                # 保存到缓存
+                if self.cache_store is not None:
+                    try:
+                        # Create composite item_key to ensure uniqueness
+                        # PIT financials returns multiple rows per stock (one per quarter)
+                        # Use "order_book_id__quarter" as unique identifier
+                        cache_result = result.copy()
+                        if 'quarter' in cache_result.columns:
+                            cache_result['_cache_item_key'] = (
+                                cache_result['order_book_id'].astype(str) + '__' +
+                                cache_result['quarter'].astype(str)
+                            )
+                            item_key_field = '_cache_item_key'
+                        else:
+                            # Fallback to order_book_id if quarter is not available
+                            item_key_field = 'order_book_id'
+
+                        self.cache_store.save_snapshot_frame(
+                            "pit_financials",
+                            cache_key,
+                            cache_result,
+                            item_key_field=item_key_field,
+                            source="rqdatac",
+                        )
+                        self.cache_store.mark_snapshot_coverage(
+                            "pit_financials",
+                            cache_key,
+                            row_count=len(result),
+                            source="rqdatac",
+                        )
+                        self.cache_store.record_fetch_audit(
+                            "pit_financials",
+                            cache_key,
+                            start_date=None,
+                            end_date=None,
+                            source="rqdatac",
+                            row_count=len(result),
+                            status="success",
+                        )
+                    except Exception as cache_exc:
+                        # Cache failure should not prevent returning data
+                        import logging
+                        logging.warning(f"Failed to cache PIT financials data: {cache_exc}")
+
+                return result
+
+        except Exception as exc:
+            if self.cache_store is not None:
+                self.cache_store.record_fetch_audit(
+                    "pit_financials",
+                    cache_key,
+                    start_date=None,
+                    end_date=None,
+                    source="rqdatac",
+                    row_count=0,
+                    status="error",
+                    error_type=exc.__class__.__name__,
+                    error_message=str(exc),
+                )
+            self._raise_if_quota_exceeded(exc)
+            # Re-raise non-quota exceptions so callers know what went wrong
+            raise
+
+        return None
+
+    def get_turnover_rate(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        start_date,
+        end_date,
+        fields: Optional[Union[str, Sequence[str]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """按 `SQLite -> rqdatac` 顺序读取换手率数据，复用 factor_values 表缓存。"""
+        ids = self._as_order_book_ids(order_book_ids)
+        field_list = self._as_list(fields, ["today"])
+        if self.provider is None and self.cache_store is None:
+            return None
+
+        # 复用 get_factor 缓存机制，用 turnover_rate 前缀的 cache_key
+        factor_names = [f"turnover_rate_{field}" for field in field_list]
+        result = self.get_factor(ids, factor_names, start_date, end_date)
+        if result is not None and not result.empty:
+            # Rename columns to simple field names
+            rename_map = {f"turnover_rate_{field}": field for field in field_list if f"turnover_rate_{field}" in result.columns}
+            result = result.rename(columns=rename_map)
+        return result
+
+    def get_bond_yield(
+        self,
+        start_date,
+        end_date,
+        tenor: str = "10Y",
+    ) -> Optional[pd.DataFrame]:
+        """读取国债收益率曲线，缓存到 factor_values 表。"""
+        if self.provider is None:
+            return None
+        try:
+            raw = self.provider.get_bond_yield(start_date, end_date, tenor=tenor)
+            if raw is None or raw.empty:
+                return None
+            result = raw.copy()
+            if isinstance(result.index, pd.DatetimeIndex):
+                result = result.reset_index()
+                result = result.rename(columns={"index": "date"})
+            # Ensure date column
+            for col in ["date", "DateTime"]:
+                if col in result.columns:
+                    result["date"] = pd.to_datetime(result[col])
+                    break
+            # Use the tenor column as the yield value
+            yield_col = tenor if tenor in result.columns else result.columns[-1]
+            result = result[["date", yield_col]].copy()
+            result = result.rename(columns={yield_col: f"bond_yield_{tenor}"})
+            result["order_book_id"] = "MARKET"
+            return result
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to load bond yield: {exc}")
+            return None
+
+    def get_northbound_flow(
+        self,
+        start_date,
+        end_date,
+    ) -> Optional[pd.DataFrame]:
+        """读取北向资金整体净流入（市场级），优先 rqdatac，fallback AKShare。"""
+        if self.provider is None:
+            # Try AKShare fallback
+            try:
+                from skyeye.data.compat import get_northbound_flow_akshare
+                raw = get_northbound_flow_akshare(start_date, end_date)
+                if raw is not None and not raw.empty:
+                    result = raw.copy()
+                    if "north_net_flow" in result.columns:
+                        result = result.rename(columns={"north_net_flow": "northbound_net_flow"})
+                    result["order_book_id"] = "MARKET"
+                    return result
+            except Exception:
+                pass
+            return None
+        try:
+            raw = self.provider.get_northbound_flow(start_date, end_date)
+            if raw is None or raw.empty:
+                return None
+            result = raw.copy()
+            if isinstance(result.index, pd.DatetimeIndex):
+                result = result.reset_index()
+                result = result.rename(columns={"index": "date"})
+            for col in ["date", "DateTime"]:
+                if col in result.columns:
+                    result["date"] = pd.to_datetime(result[col])
+                    break
+            result["order_book_id"] = "MARKET"
+            return result
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to load northbound flow from provider: {exc}")
+            # Try AKShare fallback
+            try:
+                from skyeye.data.compat import get_northbound_flow_akshare
+                raw = get_northbound_flow_akshare(start_date, end_date)
+                if raw is not None and not raw.empty:
+                    result = raw.copy()
+                    if "north_net_flow" in result.columns:
+                        result = result.rename(columns={"north_net_flow": "northbound_net_flow"})
+                    result["order_book_id"] = "MARKET"
+                    return result
+            except Exception:
+                pass
+            return None
+
+    def get_macro_pmi(
+        self,
+        start_date,
+        end_date,
+    ) -> Optional[pd.DataFrame]:
+        """读取官方制造业 PMI，优先 provider 扩展，fallback AKShare。"""
+        raw = None
+        if self.provider is not None:
+            provider_getter = getattr(self.provider, "get_macro_pmi", None)
+            if callable(provider_getter):
+                try:
+                    raw = provider_getter(start_date, end_date)
+                except Exception as exc:
+                    import logging
+
+                    logging.getLogger(__name__).warning(f"Failed to load macro PMI from provider: {exc}")
+
+        if raw is None or raw.empty:
+            try:
+                from skyeye.data.compat import get_macro_pmi_akshare
+
+                raw = get_macro_pmi_akshare(start_date, end_date)
+            except Exception:
+                raw = None
+
+        if raw is None or raw.empty:
+            return None
+
+        result = raw.copy()
+        if isinstance(result.index, pd.DatetimeIndex):
+            result = result.reset_index().rename(columns={"index": "date"})
+        for col in ["date", "DateTime"]:
+            if col in result.columns:
+                result["date"] = pd.to_datetime(result[col])
+                break
+        if "date" not in result.columns:
+            return None
+
+        pmi_col = None
+        for candidate in ["pmi", "PMI", "manufacturing_pmi", "macro_pmi"]:
+            if candidate in result.columns:
+                pmi_col = candidate
+                break
+        if pmi_col is None:
+            numeric_cols = result.select_dtypes(include="number").columns.tolist()
+            if not numeric_cols:
+                return None
+            pmi_col = numeric_cols[0]
+
+        result = result[["date", pmi_col]].copy()
+        result = result.rename(columns={pmi_col: "pmi"})
+        result["pmi"] = pd.to_numeric(result["pmi"], errors="coerce")
+        result["order_book_id"] = "MARKET"
+        return result
+
+    def is_st_stock(
+        self,
+        order_book_ids: Union[str, Sequence[str]],
+        start_date,
+        end_date,
+    ) -> Optional[pd.DataFrame]:
+        """ST 状态轻包装。"""
+        if self.provider is None:
+            return None
+        try:
+            return self.provider.is_st_stock(order_book_ids, start_date=start_date, end_date=end_date)
+        except Exception as exc:
+            self._raise_if_quota_exceeded(exc)
+            return None
