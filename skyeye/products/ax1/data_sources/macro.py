@@ -48,7 +48,7 @@ class MacroDataSource(AX1DataSource):
             ),
             DataSourceCapability(
                 name="macro.northbound_aggregate",
-                source_family="flow",
+                source_family="macro",
                 asset_type="both",
                 point_in_time=True,
                 observable_lag_days=1,

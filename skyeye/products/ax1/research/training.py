@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from skyeye.products.ax1.config import DEFAULT_WALK_FORWARD_FOLDS
+from skyeye.products.ax1.horizons import horizon_from_column
 
 
 def run_lgbm_pipeline(
@@ -79,6 +80,7 @@ def run_lgbm_pipeline(
         "feature_diagnostics": feature_report["feature_diagnostics"],
         "feature_conflicts": feature_report["feature_conflicts"],
         "feature_review_summary": feature_report["feature_review_summary"],
+        "feature_diagnostics_meta": feature_report.get("meta", {}),
     }
     if len(persisted_fold_results) == 1:
         summary.update(
@@ -273,7 +275,10 @@ def prediction_horizons(config: dict[str, Any]) -> list[int]:
 
 
 def _feature_diagnostics_label_column(config: dict[str, Any]) -> str:
-    horizon = int(config.get("labels", {}).get("stability_horizon", 20))
+    allocation = config.get("allocation", {}) or {}
+    horizon = horizon_from_column(str(allocation.get("score_column", "")))
+    if horizon is None:
+        horizon = int(config.get("labels", {}).get("stability_horizon", 20))
     return f"label_relative_net_return_{horizon}d"
 
 

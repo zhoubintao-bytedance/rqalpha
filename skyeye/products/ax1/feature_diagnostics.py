@@ -97,6 +97,7 @@ def analyze_fold_feature_diagnostics(
         feature: _aggregate_feature_metrics(fold_metrics)
         for feature, fold_metrics in per_feature_fold_metrics.items()
     }
+    _attach_feature_catalog_metadata(diagnostics)
     combined = pd.concat(merged_folds, ignore_index=True) if merged_folds else pd.DataFrame()
     conflicts = compute_feature_conflicts(
         combined,
@@ -491,6 +492,8 @@ def _aggregate_feature_metrics(fold_metrics: list[dict[str, Any]]) -> dict[str, 
         return {
             "coverage": 0.0,
             "valid_count": 0,
+            "non_null_count": 0,
+            "row_count": 0,
             "mean_cross_sectional_std": 0.0,
             "rank_ic_mean": 0.0,
             "top_bucket_spread_mean": 0.0,
@@ -504,6 +507,8 @@ def _aggregate_feature_metrics(fold_metrics: list[dict[str, Any]]) -> dict[str, 
     return {
         "coverage": float(valid_count / total_rows) if total_rows else 0.0,
         "valid_count": int(valid_count),
+        "non_null_count": int(valid_count),
+        "row_count": int(total_rows),
         "mean_cross_sectional_std": _weighted_mean(fold_metrics, "mean_cross_sectional_std", "valid_count"),
         "rank_ic_mean": _mean(fold_metrics, "rank_ic_mean"),
         "top_bucket_spread_mean": _mean(fold_metrics, "top_bucket_spread_mean"),
@@ -512,6 +517,22 @@ def _aggregate_feature_metrics(fold_metrics: list[dict[str, Any]]) -> dict[str, 
         "fold_summary": _fold_summary([_as_float(metric.get("rank_ic_mean")) for metric in fold_metrics]),
         "folds": fold_metrics,
     }
+
+
+def _attach_feature_catalog_metadata(diagnostics: dict[str, Any]) -> None:
+    try:
+        from skyeye.products.ax1.features.catalog import build_default_feature_catalog
+    except Exception:
+        return
+    catalog = build_default_feature_catalog()
+    for feature, metrics in diagnostics.items():
+        try:
+            definition = catalog.get(feature)
+        except KeyError:
+            continue
+        metrics["scope"] = definition.scope
+        metrics["source_family"] = definition.source_family
+        metrics["data_source_status"] = definition.data_source_status
 
 
 def _fold_summary(values: list[float]) -> dict[str, float | int]:

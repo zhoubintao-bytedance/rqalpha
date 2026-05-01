@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from skyeye.products.ax1._common import coerce_cost_config, normalize_asset_type
+from skyeye.products.ax1.horizons import horizon_from_column, label_kind_from_column, select_label_column_for_horizon
 
 
 def evaluate_signal_layer(predictions: pd.DataFrame, labels: pd.DataFrame | None = None) -> dict:
@@ -118,9 +119,10 @@ def _is_normalized(target_weights: pd.DataFrame) -> bool:
 
 def _compute_signal_metrics(predictions: pd.DataFrame, labels: pd.DataFrame) -> dict:
     score_column = _select_prediction_column(predictions)
-    label_column = _select_label_column(labels)
+    label_column = _select_label_column(labels, score_column=score_column)
     if score_column is None or label_column is None:
         return {
+            **_column_contract(score_column=score_column, label_column=label_column),
             "rank_ic_mean": 0.0,
             "rank_ic_ir": 0.0,
             "rank_ic_significance": _empty_rank_ic_significance(),
@@ -132,6 +134,7 @@ def _compute_signal_metrics(predictions: pd.DataFrame, labels: pd.DataFrame) -> 
     merged = _merge_on_panel_keys(predictions, labels, [score_column], [label_column])
     if merged.empty:
         return {
+            **_column_contract(score_column=score_column, label_column=label_column),
             "rank_ic_mean": 0.0,
             "rank_ic_ir": 0.0,
             "rank_ic_significance": _empty_rank_ic_significance(),
@@ -191,6 +194,7 @@ def _compute_signal_metrics(predictions: pd.DataFrame, labels: pd.DataFrame) -> 
     group_bt = _compute_group_backtest_metrics(group_daily_returns, ls_spreads, n_groups)
 
     return {
+        **_column_contract(score_column=score_column, label_column=label_column),
         "rank_ic_mean": rank_ic_mean,
         "rank_ic_ir": float(rank_ic_mean / rank_ic_std) if rank_ic_std > 0 else 0.0,
         "rank_ic_significance": rank_ic_significance,
@@ -211,6 +215,16 @@ def _empty_rank_ic_significance() -> dict[str, float | int | bool | str]:
         "p_value": 1.0,
         "fdr_adjusted_p_value": 1.0,
         "significant_at_5pct": False,
+    }
+
+
+def _column_contract(*, score_column: str | None = None, label_column: str | None = None) -> dict[str, int | str | None]:
+    return {
+        "score_column": score_column,
+        "label_column": label_column,
+        "score_horizon": horizon_from_column(score_column),
+        "label_horizon": horizon_from_column(label_column),
+        "label_kind": label_kind_from_column(label_column),
     }
 
 
@@ -342,6 +356,7 @@ def _compute_portfolio_metrics(
     label_column = _select_portfolio_label_column(returns)
     if label_column is None or target_weights.empty:
         result = {
+            **_column_contract(label_column=label_column),
             "portfolio_return_mean": 0.0,
             "max_drawdown": 0.0,
             "volatility": 0.0,
@@ -361,6 +376,7 @@ def _compute_portfolio_metrics(
     merged = _merge_on_panel_keys(target_weights, returns, left_columns, right_columns)
     if merged.empty:
         result = {
+            **_column_contract(label_column=label_column),
             "portfolio_return_mean": 0.0,
             "max_drawdown": 0.0,
             "volatility": 0.0,
@@ -382,6 +398,7 @@ def _compute_portfolio_metrics(
     merged = merged[pd.to_datetime(merged["date"]).isin(valid_dates)].copy()
     if merged.empty:
         result = {
+            **_column_contract(label_column=label_column),
             "portfolio_return_mean": 0.0,
             "max_drawdown": 0.0,
             "volatility": 0.0,
@@ -423,6 +440,7 @@ def _compute_portfolio_metrics(
     portfolio_returns = pd.DataFrame(rows)
     if portfolio_returns.empty:
         result = {
+            **_column_contract(label_column=label_column),
             "portfolio_return_mean": 0.0,
             "max_drawdown": 0.0,
             "volatility": 0.0,
@@ -442,6 +460,7 @@ def _compute_portfolio_metrics(
     std = float(returns_series.std(ddof=0)) if len(returns_series) > 1 else 0.0
     mean_return = float(returns_series.mean()) if len(returns_series) else 0.0
     result = {
+        **_column_contract(label_column=label_column),
         "portfolio_return_mean": mean_return,
         "max_drawdown": float(drawdown.max()) if len(drawdown) else 0.0,
         "volatility": float(std * np.sqrt(252.0)),
@@ -1183,7 +1202,14 @@ def _select_prediction_column(predictions: pd.DataFrame) -> str | None:
     return None
 
 
-def _select_label_column(labels: pd.DataFrame) -> str | None:
+def _select_label_column(labels: pd.DataFrame, *, score_column: str | None = None) -> str | None:
+    selected = select_label_column_for_horizon(
+        labels,
+        horizon=horizon_from_column(score_column),
+        prefixes=("label_relative_net_return", "label_net_return", "label_return"),
+    )
+    if selected is not None:
+        return selected
     if "label_relative_net_return_10d" in labels.columns:
         return "label_relative_net_return_10d"
     relative_columns = sorted(column for column in labels.columns if column.startswith("label_relative_net_return_"))

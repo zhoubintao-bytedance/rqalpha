@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from skyeye.products.ax1.horizons import horizon_from_column, label_kind_from_column, select_label_column_for_horizon
+
 
 def build_parameter_validation_summary(
     config: dict[str, Any],
@@ -17,7 +19,7 @@ def build_parameter_validation_summary(
     """Evaluate a small deterministic candidate set without changing defaults."""
     frame = _merge_predictions_and_labels(predictions, labels)
     score_column = _select_score_column(frame)
-    label_column = _select_label_column(frame)
+    label_column = _select_label_column(frame, score_column=score_column)
     current = _current_params(config)
     lgbm_param_policy = build_lgbm_param_policy_summary(config)
     if frame.empty or score_column is None or label_column is None:
@@ -53,6 +55,9 @@ def build_parameter_validation_summary(
         "status": "evaluated",
         "score_column": score_column,
         "label_column": label_column,
+        "score_horizon": horizon_from_column(score_column),
+        "label_horizon": horizon_from_column(label_column),
+        "label_kind": label_kind_from_column(label_column),
         "current": current,
         "candidate_metrics": metrics,
         "best_candidate_id": best["candidate_id"],
@@ -280,16 +285,18 @@ def _select_score_column(frame: pd.DataFrame) -> str | None:
     return None
 
 
-def _select_label_column(frame: pd.DataFrame) -> str | None:
-    for column in ("label_net_return_20d", "label_net_return_10d", "label_return_20d", "label_return_10d"):
+def _select_label_column(frame: pd.DataFrame, *, score_column: str | None = None) -> str | None:
+    selected = select_label_column_for_horizon(
+        frame,
+        horizon=horizon_from_column(score_column),
+        prefixes=("label_net_return", "label_return"),
+    )
+    if selected is not None:
+        return selected
+    for column in ("label_net_return_10d", "label_return_10d", "label_net_return_20d", "label_return_20d"):
         if column in frame.columns:
             return column
-    columns = sorted(
-        column
-        for column in frame.columns
-        if column.startswith("label_net_return_") or column.startswith("label_return_")
-    )
-    return columns[0] if columns else None
+    return None
 
 
 def _param_issue(name: str, reason_code: str, message: str, **extra: Any) -> dict[str, Any]:

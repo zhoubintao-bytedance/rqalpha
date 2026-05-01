@@ -125,6 +125,81 @@ def test_feature_view_unifies_etf_and_stock_rows_with_scope_catalog():
     assert stock_rows["feature_style_spread_composite_20d"].isna().all()
 
 
+def test_retired_research_features_are_filtered_from_default_training_surface():
+    raw = _mixed_panel()
+    retired = {
+        "feature_regime_neutral",
+        "feature_regime_risk_off",
+        "feature_regime_risk_on",
+        "feature_regime_rotation",
+        "feature_regime_strength",
+        "feature_amihud_illiquidity",
+        "feature_volatility_5d",
+        "feature_risk_forecast",
+        "feature_cost_forecast",
+        "feature_liquidity_score",
+        "feature_momentum_5d",
+        "feature_dollar_volume",
+        "feature_interaction_z_style_spread_composite_20d_x_regime_risk_off",
+        "feature_interaction_z_volume_price_flow_20d_x_regime_risk_off",
+        "feature_interaction_z_volume_price_flow_20d_x_regime_risk_on",
+        "feature_interaction_z_volume_price_flow_20d_x_regime_rotation",
+        "feature_interaction_z_style_spread_composite_20d_x_regime_risk_on",
+        "feature_interaction_z_style_spread_composite_20d_x_regime_rotation",
+        "feature_interaction_z_excess_mom_20d_x_regime_risk_off",
+        "feature_interaction_z_excess_mom_20d_x_regime_rotation",
+    }
+    regime_by_date = {
+        date: {
+            "market_regime": "bear_rotation",
+            "risk_state": "risk_off",
+            "rotation_state": "rotation",
+            "strength": 0.8,
+        }
+        for date in raw["date"].drop_duplicates()
+    }
+
+    feature_view = AX1FeatureViewBuilder({"include_scopes": ["common", "regime", "regime_interaction"]}).build(
+        raw,
+        universe_metadata=_metadata(raw),
+        regime_state_by_date=regime_by_date,
+    )
+    columns = resolve_feature_columns(
+        {
+            "model": {
+                "kind": "lgbm_multi_target",
+                "feature_set": "ax1_unified_v1",
+                "include_scopes": ["common", "regime", "regime_interaction"],
+            }
+        },
+        feature_view,
+    )
+
+    assert retired.isdisjoint(columns)
+    assert "feature_dollar_volume" in feature_view.frame.columns
+    assert "feature_regime_strength" in feature_view.frame.columns
+
+    replay_view = AX1FeatureViewBuilder(
+        {
+            "include_scopes": ["common", "regime", "regime_interaction"],
+            "include_retired_research_features": True,
+        }
+    ).build(raw, universe_metadata=_metadata(raw), regime_state_by_date=regime_by_date)
+    replay_columns = resolve_feature_columns(
+        {
+            "model": {
+                "kind": "lgbm_multi_target",
+                "feature_set": "ax1_unified_v1",
+                "include_scopes": ["common", "regime", "regime_interaction"],
+            }
+        },
+        replay_view,
+    )
+
+    assert "feature_dollar_volume" in replay_columns
+    assert "feature_regime_strength" in replay_columns
+
+
 def test_style_pair_spread_is_asset_specific_not_broadcast_by_date():
     raw = _mixed_panel()
     feature_view = AX1FeatureViewBuilder().build(raw, universe_metadata=_metadata(raw))
@@ -239,10 +314,11 @@ def test_resolve_feature_columns_uses_feature_set_scopes_not_legacy_columns():
         feature_view,
     )
 
-    assert "feature_momentum_5d" in columns
+    assert "feature_realized_skew_20d" in columns
+    assert "feature_momentum_5d" not in columns
     assert "feature_reversal_5d" not in columns
     assert "feature_z_style_spread_composite_20d" in columns
-    assert "feature_regime_risk_off" in columns
+    assert "feature_regime_risk_off" not in columns
     assert "feature_interaction_z_style_spread_composite_20d_x_regime_risk_off" not in columns
     assert "feature_style_spread_value_vs_growth_20d" not in columns
     assert "momentum_5d" not in columns
@@ -275,8 +351,45 @@ def test_regime_interactions_are_lazy_and_explicit_opt_in():
         feature_view,
     )
 
-    assert "feature_momentum_5d" in columns
-    assert "feature_interaction_z_style_spread_composite_20d_x_regime_risk_off" in columns
+    assert "feature_realized_skew_20d" in columns
+    assert "feature_interaction_z_style_spread_composite_20d_x_regime_strength" in columns
+    assert "feature_interaction_z_style_spread_composite_20d_x_regime_risk_off" not in columns
+
+
+def test_resolve_feature_columns_applies_research_allowlist_and_blocklist_after_scopes():
+    raw = _mixed_panel()
+    feature_view = AX1FeatureViewBuilder({"include_scopes": ["common", "etf_zscore", "regime", "regime_interaction"]}).build(
+        raw,
+        universe_metadata=_metadata(raw),
+        regime_state_by_date={
+            date: {
+                "market_regime": "bear_rotation",
+                "risk_state": "risk_off",
+                "rotation_state": "rotation",
+                "strength": 0.8,
+            }
+            for date in raw["date"].drop_duplicates()
+        },
+    )
+
+    columns = resolve_feature_columns(
+        {
+            "model": {
+                "kind": "lgbm_multi_target",
+                "feature_set": "ax1_unified_v1",
+                "include_scopes": ["common", "etf_zscore", "regime", "regime_interaction"],
+                "feature_allowlist": [
+                    "feature_realized_skew_20d",
+                    "feature_z_style_spread_composite_20d",
+                    "feature_interaction_z_volume_price_flow_20d_x_regime_strength",
+                ],
+                "feature_blocklist": ["feature_interaction_z_volume_price_flow_20d_x_regime_strength"],
+            }
+        },
+        feature_view,
+    )
+
+    assert columns == ["feature_realized_skew_20d", "feature_z_style_spread_composite_20d"]
 
 
 def test_feature_view_exposes_preprocess_policies_for_regime_and_interactions():
@@ -597,7 +710,8 @@ def test_resolve_feature_columns_supports_new_scopes():
         },
         feature_view,
     )
-    assert "feature_momentum_5d" in columns
+    assert "feature_realized_skew_20d" in columns
+    assert "feature_momentum_5d" not in columns
     assert "feature_rsi_14d" in columns
     assert "feature_macd" in columns
 

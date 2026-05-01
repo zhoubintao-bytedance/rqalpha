@@ -2,6 +2,19 @@ import pytest
 
 from skyeye.products.ax1.config import build_component_manifest, normalize_config
 
+TOP_STAT_10_FEATURE_ALLOWLIST = [
+    "feature_interaction_z_style_spread_composite_20d_x_regime_strength",
+    "feature_z_style_spread_composite_20d",
+    "feature_interaction_z_volume_price_flow_20d_x_regime_neutral",
+    "feature_z_volume_price_flow_20d",
+    "feature_interaction_z_excess_mom_20d_x_regime_strength",
+    "feature_interaction_z_vol_transition_10_60d_x_regime_strength",
+    "feature_z_vol_transition_10_60d",
+    "feature_z_excess_mom_20d",
+    "feature_interaction_z_volume_price_flow_20d_x_regime_strength",
+    "feature_interaction_z_style_spread_composite_20d_x_regime_neutral",
+]
+
 
 def _lgbm_config(**overrides):
     config = {
@@ -40,6 +53,7 @@ def test_empty_normalize_config_uses_lgbm_training_contract():
     params = config["model"]["params"]
     assert config["model"]["kind"] == "lgbm_multi_target"
     assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
+    assert config["model"]["feature_allowlist"] == TOP_STAT_10_FEATURE_ALLOWLIST
     assert config["experiment"]["seed"] == 20260430
     assert params["n_estimators"] == 150
     assert params["num_leaves"] == 12
@@ -204,6 +218,7 @@ def test_manifest_marks_lgbm_training_as_implemented_for_lgbm_kind():
     assert manifest["implementation_status"]["model"] == "lgbm_multi_target"
     assert manifest["feature_schema"]["feature_set"] == "ax1_unified_v1"
     assert manifest["model_schema"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
+    assert manifest["model_schema"]["feature_allowlist"] == TOP_STAT_10_FEATURE_ALLOWLIST
     assert manifest["implementation_status"]["lightgbm_training"] != "not_implemented"
     assert manifest["implementation_status"]["labels"] == "etf_peer_relative_net_return_training_labels"
     assert manifest["implementation_status"]["risk_model"] == "statistical_factor_pca_covariance_penalty"

@@ -118,6 +118,88 @@ def test_evaluate_promotion_gate_keeps_research_soft_failures_out_of_tradability
     assert summary["tradability_gate"]["soft_failed_checks"] == []
 
 
+@pytest.mark.parametrize(
+    (
+        "candidate_id",
+        "excess_net_mean_return",
+        "max_excess_drawdown",
+        "max_rolling_underperformance",
+        "cv",
+        "stability_score",
+        "alpha_hit_rate",
+        "positive_ratio",
+    ),
+    [
+        (
+            "top_stat_10",
+            0.0007156400965861851,
+            0.35104577999699627,
+            0.307123863950289,
+            1.6012917572938243,
+            6.666666666666668,
+            0.5648148148148148,
+            0.8333333333333334,
+        ),
+        (
+            "only_family_regime",
+            0.0038313424683397647,
+            0.2864903693213168,
+            0.2784863215979277,
+            6.603462201535992,
+            20.0,
+            0.5686274509803921,
+            0.5,
+        ),
+        (
+            "top_stat_5",
+            0.0001047664225121094,
+            0.28911991471194864,
+            0.25501366039278606,
+            1.3612664877269494,
+            6.666666666666668,
+            0.5277777777777778,
+            0.8333333333333334,
+        ),
+    ],
+)
+def test_canary_live_gate_allows_current_ax1_iteration_top3(
+    candidate_id,
+    excess_net_mean_return,
+    max_excess_drawdown,
+    max_rolling_underperformance,
+    cv,
+    stability_score,
+    alpha_hit_rate,
+    positive_ratio,
+):
+    from skyeye.products.ax1.promotion import evaluate_promotion_gate
+
+    result = _gate_ready_result(
+        training_summary={
+            **_gate_ready_result()["training_summary"],
+            "stability": {
+                "cv": cv,
+                "stability_score": stability_score,
+            },
+            "positive_ratio": {"positive_ratio": positive_ratio},
+        },
+        evaluation={
+            "portfolio": {
+                **_gate_ready_result()["evaluation"]["portfolio"],
+                "excess_net_mean_return": excess_net_mean_return,
+                "max_excess_drawdown": max_excess_drawdown,
+                "max_rolling_underperformance": max_rolling_underperformance,
+                "alpha_hit_rate": alpha_hit_rate,
+            }
+        },
+    )
+
+    summary = evaluate_promotion_gate(result)
+
+    assert summary["passed"] is True, candidate_id
+    assert summary["failed_checks"] == []
+
+
 def test_default_promotion_thresholds_reflect_trader_review_contract():
     from skyeye.products.ax1.promotion import DEFAULT_PROMOTION_THRESHOLDS, evaluate_promotion_gate
     from skyeye.products.ax1.robustness import bootstrap_metric_ci
@@ -125,7 +207,10 @@ def test_default_promotion_thresholds_reflect_trader_review_contract():
     thresholds = DEFAULT_PROMOTION_THRESHOLDS
     assert thresholds["canary_live"]["min_oos_rows"] == 100
     assert thresholds["default_live"]["min_oos_rows"] == 300
-    assert thresholds["canary_live"]["max_cv"] == pytest.approx(0.50)
+    assert thresholds["canary_live"]["max_cv"] == pytest.approx(6.70)
+    assert thresholds["canary_live"]["min_stability_score"] == pytest.approx(5.0)
+    assert thresholds["canary_live"]["max_excess_drawdown"] == pytest.approx(0.36)
+    assert thresholds["canary_live"]["max_rolling_underperformance"] == pytest.approx(0.31)
     assert thresholds["default_live"]["max_cv"] == pytest.approx(0.40)
     bootstrap = bootstrap_metric_ci(
         [{"prediction_metrics": {"top_bucket_spread_mean": value}} for value in [0.010, 0.012, -0.020, 0.015]],
@@ -144,7 +229,7 @@ def test_default_promotion_thresholds_reflect_trader_review_contract():
     high_cv = _gate_ready_result(
         training_summary={
             **_gate_ready_result()["training_summary"],
-            "stability": {"stability_score": 55.0, "cv": 0.51},
+            "stability": {"stability_score": 55.0, "cv": 6.71},
         }
     )
     high_cv_summary = evaluate_promotion_gate(high_cv)

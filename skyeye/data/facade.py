@@ -328,6 +328,44 @@ class DataFacade:
         """构造快照型缓存键。"""
         return "|".join(str(part) for part in parts)
 
+    @staticmethod
+    def _quarter_key(value) -> str:
+        period = pd.Period(pd.Timestamp(value), freq="Q")
+        return f"{period.year}q{period.quarter}"
+
+    @staticmethod
+    def _shift_quarter_key(value, quarters: int) -> str:
+        period = pd.Period(pd.Timestamp(value), freq="Q") + int(quarters)
+        return f"{period.year}q{period.quarter}"
+
+    @staticmethod
+    def _normalize_date_column(frame: pd.DataFrame) -> pd.DataFrame:
+        """Normalize common provider date column/index variants to `date`."""
+        working = frame.copy()
+        if isinstance(working.index, pd.DatetimeIndex):
+            working = working.reset_index()
+            first_column = working.columns[0]
+            if first_column != "date":
+                working = working.rename(columns={first_column: "date"})
+        elif "date" not in working.columns:
+            working = working.reset_index()
+
+        if "date" not in working.columns:
+            for column in ("trading_date", "datetime", "DateTime", "index"):
+                if column in working.columns:
+                    working = working.rename(columns={column: "date"})
+                    break
+
+        if "date" not in working.columns:
+            for column in working.columns:
+                if pd.api.types.is_datetime64_any_dtype(working[column]):
+                    working = working.rename(columns={column: "date"})
+                    break
+
+        if "date" in working.columns:
+            working["date"] = pd.to_datetime(working["date"]).dt.normalize()
+        return working
+
     def get_daily_bars(
         self,
         order_book_ids: Union[str, Sequence[str]],
@@ -907,16 +945,15 @@ class DataFacade:
         for missing_ranges, missing_ids in grouped_missing_ids.items():
             for range_start, range_end in missing_ranges:
                     try:
-                        # Direct call to rqalpha.apis (provider doesn't have this method)
-                        from rqalpha.apis import get_securities_margin
-
-                        raw_frame = get_securities_margin(
-                            missing_ids[0] if len(missing_ids) == 1 else missing_ids,
-                            start_date=range_start,
-                            end_date=range_end,
-                            fields=field_list[0] if len(field_list) == 1 else field_list,
-                            expect_df=True,
-                        )
+                        if self.provider is None:
+                            raw_frame = None
+                        else:
+                            raw_frame = self.provider.get_securities_margin(
+                                missing_ids[0] if len(missing_ids) == 1 else missing_ids,
+                                start_date=range_start,
+                                end_date=range_end,
+                                fields=field_list[0] if len(field_list) == 1 else field_list,
+                            )
                         normalized = self._normalize_online_factor_frame(raw_frame, missing_ids, field_list)
                         if self.cache_store is not None and normalized is not None and not normalized.empty:
                             self.cache_store.save_factor_values(normalized, source="rqdatac")
@@ -1024,16 +1061,33 @@ class DataFacade:
         for missing_ranges, missing_ids in grouped_missing_ids.items():
             for range_start, range_end in missing_ranges:
                     try:
-                        # Direct call to rqalpha.apis (provider doesn't have this method)
-                        from rqalpha.apis import get_stock_connect
+                        if self.provider is None:
+                            raw_frame = None
+                        else:
+                            raw_frame = self.provider.get_stock_connect(
+                                missing_ids[0] if len(missing_ids) == 1 else missing_ids,
+                                start_date=range_start,
+                                end_date=range_end,
+                                fields=field_list,
+                            )
+                        if raw_frame is None or raw_frame.empty:
+                            raw_frame = self._get_stock_connect_holding_details(
+                                missing_ids,
+                                range_start,
+                                range_end,
+                                field_list,
+                            )
+                        if raw_frame is None or raw_frame.empty:
+                            try:
+                                from skyeye.data.compat import get_stock_connect_holding_akshare
 
-                        raw_frame = get_stock_connect(
-                            missing_ids[0] if len(missing_ids) == 1 else missing_ids,
-                            start_date=range_start,
-                            end_date=range_end,
-                            fields=field_list,
-                            expect_df=True,
-                        )
+                                raw_frame = get_stock_connect_holding_akshare(
+                                    missing_ids,
+                                    range_start,
+                                    range_end,
+                                )
+                            except Exception:
+                                raw_frame = None
                         normalized = self._normalize_online_factor_frame(raw_frame, missing_ids, field_list)
                         if self.cache_store is not None and normalized is not None and not normalized.empty:
                             self.cache_store.save_factor_values(normalized, source="rqdatac")
@@ -1087,12 +1141,55 @@ class DataFacade:
             return None
         return self.cache_store.load_factor_frame(ids, field_list, start_date, end_date)
 
+    def _get_stock_connect_holding_details(
+        self,
+        order_book_ids: list[str],
+        start_date,
+        end_date,
+        field_list: list[str],
+    ) -> Optional[pd.DataFrame]:
+        if self.provider is None or not hasattr(self.provider, "get_stock_connect_holding_details"):
+            return None
+        raw = self.provider.get_stock_connect_holding_details(
+            order_book_ids[0] if len(order_book_ids) == 1 else order_book_ids,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if raw is None or raw.empty:
+            return None
+        working = raw.copy()
+        if isinstance(working.index, pd.MultiIndex):
+            working = working.reset_index()
+        elif "date" not in working.columns:
+            working = working.reset_index()
+        if "date" not in working.columns or "order_book_id" not in working.columns:
+            return None
+        aggregations = {
+            field: "sum"
+            for field in field_list
+            if field in working.columns and field in {"shares_holding", "holding_ratio"}
+        }
+        if not aggregations:
+            return None
+        result = (
+            working.groupby(["order_book_id", "date"], as_index=False)
+            .agg(aggregations)
+            .sort_values(["order_book_id", "date"])
+            .reset_index(drop=True)
+        )
+        result["date"] = pd.to_datetime(result["date"]).dt.normalize()
+        result["order_book_id"] = result["order_book_id"].astype(str)
+        return result
+
     def get_pit_financials(
         self,
         order_book_ids: Union[str, Sequence[str]],
         fields: Union[str, Sequence[str]],
         count: int = 4,
         statements: str = "latest",
+        date=None,
+        start_quarter: Optional[str] = None,
+        end_quarter: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
         """读取 Point-in-time 财务数据，使用 snapshot_cache 表缓存。
 
@@ -1110,11 +1207,21 @@ class DataFacade:
         if not field_list:
             raise ValueError("fields parameter is required for get_pit_financials")
 
-        # 使用 snapshot_cache 表存储 PIT 财务数据
-        # cache_key 格式: {count}__{statements}__{field_list_hash}
         import hashlib
+        as_of_date = pd.Timestamp(date).normalize() if date is not None else pd.Timestamp.today().normalize()
+        end_quarter = str(end_quarter or self._quarter_key(as_of_date))
+        start_quarter = str(start_quarter or self._shift_quarter_key(as_of_date, -(int(count) + 1)))
+        ids_hash = hashlib.md5("|".join(sorted(ids)).encode()).hexdigest()[:8]
         field_hash = hashlib.md5("|".join(sorted(field_list)).encode()).hexdigest()[:8]
-        cache_key = f"pit_fin_{count}_{statements}_{field_hash}"
+        cache_key = self._snapshot_cache_key(
+            "pit_fin",
+            as_of_date.strftime("%Y-%m-%d"),
+            start_quarter,
+            end_quarter,
+            statements,
+            ids_hash,
+            field_hash,
+        )
 
         # 尝试从缓存加载
         if self.cache_store is not None:
@@ -1128,20 +1235,20 @@ class DataFacade:
             if covered:
                 return pd.DataFrame()
 
-        # 在线获取数据
-        try:
-            # Direct call to rqalpha.apis (provider doesn't have this method)
-            from rqalpha.apis import get_pit_financials_ex
+        if self.provider is None:
+            return None
 
-            result = get_pit_financials_ex(
-                order_book_ids=ids,
-                fields=field_list,
-                count=count,
+        try:
+            result = self.provider.get_pit_financials_ex(
+                ids,
+                field_list,
+                start_quarter=start_quarter,
+                end_quarter=end_quarter,
+                date=as_of_date,
                 statements=statements,
             )
 
             if result is not None and not result.empty:
-                # 标准化格式
                 if isinstance(result.index, pd.MultiIndex):
                     result = result.reset_index()
 
@@ -1159,7 +1266,6 @@ class DataFacade:
                             )
                             item_key_field = '_cache_item_key'
                         else:
-                            # Fallback to order_book_id if quarter is not available
                             item_key_field = 'order_book_id'
 
                         self.cache_store.save_snapshot_frame(
@@ -1205,7 +1311,6 @@ class DataFacade:
                     error_message=str(exc),
                 )
             self._raise_if_quota_exceeded(exc)
-            # Re-raise non-quota exceptions so callers know what went wrong
             raise
 
         return None
@@ -1246,16 +1351,18 @@ class DataFacade:
             if raw is None or raw.empty:
                 return None
             result = raw.copy()
-            if isinstance(result.index, pd.DatetimeIndex):
-                result = result.reset_index()
-                result = result.rename(columns={"index": "date"})
-            # Ensure date column
-            for col in ["date", "DateTime"]:
-                if col in result.columns:
-                    result["date"] = pd.to_datetime(result[col])
+            result = self._normalize_date_column(result)
+            yield_col = None
+            for candidate in (f"bond_yield_{tenor}", tenor, str(tenor).upper(), str(tenor).lower()):
+                if candidate in result.columns:
+                    yield_col = candidate
                     break
-            # Use the tenor column as the yield value
-            yield_col = tenor if tenor in result.columns else result.columns[-1]
+            if yield_col is None:
+                numeric_cols = [
+                    column for column in result.select_dtypes(include="number").columns
+                    if column != "date"
+                ]
+                yield_col = numeric_cols[0] if numeric_cols else result.columns[-1]
             result = result[["date", yield_col]].copy()
             result = result.rename(columns={yield_col: f"bond_yield_{tenor}"})
             result["order_book_id"] = "MARKET"

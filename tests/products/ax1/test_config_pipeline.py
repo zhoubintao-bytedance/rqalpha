@@ -11,6 +11,23 @@ from skyeye.products.ax1.config import DEFAULT_PROFILE_PATH, load_profile, norma
 
 
 PERSONAL_PROFILE_PATH = Path("skyeye/products/ax1/profiles/personal_etf_core.yaml")
+AX1_PROFILE_PATHS = [
+    Path("skyeye/products/ax1/profiles/default.yaml"),
+    Path("skyeye/products/ax1/profiles/lgbm_multi_target.yaml"),
+    PERSONAL_PROFILE_PATH,
+]
+TOP_STAT_10_FEATURE_ALLOWLIST = [
+    "feature_interaction_z_style_spread_composite_20d_x_regime_strength",
+    "feature_z_style_spread_composite_20d",
+    "feature_interaction_z_volume_price_flow_20d_x_regime_neutral",
+    "feature_z_volume_price_flow_20d",
+    "feature_interaction_z_excess_mom_20d_x_regime_strength",
+    "feature_interaction_z_vol_transition_10_60d_x_regime_strength",
+    "feature_z_vol_transition_10_60d",
+    "feature_z_excess_mom_20d",
+    "feature_interaction_z_volume_price_flow_20d_x_regime_strength",
+    "feature_interaction_z_style_spread_composite_20d_x_regime_neutral",
+]
 
 
 def test_default_profile_regime_warmup_matches_market_regime_required_history():
@@ -356,6 +373,7 @@ def test_default_profile_preserves_ax1_architecture_decisions():
     assert config["model"]["feature_set"] == "ax1_unified_v1"
     assert config["model"]["kind"] == "lgbm_multi_target"
     assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
+    assert config["model"]["feature_allowlist"] == TOP_STAT_10_FEATURE_ALLOWLIST
     assert config["labels"]["volatility_horizons"] == [10]
     assert config["labels"]["winsorize_quantiles"] == [0.01, 0.99]
     assert config["view_fusion"]["kind"] == "noop_adjusted_return"
@@ -376,6 +394,13 @@ def test_default_profile_preserves_ax1_architecture_decisions():
     assert config["splitter"]["kind"] == "walk_forward"
     assert config["splitter"]["train_end"] == "auto"
     assert config["splitter"]["n_folds"] == 6
+
+
+def test_ax1_lgbm_profiles_default_to_top_stat_10_feature_allowlist():
+    for profile_path in AX1_PROFILE_PATHS:
+        config = load_profile(profile_path)
+        assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
+        assert config["model"]["feature_allowlist"] == TOP_STAT_10_FEATURE_ALLOWLIST
 
 
 def test_opportunity_pool_config_carries_exposure_contract_without_layer_budgets():
@@ -1056,7 +1081,7 @@ def test_run_experiment_writes_lgbm_pipeline_contract(personal_pipeline_result):
     assert result["component_manifest"]["allocation"]["kind"] == "opportunity_pool_optimizer"
     assert result["data_audit"]["passed"] is True
     assert result["data_audit"]["hard_block_count"] == 0
-    assert "feature_momentum_5d" in result["data_audit"]["features"]
+    assert set(result["data_audit"]["features"]) == set(TOP_STAT_10_FEATURE_ALLOWLIST)
     assert result["raw_data_quality"]["passed"] is True
     assert result["feature_data_quality"]["passed"] is True
     assert result["raw_data_quality"]["price_adjustment"]["method"] == "adjusted_price_column"
@@ -1130,7 +1155,7 @@ def test_run_experiment_writes_lgbm_pipeline_contract(personal_pipeline_result):
     assert first_fold["predictor_bundle"]["product"] == "ax1"
     assert first_fold["predictor_bundle"]["predictor_kind"] == "lgbm_multi_target"
     assert first_fold["preprocessor_bundle"]["kind"] == "feature_preprocessor"
-    assert first_fold["preprocessor_bundle"]["preprocess_policies"]["feature_regime_strength"] == "passthrough"
+    assert set(first_fold["preprocessor_bundle"]["preprocess_policies"]) == set(TOP_STAT_10_FEATURE_ALLOWLIST)
     persisted = load_experiment(experiment_dir)
     persisted_fold = persisted["training_summary"]["fold_results"][0]
     assert persisted["artifact_schema_version"] == 1
@@ -1150,9 +1175,7 @@ def test_run_experiment_default_lgbm_path_produces_non_constant_predictions(pers
     assert result["implementation_status"]["features"] == "unified_feature_view"
     assert result["implementation_status"]["model"] == "lgbm_multi_target"
     assert result["training_summary"]["model_kind"] == "lgbm_multi_target"
-    assert "feature_z_style_spread_composite_20d" in result["training_summary"]["feature_columns"]
-    assert "feature_regime_strength" in result["training_summary"]["feature_columns"]
-    assert "feature_interaction_z_excess_mom_20d_x_regime_risk_on" in result["training_summary"]["feature_columns"]
+    assert result["training_summary"]["feature_columns"] == TOP_STAT_10_FEATURE_ALLOWLIST
 
 
 def test_rule_model_override_is_rejected_from_main_pipeline_contract():
@@ -1369,6 +1392,7 @@ def test_run_experiment_lgbm_raises_when_splitter_has_no_valid_fold(tmp_path):
                     "kind": "lgbm_multi_target",
                     "feature_set": "ax1_unified_v1",
                     "include_scopes": ["common", "etf_zscore"],
+                    "feature_allowlist": [],
                     "training_horizons": [5, 10, 20],
                     "risk_horizon": 10,
                     "params": {"n_estimators": 5, "num_threads": 1},

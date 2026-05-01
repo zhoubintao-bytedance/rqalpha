@@ -108,6 +108,17 @@ model:
   kind: lgbm_multi_target
   feature_set: ax1_unified_v1
   include_scopes: [common, etf_zscore, regime, regime_interaction]
+  feature_allowlist:
+    - feature_interaction_z_style_spread_composite_20d_x_regime_strength
+    - feature_z_style_spread_composite_20d
+    - feature_interaction_z_volume_price_flow_20d_x_regime_neutral
+    - feature_z_volume_price_flow_20d
+    - feature_interaction_z_excess_mom_20d_x_regime_strength
+    - feature_interaction_z_vol_transition_10_60d_x_regime_strength
+    - feature_z_vol_transition_10_60d
+    - feature_z_excess_mom_20d
+    - feature_interaction_z_volume_price_flow_20d_x_regime_strength
+    - feature_interaction_z_style_spread_composite_20d_x_regime_neutral
   training_horizons: [5, 10, 20]
   risk_horizon: 10
   stability_horizon: 20

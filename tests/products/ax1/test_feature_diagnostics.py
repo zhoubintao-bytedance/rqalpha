@@ -11,6 +11,17 @@ from skyeye.products.ax1.feature_diagnostics import (
 from skyeye.products.ax1.models.lgbm_multi_target import LGBMMultiTargetPredictor
 
 
+def test_training_feature_diagnostics_label_follows_allocation_score_horizon():
+    from skyeye.products.ax1.research.training import _feature_diagnostics_label_column
+
+    config = {
+        "labels": {"stability_horizon": 20},
+        "allocation": {"score_column": "expected_relative_net_return_10d"},
+    }
+
+    assert _feature_diagnostics_label_column(config) == "label_relative_net_return_10d"
+
+
 def _diagnostic_panel() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     dates = pd.date_range("2024-01-01", periods=8, freq="D")
     assets = ["A", "B", "C", "D", "E"]
@@ -99,6 +110,42 @@ def test_feature_diagnostics_classifies_factor_quality_and_conflicts():
         {"positive_factor", "negative_factor"}.issubset(set(group["features"]))
         for group in inverse_groups
     )
+
+
+def test_feature_diagnostics_reports_external_feature_coverage_and_source_metadata():
+    dates = pd.date_range("2024-01-01", periods=3, freq="D")
+    features = pd.DataFrame(
+        {
+            "date": dates.tolist() * 2,
+            "order_book_id": ["A"] * 3 + ["B"] * 3,
+            "feature_pe_ttm": [np.nan] * 6,
+            "feature_bond_yield_10y": [0.02, 0.021, 0.022, 0.02, 0.021, 0.022],
+        }
+    )
+    labels = pd.DataFrame(
+        {
+            "date": dates.tolist() * 2,
+            "order_book_id": ["A"] * 3 + ["B"] * 3,
+            "label_net_return_5d": [0.01, 0.02, 0.03, 0.00, 0.01, 0.02],
+        }
+    )
+
+    report = analyze_feature_diagnostics(
+        features=features,
+        labels=labels,
+        feature_columns=["feature_pe_ttm", "feature_bond_yield_10y"],
+        label_column="label_net_return_5d",
+    )
+
+    pe = report["feature_diagnostics"]["feature_pe_ttm"]
+    bond = report["feature_diagnostics"]["feature_bond_yield_10y"]
+    assert pe["non_null_count"] == 0
+    assert pe["row_count"] == 6
+    assert pe["coverage"] == pytest.approx(0.0)
+    assert pe["source_family"] == "fundamental"
+    assert pe["data_source_status"] == "implemented"
+    assert bond["non_null_count"] == 6
+    assert bond["source_family"] == "macro"
 
 
 def test_fold_feature_diagnostics_accepts_runner_style_fold_results():

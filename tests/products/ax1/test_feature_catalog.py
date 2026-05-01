@@ -37,6 +37,20 @@ def test_default_feature_catalog_describes_current_etf_and_regime_features():
     assert "feature_regime_strength" in active
 
 
+def test_feature_catalog_records_retired_research_feature_rationales():
+    from skyeye.products.ax1.features.catalog import RETIRED_RESEARCH_FEATURES
+
+    assert len(RETIRED_RESEARCH_FEATURES) == 20
+    assert "feature_dollar_volume" in RETIRED_RESEARCH_FEATURES
+    assert "liquidity and execution plumbing" in RETIRED_RESEARCH_FEATURES["feature_dollar_volume"]
+    assert "feature_regime_risk_off" in RETIRED_RESEARCH_FEATURES
+    assert "cross-sectional alpha ranking" in RETIRED_RESEARCH_FEATURES["feature_regime_risk_off"]
+    assert "feature_interaction_z_volume_price_flow_20d_x_regime_rotation" in RETIRED_RESEARCH_FEATURES
+    assert "dedicated regime studies" in RETIRED_RESEARCH_FEATURES[
+        "feature_interaction_z_volume_price_flow_20d_x_regime_rotation"
+    ]
+
+
 def test_feature_catalog_rejects_unknown_or_unimplemented_active_features():
     from skyeye.products.ax1.features.catalog import build_default_feature_catalog
 
@@ -56,6 +70,12 @@ def test_feature_catalog_marks_macro_and_institutional_proxy_features_as_impleme
     assert macro_pmi.status == "implemented"
     assert macro_pmi.to_dict()["data_source_status"] == "implemented"
     assert macro_pmi.observable_lag_days == 1
+
+    northbound_aggregate = catalog.get("feature_northbound_aggregate_flow")
+    assert northbound_aggregate.scope == "macro"
+    assert northbound_aggregate.source_family == "macro"
+    assert northbound_aggregate.status == "implemented"
+    assert northbound_aggregate.observable_lag_days == 1
 
     institutional = catalog.get("feature_institutional_holding_ratio")
     assert institutional.scope == "flow"

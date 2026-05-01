@@ -11,6 +11,90 @@ from skyeye.market_regime_layer import MarketRegimeConfig, required_market_regim
 REGIME_FEATURE_LOOKBACK_DAYS = required_market_regime_history_days(MarketRegimeConfig())
 
 
+RETIRED_RESEARCH_FEATURES: dict[str, str] = {
+    "feature_regime_neutral": (
+        "Market-level regime dummies are broadcast to every ETF on the same date; use them for regime gating "
+        "or allocation overlays instead of cross-sectional alpha ranking."
+    ),
+    "feature_regime_risk_off": (
+        "Market-level regime dummies are broadcast to every ETF on the same date; use them for regime gating "
+        "or allocation overlays instead of cross-sectional alpha ranking."
+    ),
+    "feature_regime_risk_on": (
+        "Market-level regime dummies are broadcast to every ETF on the same date; use them for regime gating "
+        "or allocation overlays instead of cross-sectional alpha ranking."
+    ),
+    "feature_regime_rotation": (
+        "Market-level rotation state is shared by the ETF universe on each date; it is a portfolio context "
+        "signal, not a cross-sectional selector."
+    ),
+    "feature_regime_strength": (
+        "Market-level regime strength is useful as a smooth context multiplier, but by itself it is shared "
+        "across ETFs and should not enter the alpha ranking surface."
+    ),
+    "feature_amihud_illiquidity": (
+        "Broad and sector ETFs are generally liquid enough that raw Amihud-style illiquidity mostly behaves "
+        "like a capacity diagnostic rather than an alpha signal."
+    ),
+    "feature_volatility_5d": (
+        "Short ETF volatility is mostly a market and exposure proxy; use it in risk controls rather than "
+        "as a standalone ranking feature."
+    ),
+    "feature_risk_forecast": (
+        "Risk forecast is a constraint and sizing input. Feeding it directly into alpha ranking mixes risk "
+        "control with expected-return estimation."
+    ),
+    "feature_cost_forecast": (
+        "Cost forecast belongs in execution and trade gating. As an alpha feature it mostly teaches the model "
+        "implementation details of trading friction."
+    ),
+    "feature_liquidity_score": (
+        "ETF liquidity is a capacity and tradability screen; direct ranking on liquidity tends to prefer "
+        "crowded beta exposure rather than genuine allocation edge."
+    ),
+    "feature_momentum_5d": (
+        "Raw 5d momentum is too short and noisy for this ETF allocation horizon; prefer relative or z-scored "
+        "ETF momentum constructs with explicit horizon alignment."
+    ),
+    "feature_dollar_volume": (
+        "Dollar volume remains required for liquidity and execution plumbing, but as an alpha feature it mainly "
+        "acts as an ETF size/crowding proxy."
+    ),
+    "feature_interaction_z_style_spread_composite_20d_x_regime_risk_off": (
+        "Sparse risk-state dummy interactions are brittle for long-running factor search; prefer smoother "
+        "regime strength or neutral-state interactions when testing context dependence."
+    ),
+    "feature_interaction_z_volume_price_flow_20d_x_regime_risk_off": (
+        "Sparse risk-state dummy interactions are brittle for long-running factor search; prefer smoother "
+        "regime strength or neutral-state interactions when testing context dependence."
+    ),
+    "feature_interaction_z_volume_price_flow_20d_x_regime_risk_on": (
+        "Directional risk-state dummy interactions can confuse a market phase tag with a reusable ETF alpha; "
+        "treat them as retired unless a future regime-specific design reintroduces them explicitly."
+    ),
+    "feature_interaction_z_volume_price_flow_20d_x_regime_rotation": (
+        "Rotation dummy interactions are too event-like for the default factor surface; use dedicated regime "
+        "studies before reintroducing this shape."
+    ),
+    "feature_interaction_z_style_spread_composite_20d_x_regime_risk_on": (
+        "Directional risk-state dummy interactions can confuse a market phase tag with a reusable ETF alpha; "
+        "treat them as retired unless a future regime-specific design reintroduces them explicitly."
+    ),
+    "feature_interaction_z_style_spread_composite_20d_x_regime_rotation": (
+        "Rotation dummy interactions are too event-like for the default factor surface; use dedicated regime "
+        "studies before reintroducing this shape."
+    ),
+    "feature_interaction_z_excess_mom_20d_x_regime_risk_off": (
+        "Sparse risk-state dummy interactions are brittle for long-running factor search; prefer smoother "
+        "regime strength or neutral-state interactions when testing context dependence."
+    ),
+    "feature_interaction_z_excess_mom_20d_x_regime_rotation": (
+        "Rotation dummy interactions are too event-like for the default factor surface; use dedicated regime "
+        "studies before reintroducing this shape."
+    ),
+}
+
+
 @dataclass(frozen=True)
 class FeatureDefinition:
     name: str
@@ -400,9 +484,9 @@ def build_default_feature_catalog(config: dict | None = None) -> FeatureCatalog:
     )
     add(
         name="feature_northbound_aggregate_flow",
-        scope="flow",
+        scope="macro",
         asset_type="both",
-        source_family="flow",
+        source_family="macro",
         observable_lag_days=1,
         status="implemented",
         data_source_status="implemented",

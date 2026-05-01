@@ -227,6 +227,25 @@ class RQDataProvider:
             start_date=start_date, end_date=end_date, tenor=tenor
         )
 
+    def get_pit_financials_ex(
+        self,
+        order_book_ids: Union[str, list[str]],
+        fields: Union[str, list[str]],
+        start_quarter: str,
+        end_quarter: str,
+        date: Optional[DateLike] = None,
+        statements: str = "latest",
+    ) -> Optional[pd.DataFrame]:
+        """Point-in-time financial statements via rqdatac."""
+        return rqdatac.get_pit_financials_ex(
+            order_book_ids,
+            fields,
+            start_quarter=start_quarter,
+            end_quarter=end_quarter,
+            date=date,
+            statements=statements,
+        )
+
     # ------------------------------------------------------------------
     # Dividend / Split
     # ------------------------------------------------------------------
@@ -336,6 +355,48 @@ class RQDataProvider:
             end_date=end_date,
             fields=fields,
             expect_df=True,
+        )
+
+    def get_securities_margin(
+        self,
+        order_book_ids: Union[str, list[str]],
+        start_date: DateLike,
+        end_date: DateLike,
+        fields: Optional[Union[str, list[str]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        return rqdatac.get_securities_margin(
+            order_book_ids,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+            expect_df=True,
+        )
+
+    def get_stock_connect(
+        self,
+        order_book_ids: Union[str, list[str]],
+        start_date: DateLike,
+        end_date: DateLike,
+        fields: Optional[Union[str, list[str]]] = None,
+    ) -> Optional[pd.DataFrame]:
+        return rqdatac.get_stock_connect(
+            order_book_ids,
+            start_date=start_date,
+            end_date=end_date,
+            fields=fields,
+            expect_df=True,
+        )
+
+    def get_stock_connect_holding_details(
+        self,
+        order_book_ids: Union[str, list[str]],
+        start_date: DateLike,
+        end_date: DateLike,
+    ) -> Optional[pd.DataFrame]:
+        return rqdatac.get_stock_connect_holding_details(
+            order_book_ids,
+            start_date=start_date,
+            end_date=end_date,
         )
 
     # ------------------------------------------------------------------

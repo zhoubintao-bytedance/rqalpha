@@ -69,6 +69,65 @@ def get_northbound_flow_akshare(
     return result.loc[mask].reset_index(drop=True)
 
 
+def get_stock_connect_holding_akshare(
+    order_book_ids: list[str],
+    start_date: DateLike,
+    end_date: DateLike,
+) -> Optional[pd.DataFrame]:
+    """Fetch per-stock northbound holding details via AKShare/EastMoney.
+
+    Returns long-format columns: date, order_book_id, shares_holding, holding_ratio.
+    This is a best-effort fallback for research coverage; rqdatac remains primary.
+    """
+    try:
+        import akshare as ak
+    except ImportError:
+        logger.warning("akshare not installed, stock connect holding unavailable")
+        return None
+
+    try:
+        raw = ak.stock_hsgt_stock_statistics_em(
+            symbol="北向持股",
+            start_date=pd.Timestamp(str(start_date)).strftime("%Y%m%d"),
+            end_date=pd.Timestamp(str(end_date)).strftime("%Y%m%d"),
+        )
+    except Exception as exc:
+        logger.warning("AKShare stock connect holding fetch failed: %s", exc)
+        return None
+
+    if raw is None or raw.empty:
+        return None
+
+    frame = raw.copy()
+    date_col = "持股日期" if "持股日期" in frame.columns else frame.columns[0]
+    code_col = "股票代码" if "股票代码" in frame.columns else None
+    shares_col = "持股数量" if "持股数量" in frame.columns else None
+    ratio_col = "持股数量占发行股百分比" if "持股数量占发行股百分比" in frame.columns else None
+    if code_col is None or (shares_col is None and ratio_col is None):
+        return None
+
+    result = pd.DataFrame()
+    result["date"] = pd.to_datetime(frame[date_col], errors="coerce").dt.normalize()
+    result["order_book_id"] = frame[code_col].astype(str).str.zfill(6).map(_china_stock_order_book_id)
+    if shares_col is not None:
+        result["shares_holding"] = pd.to_numeric(frame[shares_col], errors="coerce")
+    if ratio_col is not None:
+        result["holding_ratio"] = pd.to_numeric(frame[ratio_col], errors="coerce")
+
+    requested = {str(item) for item in order_book_ids}
+    result = result[result["order_book_id"].isin(requested)]
+    if result.empty:
+        return None
+    return result.sort_values(["order_book_id", "date"]).reset_index(drop=True)
+
+
+def _china_stock_order_book_id(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith("6"):
+        return f"{code}.XSHG"
+    return f"{code}.XSHE"
+
+
 def get_macro_pmi_akshare(
     start_date: DateLike, end_date: DateLike
 ) -> Optional[pd.DataFrame]:

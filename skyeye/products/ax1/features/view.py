@@ -11,6 +11,7 @@ import pandas as pd
 
 from skyeye.products.ax1._common import require_columns
 from skyeye.products.ax1.data_sources.technical import TECHNICAL_FEATURE_COLUMNS, build_technical_indicator_features
+from skyeye.products.ax1.features.catalog import RETIRED_RESEARCH_FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,8 @@ class AX1FeatureViewBuilder:
                 "regime_state_by_date_count": int(len(regime_state_by_date or {})),
                 "style_pairs": _style_pairs(self.config),
                 "preprocess_policies": _preprocess_policies_by_feature(columns_by_scope),
+                "retired_research_features": dict(RETIRED_RESEARCH_FEATURES),
+                "include_retired_research_features": _include_retired_research_features(self.config),
             },
         )
 
@@ -221,9 +224,44 @@ def resolve_feature_columns(config: dict, feature_view: FeatureView) -> list[str
             raise ValueError(f"unknown feature scope: {scope}") from exc
         columns.extend(scope_columns)
     resolved = [column for column in dict.fromkeys(columns) if column in feature_view.frame.columns]
+    include_retired = _include_retired_research_features(
+        {
+            **features,
+            **model,
+            "include_retired_research_features": (
+                model.get("include_retired_research_features")
+                if "include_retired_research_features" in model
+                else features.get(
+                    "include_retired_research_features",
+                    feature_view.metadata.get("include_retired_research_features", False),
+                )
+            ),
+        }
+    )
+    if not include_retired:
+        resolved = _filter_retired_research_features(resolved)
+    allowlist = [str(column) for column in model.get("feature_allowlist", []) or []]
+    blocklist = {str(column) for column in model.get("feature_blocklist", []) or []}
+    if allowlist:
+        missing = [column for column in allowlist if column not in resolved]
+        if missing:
+            raise ValueError(f"feature_allowlist contains features outside resolved scopes: {missing}")
+        resolved = [column for column in allowlist if column not in blocklist]
+    elif blocklist:
+        resolved = [column for column in resolved if column not in blocklist]
     if not resolved:
         raise ValueError("feature_set resolved no feature columns")
     return resolved
+
+
+def _include_retired_research_features(config: dict[str, Any] | None) -> bool:
+    config = dict(config or {})
+    return bool(config.get("include_retired_research_features", False))
+
+
+def _filter_retired_research_features(columns: list[str]) -> list[str]:
+    retired = set(RETIRED_RESEARCH_FEATURES)
+    return [column for column in columns if column not in retired]
 
 
 def _build_common_features(frame: pd.DataFrame, config: dict[str, Any] | None = None) -> list[str]:

@@ -38,6 +38,71 @@ def test_signal_layer_computes_rank_ic_spread_and_hit_rate():
     assert metrics["signal"]["top_k_hit_rate"] == pytest.approx(1.0)
 
 
+def test_signal_and_portfolio_layers_report_selected_columns_and_horizons():
+    predictions = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "order_book_id": ["A", "B"],
+            "expected_relative_net_return_10d": [0.02, 0.01],
+        }
+    )
+    labels = pd.DataFrame(
+        {
+            "date": predictions["date"],
+            "order_book_id": predictions["order_book_id"],
+            "label_relative_net_return_10d": [0.03, 0.01],
+            "label_net_return_10d": [0.025, 0.005],
+        }
+    )
+
+    signal = evaluate_signal_layer(predictions, labels)["signal"]
+
+    assert signal["score_column"] == "expected_relative_net_return_10d"
+    assert signal["label_column"] == "label_relative_net_return_10d"
+    assert signal["score_horizon"] == 10
+    assert signal["label_horizon"] == 10
+    assert signal["label_kind"] == "relative_net_return"
+
+    portfolio = evaluate_portfolio_layer(
+        pd.DataFrame(
+            {
+                "date": predictions["date"],
+                "order_book_id": predictions["order_book_id"],
+                "target_weight": [0.6, 0.4],
+            }
+        ),
+        labels,
+    )["portfolio"]
+
+    assert portfolio["label_column"] == "label_net_return_10d"
+    assert portfolio["label_horizon"] == 10
+    assert portfolio["label_kind"] == "net_return"
+
+
+def test_signal_layer_matches_label_horizon_to_selected_score_column():
+    predictions = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01", "2024-01-01"]),
+            "order_book_id": ["A", "B"],
+            "expected_relative_net_return_20d": [0.02, 0.01],
+        }
+    )
+    labels = pd.DataFrame(
+        {
+            "date": predictions["date"],
+            "order_book_id": predictions["order_book_id"],
+            "label_relative_net_return_10d": [-0.05, 0.05],
+            "label_relative_net_return_20d": [0.03, 0.01],
+        }
+    )
+
+    signal = evaluate_signal_layer(predictions, labels)["signal"]
+
+    assert signal["score_column"] == "expected_relative_net_return_20d"
+    assert signal["label_column"] == "label_relative_net_return_20d"
+    assert signal["score_horizon"] == signal["label_horizon"] == 20
+
+
 def test_signal_layer_reports_newey_west_rank_ic_significance_and_fdr():
     rows = []
     dates = pd.date_range("2024-01-01", periods=40, freq="B")

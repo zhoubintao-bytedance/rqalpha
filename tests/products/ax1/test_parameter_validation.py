@@ -1,6 +1,36 @@
 from skyeye.products.ax1.config import normalize_config
 
 
+def test_parameter_validation_aligns_label_horizon_with_score_column():
+    import pandas as pd
+
+    from skyeye.products.ax1.parameter_validation import build_parameter_validation_summary
+
+    predictions = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-02", "2024-01-03", "2024-01-03"]),
+            "order_book_id": ["A", "B", "A", "B"],
+            "expected_relative_net_return_10d": [0.20, 0.10, 0.05, 0.15],
+        }
+    )
+    labels = pd.DataFrame(
+        {
+            "date": predictions["date"],
+            "order_book_id": predictions["order_book_id"],
+            "label_net_return_10d": [0.02, 0.01, 0.00, 0.03],
+            "label_net_return_20d": [-0.10, 0.10, 0.10, -0.10],
+        }
+    )
+
+    summary = build_parameter_validation_summary(normalize_config({}), predictions, labels)
+
+    assert summary["score_column"] == "expected_relative_net_return_10d"
+    assert summary["label_column"] == "label_net_return_10d"
+    assert summary["score_horizon"] == 10
+    assert summary["label_horizon"] == 10
+    assert summary["label_kind"] == "net_return"
+
+
 def test_lgbm_param_policy_reports_candidates_and_deviation():
     from skyeye.products.ax1.parameter_validation import build_lgbm_param_policy_summary
 
