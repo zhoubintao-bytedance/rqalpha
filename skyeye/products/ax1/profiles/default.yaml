@@ -107,7 +107,7 @@ model:
   registry: default
   kind: lgbm_multi_target
   feature_set: ax1_unified_v1
-  include_scopes: [common, etf_zscore, regime]
+  include_scopes: [common, etf_zscore, regime, regime_interaction]
   training_horizons: [5, 10, 20]
   risk_horizon: 10
   stability_horizon: 20

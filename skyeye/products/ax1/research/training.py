@@ -14,6 +14,7 @@ def run_lgbm_pipeline(
     labeled: pd.DataFrame,
     *,
     feature_columns: list[str],
+    preprocess_policies: dict[str, str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     from skyeye.products.ax1.confidence import aggregate_confidence_calibration
     from skyeye.products.ax1.feature_diagnostics import analyze_fold_feature_diagnostics
@@ -39,6 +40,7 @@ def run_lgbm_pipeline(
             config,
             fold,
             feature_columns=feature_columns,
+            preprocess_policies=preprocess_policies or {},
             target_columns=targets,
         )
         fold_results.append(fold_summary)
@@ -58,6 +60,7 @@ def run_lgbm_pipeline(
         "seed": int((config.get("experiment") or {}).get("seed", 0) or 0),
         "model_params": dict((config.get("model") or {}).get("params") or {}),
         "feature_columns": list(feature_columns),
+        "preprocess_policy_counts": _preprocess_policy_counts(feature_columns, preprocess_policies or {}),
         "target_columns": targets,
         "fold_results": persisted_fold_results,
         "aggregate_predictions_df": aggregate_predictions,
@@ -93,6 +96,7 @@ def run_lgbm_fold(
     fold: dict[str, Any],
     *,
     feature_columns: list[str],
+    preprocess_policies: dict[str, str] | None = None,
     target_columns: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     from skyeye.products.ax1.confidence import apply_confidence_calibration, fit_confidence_calibrator
@@ -105,15 +109,16 @@ def run_lgbm_fold(
     test_labeled = fold["test_df"].reset_index(drop=True)
 
     preprocessor = build_preprocessor(config)
-    train_features = preprocessor.transform(train_labeled, feature_columns)
-    val_features = preprocessor.transform(val_labeled, feature_columns)
-    test_features = preprocessor.transform(test_labeled, feature_columns)
+    policy_map = dict(preprocess_policies or {})
+    train_features = preprocessor.transform(train_labeled, feature_columns, preprocess_policies=policy_map)
+    val_features = preprocessor.transform(val_labeled, feature_columns, preprocess_policies=policy_map)
+    test_features = preprocessor.transform(test_labeled, feature_columns, preprocess_policies=policy_map)
 
     # Feature diagnostics should run on the pre-standardization panel.
     # Otherwise, cross-sectional z-score makes per-date std ~ 1 and the
     # low-variance check becomes ineffective.
     diagnostic_preprocessor = build_feature_diagnostics_preprocessor(config)
-    diagnostic_features = diagnostic_preprocessor.transform(test_labeled, feature_columns)
+    diagnostic_features = diagnostic_preprocessor.transform(test_labeled, feature_columns, preprocess_policies=policy_map)
     predictor = build_predictor(config, horizons=prediction_horizons(config), feature_columns=feature_columns)
     predictor.fit(
         train_features,
@@ -121,7 +126,7 @@ def run_lgbm_fold(
         val_features=val_features,
         val_labels=val_labeled,
     )
-    preprocessor_bundle = preprocessor.to_bundle(feature_columns)
+    preprocessor_bundle = preprocessor.to_bundle(feature_columns, preprocess_policies=policy_map)
     predictor_bundle = dump_predictor_bundle(predictor, preprocessor_bundle, feature_columns)
     validation_predictions = predictor.predict(val_features)
     validation_predictions = validation_predictions.copy()
@@ -331,6 +336,14 @@ def _aggregate_lgbm_feature_importance(
             for kind in ("gain", "split")
         },
     }
+
+
+def _preprocess_policy_counts(feature_columns: list[str], preprocess_policies: dict[str, str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for feature_name in feature_columns:
+        policy = str(preprocess_policies.get(feature_name, "cross_sectional"))
+        counts[policy] = counts.get(policy, 0) + 1
+    return counts
 
 
 def _format_aggregate_importance(values_by_feature: dict[str, list[float]]) -> list[dict[str, Any]]:

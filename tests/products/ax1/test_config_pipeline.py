@@ -222,7 +222,7 @@ def _install_fast_lgbm_pipeline(monkeypatch):
     monkeypatch.setattr(ax1_runner, "_run_lgbm_pipeline", _fast_run_lgbm_pipeline)
 
 
-def _fast_run_lgbm_pipeline(config, labeled, *, feature_columns):
+def _fast_run_lgbm_pipeline(config, labeled, *, feature_columns, preprocess_policies=None):
     from skyeye.products.ax1.run_experiment import _build_splitter
 
     target_columns = [column for column in labeled.columns if column.startswith("label_")]
@@ -344,7 +344,7 @@ def test_default_profile_preserves_ax1_architecture_decisions():
     assert config["execution"]["net_alpha_column"] == "adjusted_expected_return"
     assert config["execution"]["t_plus_one_lock"] is True
     assert config["execution"]["today_buy_weight_column"] == "today_buy_weight"
-    assert config["execution"]["participation_rate"] == pytest.approx(0.05)
+    assert config["execution"]["participation_rate"] is None
     assert config["execution"]["liquidity_column"] == "dollar_volume"
     assert config["execution"]["lot_size"] == 100
     assert config["execution"]["max_order_count"] == 12
@@ -355,7 +355,7 @@ def test_default_profile_preserves_ax1_architecture_decisions():
     assert config["features"]["normalization"]["cross_sectional"] is False
     assert config["model"]["feature_set"] == "ax1_unified_v1"
     assert config["model"]["kind"] == "lgbm_multi_target"
-    assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime"]
+    assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
     assert config["labels"]["volatility_horizons"] == [10]
     assert config["labels"]["winsorize_quantiles"] == [0.01, 0.99]
     assert config["view_fusion"]["kind"] == "noop_adjusted_return"
@@ -514,7 +514,7 @@ def test_personal_etf_core_profile_declares_etf_first_universe_and_costs():
     assert config["allocation"]["exposure_groups"]["sector"]["max_weight"] == pytest.approx(0.55)
     assert config["costs"]["stock"]["stamp_tax_rate"] > config["costs"]["etf"]["stamp_tax_rate"]
     assert config["model"]["kind"] == "lgbm_multi_target"
-    assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime"]
+    assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
 
 
 def test_ax1_profiles_expand_corrected_etf_pool_without_legacy_code_mismatches():
@@ -1077,7 +1077,7 @@ def test_run_experiment_writes_lgbm_pipeline_contract(personal_pipeline_result):
     assert result["implementation_status"]["features"] == "unified_feature_view"
     assert result["implementation_status"]["optimizer"] == "opportunity_pool_optimizer_lot_aware_execution"
     assert result["implementation_status"]["execution_t_plus_one"] == "implemented_enabled"
-    assert result["implementation_status"]["execution_capacity"] == "implemented_enabled"
+    assert result["implementation_status"]["execution_capacity"] == "implemented_available"
     assert result["implementation_status"]["risk_model"] == "statistical_factor_pca_covariance_penalty"
     assert result["implementation_status"]["factor_risk_model"] == "implemented_statistical_factor_pca"
     assert result["component_manifest"]["costs"]["enabled"] is True
@@ -1130,6 +1130,7 @@ def test_run_experiment_writes_lgbm_pipeline_contract(personal_pipeline_result):
     assert first_fold["predictor_bundle"]["product"] == "ax1"
     assert first_fold["predictor_bundle"]["predictor_kind"] == "lgbm_multi_target"
     assert first_fold["preprocessor_bundle"]["kind"] == "feature_preprocessor"
+    assert first_fold["preprocessor_bundle"]["preprocess_policies"]["feature_regime_strength"] == "passthrough"
     persisted = load_experiment(experiment_dir)
     persisted_fold = persisted["training_summary"]["fold_results"][0]
     assert persisted["artifact_schema_version"] == 1
@@ -1151,7 +1152,7 @@ def test_run_experiment_default_lgbm_path_produces_non_constant_predictions(pers
     assert result["training_summary"]["model_kind"] == "lgbm_multi_target"
     assert "feature_z_style_spread_composite_20d" in result["training_summary"]["feature_columns"]
     assert "feature_regime_strength" in result["training_summary"]["feature_columns"]
-    assert "feature_interaction_z_excess_mom_20d_x_regime_risk_on" not in result["training_summary"]["feature_columns"]
+    assert "feature_interaction_z_excess_mom_20d_x_regime_risk_on" in result["training_summary"]["feature_columns"]
 
 
 def test_rule_model_override_is_rejected_from_main_pipeline_contract():

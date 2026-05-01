@@ -67,6 +67,27 @@ def test_transform_produces_zero_mean_unit_variance_per_date():
             assert values.std(ddof=1) > 0
 
 
+def test_transform_passthrough_policy_preserves_date_level_regime_features():
+    df = make_factor_panel(with_sector=False).copy()
+    first_date = df["date"].min()
+    df["feature_regime_risk_on"] = np.where(df["date"].eq(first_date), 1.0, 0.0)
+    pre = FeaturePreprocessor(neutralize=True, winsorize_scale=None, standardize=True)
+
+    out = pre.transform(
+        df,
+        feature_columns=["factor_a", "feature_regime_risk_on"],
+        preprocess_policies={"feature_regime_risk_on": "passthrough"},
+    )
+
+    pd.testing.assert_series_equal(
+        out["feature_regime_risk_on"],
+        df["feature_regime_risk_on"],
+        check_names=False,
+    )
+    for _, day in out.groupby("date"):
+        assert day["factor_a"].mean() == pytest.approx(0.0, abs=1e-9)
+
+
 def test_transform_without_sector_column_uses_ln_close_only():
     df = make_factor_panel(with_sector=False)
     pre = FeaturePreprocessor(neutralize=True, sector_optional=True)

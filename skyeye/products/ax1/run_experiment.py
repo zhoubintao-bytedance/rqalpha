@@ -18,6 +18,7 @@ from skyeye.products.ax1.config import (
     merge_config,
     normalize_config,
 )
+from skyeye.products.ax1.etf_metadata import normalize_industry_value, resolve_ax1_etf_industry_map
 from skyeye.products.ax1.research.training import (
     build_splitter as _build_splitter,
     prediction_horizons as _prediction_horizons,
@@ -120,6 +121,7 @@ def run_experiment(
         config,
         labeled,
         feature_columns=feature_columns,
+        preprocess_policies=feature_view.preprocess_policies,
     )
 
     fused = _build_view_fusion(config).fuse(predictions)
@@ -644,12 +646,11 @@ def _build_view_fusion(config: dict[str, Any]):
 
 def _build_industry_map(scoped: pd.DataFrame, *, as_of_date: pd.Timestamp, data_provider=None) -> dict[str, str]:
     order_book_ids = sorted(scoped["order_book_id"].dropna().astype(str).unique()) if "order_book_id" in scoped.columns else []
-    industry_map = _industry_map_from_frame(scoped)
+    frame_map = _industry_map_from_frame(scoped)
+    provider_map: dict[str, str] = {}
     if data_provider is not None:
         provider_map = _industry_map_from_provider(data_provider, order_book_ids, as_of_date)
-        provider_map.update(industry_map)
-        industry_map = provider_map
-    return {order_book_id: str(industry_map.get(order_book_id, "Unknown") or "Unknown") for order_book_id in order_book_ids}
+    return resolve_ax1_etf_industry_map(order_book_ids, frame_map, provider_map)
 
 
 def _industry_map_from_frame(frame: pd.DataFrame) -> dict[str, str]:
@@ -669,7 +670,7 @@ def _industry_map_from_frame(frame: pd.DataFrame) -> dict[str, str]:
         working = working.sort_values(["order_book_id", "date"])
     latest = working.drop_duplicates("order_book_id", keep="last")
     return {
-        str(row["order_book_id"]): str(row[industry_column]) if pd.notna(row[industry_column]) else "Unknown"
+        str(row["order_book_id"]): normalize_industry_value(row[industry_column]) or "Unknown"
         for _, row in latest.iterrows()
     }
 
@@ -710,11 +711,11 @@ def _attach_universe_metadata(frame: pd.DataFrame, universe_metadata: pd.DataFra
         return frame
     if "order_book_id" not in frame.columns:
         return frame
-    columns = [column for column in ("order_book_id", "asset_type", "universe_layer") if column in universe_metadata.columns]
+    columns = [column for column in ("order_book_id", "asset_type", "universe_layer", "industry") if column in universe_metadata.columns]
     if len(columns) <= 1:
         return frame
     metadata = universe_metadata[columns].drop_duplicates("order_book_id", keep="last").copy()
-    result = frame.drop(columns=[column for column in ("asset_type", "universe_layer") if column in frame.columns], errors="ignore")
+    result = frame.drop(columns=[column for column in ("asset_type", "universe_layer", "industry") if column in frame.columns], errors="ignore")
     result["order_book_id"] = result["order_book_id"].astype(str)
     metadata["order_book_id"] = metadata["order_book_id"].astype(str)
     return result.merge(metadata, on="order_book_id", how="left")

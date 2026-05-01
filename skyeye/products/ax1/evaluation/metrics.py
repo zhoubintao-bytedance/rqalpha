@@ -690,7 +690,11 @@ def _constraint_violations(target_weights: pd.DataFrame, constraints: dict) -> d
     if max_industry_weight is not None and "date" in target_weights.columns:
         exposure = _industry_exposure_frame(target_weights)
         if not exposure.empty:
-            max_industry_count = int((exposure["industry_weight"] > float(max_industry_weight) + 1e-12).sum())
+            max_industry_count = sum(
+                int((day_df["industry_weight"] > float(max_industry_weight) + 1e-12).sum())
+                for _, day_df in exposure.groupby("date", sort=True)
+                if not _industry_day_is_all_unknown(day_df)
+            )
 
     target_gross = constraints.get("target_gross_exposure")
     cash_buffer = float(constraints.get("cash_buffer", 0.0) or 0.0)
@@ -845,6 +849,12 @@ def _industry_exposure_by_date(target_weights: pd.DataFrame) -> dict[str, dict[s
             for _, row in day_df.iterrows()
         }
     return result
+
+
+def _industry_day_is_all_unknown(day_df: pd.DataFrame) -> bool:
+    if day_df is None or day_df.empty or "industry" not in day_df.columns:
+        return False
+    return set(day_df["industry"].dropna().astype(str).unique()) == {"Unknown"}
 
 
 def _compute_cost_metrics(portfolio_returns: pd.DataFrame, cost_config) -> dict:

@@ -304,8 +304,10 @@ class ExecutionSmoother:
     def _cap_delta_by_capacity(self, delta_weight: float, liquidity_value) -> float:
         if not self._capacity_enabled() or delta_weight == 0:
             return delta_weight
+        # Some instruments (notably certain ETFs) may not have liquidity data.
+        # Speed-first / robustness: skip capacity capping instead of aborting the run.
         if liquidity_value is None or pd.isna(liquidity_value):
-            raise ValueError("capacity requires non-null liquidity values")
+            return delta_weight
         liquidity_value = float(liquidity_value)
         if liquidity_value < 0:
             raise ValueError("capacity liquidity values must be non-negative")

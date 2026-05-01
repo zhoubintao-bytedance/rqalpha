@@ -6,6 +6,7 @@ from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
+from skyeye.products.ax1.etf_metadata import normalize_industry_value
 from skyeye.products.ax1.layers import LayerRegistry
 
 
@@ -765,7 +766,7 @@ def _annotate_metadata_audit(metadata: pd.DataFrame, audit: dict[str, Any]) -> p
 
 
 def _empty_metadata() -> pd.DataFrame:
-    return pd.DataFrame(columns=["order_book_id", "asset_type", "universe_layer"])
+    return pd.DataFrame(columns=["order_book_id", "asset_type", "universe_layer", "industry"])
 
 
 def _universe_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -811,6 +812,7 @@ def _metadata_from_frame(frame: pd.DataFrame, *, cutoff: pd.Timestamp | None, re
                 "order_book_id": order_book_id,
                 "asset_type": asset_type,
                 "universe_layer": layer,
+                "industry": normalize_industry_value(_first_present(row, ("industry", "sector", "industry_name"))) or "Unknown",
             }
         )
     if not rows:

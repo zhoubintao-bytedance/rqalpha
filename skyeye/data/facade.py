@@ -19,7 +19,13 @@ class DataFacade:
         self.bundle_reader = BundleDataReader()
         source = os.environ.get("SKYEYE_DATA_SOURCE", "rqdatac").strip().lower()
         self.source = source
-        self.cache_store = None if source == "bundle" else LocalDataCacheStore()
+        # source=bundle 仅使用 bundle；其他数据源默认启用 SQLite 缓存，
+        # SKYEYE_DATA_CACHE_PATH 只负责覆盖默认路径。
+        cache_path = os.environ.get("SKYEYE_DATA_CACHE_PATH")
+        if source == "bundle":
+            self.cache_store = None
+        else:
+            self.cache_store = LocalDataCacheStore(db_path=cache_path)
         if source not in ("bundle", "local"):
             try:
                 from skyeye.data.provider import RQDataProvider

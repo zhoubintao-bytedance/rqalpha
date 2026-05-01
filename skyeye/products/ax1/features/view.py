@@ -29,6 +29,13 @@ class FeatureView:
             columns.extend(scope_columns)
         return list(dict.fromkeys(columns))
 
+    @property
+    def preprocess_policies(self) -> dict[str, str]:
+        return {
+            str(feature): str(policy)
+            for feature, policy in (self.metadata.get("preprocess_policies") or {}).items()
+        }
+
 
 class AX1FeatureViewBuilder:
     def __init__(self, config: dict | None = None) -> None:
@@ -128,6 +135,7 @@ class AX1FeatureViewBuilder:
                 "regime_state": dict(regime_state or {}),
                 "regime_state_by_date_count": int(len(regime_state_by_date or {})),
                 "style_pairs": _style_pairs(self.config),
+                "preprocess_policies": _preprocess_policies_by_feature(columns_by_scope),
             },
         )
 
@@ -281,6 +289,15 @@ def _build_common_features(frame: pd.DataFrame, config: dict[str, Any] | None = 
     if turnover_in_scope:
         common_features.append("feature_turnover_rate")
     return common_features
+
+
+def _preprocess_policies_by_feature(columns_by_scope: dict[str, list[str]]) -> dict[str, str]:
+    policies: dict[str, str] = {}
+    for scope, columns in columns_by_scope.items():
+        policy = "passthrough" if scope == "regime" else "cross_sectional"
+        for column in columns:
+            policies[str(column)] = policy
+    return policies
 
 
 def _build_technical_features(frame: pd.DataFrame) -> list[str]:

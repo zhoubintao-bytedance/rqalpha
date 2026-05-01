@@ -8,7 +8,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from skyeye.products.tx1.preprocessor import FeaturePreprocessor as _TX1Preprocessor
+
+_CROSS_SECTIONAL_POLICY = "cross_sectional"
+_PASSTHROUGH_POLICY = "passthrough"
+_SUPPORTED_POLICIES = {_CROSS_SECTIONAL_POLICY, _PASSTHROUGH_POLICY}
 
 
 class FeaturePreprocessor(_TX1Preprocessor):
@@ -21,6 +27,7 @@ class FeaturePreprocessor(_TX1Preprocessor):
         standardize: bool = True,
         min_obs: int = 5,
         sector_optional: bool = True,
+        preprocess_policies: Mapping[str, str] | None = None,
     ):
         super().__init__(
             neutralize=neutralize,
@@ -29,6 +36,27 @@ class FeaturePreprocessor(_TX1Preprocessor):
             min_obs=min_obs,
         )
         self.sector_optional = bool(sector_optional)
+        self.preprocess_policies = _normalize_preprocess_policies([], preprocess_policies)
+
+    def transform(self, df, feature_columns, preprocess_policies: Mapping[str, str] | None = None):
+        """Apply policy-aware preprocessing.
+
+        `cross_sectional` preserves the inherited TX1 behavior. `passthrough`
+        keeps date-level state features such as regime dummies from being
+        collapsed to zero by per-date z-score standardization.
+        """
+        policies = _normalize_preprocess_policies(
+            feature_columns,
+            preprocess_policies if preprocess_policies is not None else self.preprocess_policies,
+        )
+        cross_sectional_columns = [
+            feature_name
+            for feature_name in feature_columns or []
+            if policies.get(str(feature_name), _CROSS_SECTIONAL_POLICY) == _CROSS_SECTIONAL_POLICY
+        ]
+        if not cross_sectional_columns:
+            return df.copy()
+        return super().transform(df, cross_sectional_columns)
 
     def required_columns(self, feature_columns):
         """返回当前配置运行所需的最小列集合。
@@ -45,11 +73,15 @@ class FeaturePreprocessor(_TX1Preprocessor):
                 required.append(feature_name)
         return required
 
-    def to_bundle(self, feature_columns):
+    def to_bundle(self, feature_columns, preprocess_policies: Mapping[str, str] | None = None):
         """导出 AX1 预处理配置，保留 sector 可选语义。"""
         payload = super().to_bundle(feature_columns)
         payload["kind"] = "feature_preprocessor"
         payload["sector_optional"] = bool(self.sector_optional)
+        payload["preprocess_policies"] = _normalize_preprocess_policies(
+            feature_columns,
+            preprocess_policies if preprocess_policies is not None else self.preprocess_policies,
+        )
         return payload
 
     @classmethod
@@ -63,4 +95,25 @@ class FeaturePreprocessor(_TX1Preprocessor):
             standardize=bundle.get("standardize", True),
             min_obs=bundle.get("min_obs", 5),
             sector_optional=bundle.get("sector_optional", True),
+            preprocess_policies=bundle.get("preprocess_policies"),
         )
+
+
+def _normalize_preprocess_policies(
+    feature_columns,
+    preprocess_policies: Mapping[str, str] | None,
+) -> dict[str, str]:
+    policies = {str(key): str(value) for key, value in dict(preprocess_policies or {}).items()}
+    feature_names = [str(feature_name) for feature_name in feature_columns or []]
+    for feature_name in feature_names:
+        policies.setdefault(feature_name, _CROSS_SECTIONAL_POLICY)
+    unsupported = {
+        feature_name: policy
+        for feature_name, policy in policies.items()
+        if policy not in _SUPPORTED_POLICIES
+    }
+    if unsupported:
+        raise ValueError(f"unsupported AX1 preprocess policies: {unsupported}")
+    if not feature_names:
+        return policies
+    return {feature_name: policies[feature_name] for feature_name in feature_names if feature_name in policies}

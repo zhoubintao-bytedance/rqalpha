@@ -164,7 +164,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "features": {
         "feature_set": "ax1_unified_v1",
-        "include_scopes": ["common", "etf_zscore", "regime"],
+        "include_scopes": ["common", "etf_zscore", "regime", "regime_interaction"],
         "normalization": {
             "kind": "rolling_time_series",
             "windows": [60],
@@ -260,7 +260,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "registry": "default",
         "kind": "lgbm_multi_target",
         "feature_set": "ax1_unified_v1",
-        "include_scopes": ["common", "etf_zscore", "regime"],
+        "include_scopes": ["common", "etf_zscore", "regime", "regime_interaction"],
         "training_horizons": [5, 10, 20],
         "risk_horizon": 10,
         "stability_horizon": 20,
@@ -888,6 +888,10 @@ def _normalize_lgbm_params(config: dict[str, Any]) -> None:
     seed = int((config.get("experiment") or {}).get("seed", DEFAULT_EXPERIMENT_SEED))
     params = dict(DEFAULT_LGBM_PARAMS)
     params.update(model.get("params") or {})
+    # Accept legacy "-1" as "use OpenMP default threads".
+    # LightGBM documents num_threads=0 as OpenMP default.
+    if int(params.get("num_threads", 1)) == -1:
+        params["num_threads"] = 0
     params.setdefault("seed", seed)
     params.setdefault("feature_fraction_seed", seed)
     params.setdefault("bagging_seed", seed)
@@ -936,8 +940,9 @@ def _validate_lgbm_params(params: dict[str, Any]) -> None:
         raise ValueError("lgbm_multi_target params.max_depth must be positive")
     if int(params.get("early_stopping_rounds", 0)) < 10:
         raise ValueError("lgbm_multi_target params.early_stopping_rounds must be >= 10")
-    if int(params.get("num_threads", 1)) != 1:
-        raise ValueError("lgbm_multi_target params.num_threads must be 1 for reproducibility")
+    num_threads = int(params.get("num_threads", 1))
+    if num_threads < 0:
+        raise ValueError("lgbm_multi_target params.num_threads must be 0 (OpenMP default) or a positive integer")
     if not bool(params.get("deterministic", False)):
         raise ValueError("lgbm_multi_target params.deterministic must be true")
 

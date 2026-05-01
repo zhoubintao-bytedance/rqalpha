@@ -251,6 +251,26 @@ def test_portfolio_layer_reports_industry_constraint_violations():
     assert metrics["portfolio"]["industry_exposure_by_date"]["2024-01-01"]["bank"] == pytest.approx(0.65)
 
 
+def test_portfolio_layer_ignores_all_unknown_industry_constraint_violations():
+    target_weights = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-01", "2024-01-01", "2024-01-01"]),
+            "order_book_id": ["ETF_A", "ETF_B", "ETF_C"],
+            "target_weight": [0.35, 0.30, 0.25],
+            "industry": ["Unknown", "Unknown", "Unknown"],
+        }
+    )
+
+    metrics = evaluate_portfolio_layer(
+        target_weights,
+        constraints={"max_industry_weight": 0.20},
+    )
+
+    violations = metrics["portfolio"]["constraint_violations"]
+    assert violations["max_industry_weight_count"] == 0
+    assert metrics["portfolio"]["industry_exposure_by_date"]["2024-01-01"]["Unknown"] == pytest.approx(0.90)
+
+
 def test_portfolio_layer_computes_transaction_cost_and_net_return_metrics():
     target_weights = pd.DataFrame(
         {

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import pickle
+import sys
+import types
 from pathlib import Path
 
 import h5py
@@ -13,6 +15,29 @@ import pytest
 from rqdatac.share.errors import QuotaExceeded
 
 from skyeye.data.facade import DataFacade
+
+
+def test_default_rqdatac_source_enables_sqlite_cache_without_explicit_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """默认在线数据源也应启用 SQLite 缓存，避免重复拉取慢数据。"""
+    monkeypatch.setenv("SKYEYE_DATA_SOURCE", "rqdatac")
+    monkeypatch.delenv("SKYEYE_DATA_CACHE_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    fake_provider_module = types.ModuleType("skyeye.data.provider")
+
+    class FakeRQDataProvider:
+        pass
+
+    fake_provider_module.RQDataProvider = FakeRQDataProvider
+    monkeypatch.setitem(sys.modules, "skyeye.data.provider", fake_provider_module)
+
+    facade = DataFacade()
+
+    assert facade.cache_store is not None
+    assert facade.cache_store.db_path == str(tmp_path / ".rqalpha" / "skyeye_data_cache.sqlite3")
 
 
 def _build_test_facade(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> DataFacade:

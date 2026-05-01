@@ -8,7 +8,7 @@ def _lgbm_config(**overrides):
         "model": {
             "kind": "lgbm_multi_target",
             "feature_set": "ax1_unified_v1",
-            "include_scopes": ["common", "etf_zscore", "regime"],
+            "include_scopes": ["common", "etf_zscore", "regime", "regime_interaction"],
             "training_horizons": [5, 10, 20],
             "risk_horizon": 10,
         },
@@ -39,7 +39,7 @@ def test_empty_normalize_config_uses_lgbm_training_contract():
 
     params = config["model"]["params"]
     assert config["model"]["kind"] == "lgbm_multi_target"
-    assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime"]
+    assert config["model"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
     assert config["experiment"]["seed"] == 20260430
     assert params["n_estimators"] == 150
     assert params["num_leaves"] == 12
@@ -203,7 +203,7 @@ def test_manifest_marks_lgbm_training_as_implemented_for_lgbm_kind():
     assert manifest["splitter"]["kind"] == "single_split"
     assert manifest["implementation_status"]["model"] == "lgbm_multi_target"
     assert manifest["feature_schema"]["feature_set"] == "ax1_unified_v1"
-    assert manifest["model_schema"]["include_scopes"] == ["common", "etf_zscore", "regime"]
+    assert manifest["model_schema"]["include_scopes"] == ["common", "etf_zscore", "regime", "regime_interaction"]
     assert manifest["implementation_status"]["lightgbm_training"] != "not_implemented"
     assert manifest["implementation_status"]["labels"] == "etf_peer_relative_net_return_training_labels"
     assert manifest["implementation_status"]["risk_model"] == "statistical_factor_pca_covariance_penalty"

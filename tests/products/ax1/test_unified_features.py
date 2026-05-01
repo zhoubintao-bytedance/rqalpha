@@ -279,6 +279,30 @@ def test_regime_interactions_are_lazy_and_explicit_opt_in():
     assert "feature_interaction_z_style_spread_composite_20d_x_regime_risk_off" in columns
 
 
+def test_feature_view_exposes_preprocess_policies_for_regime_and_interactions():
+    raw = _mixed_panel()
+    feature_view = AX1FeatureViewBuilder({"include_scopes": ["common", "etf_zscore", "regime", "regime_interaction"]}).build(
+        raw,
+        universe_metadata=_metadata(raw),
+        regime_state_by_date={
+            date: {
+                "market_regime": "bear_rotation",
+                "risk_state": "risk_off",
+                "rotation_state": "rotation",
+                "strength": 0.8,
+            }
+            for date in raw["date"].drop_duplicates()
+        },
+    )
+
+    policies = feature_view.metadata["preprocess_policies"]
+
+    assert policies["feature_regime_strength"] == "passthrough"
+    assert policies["feature_regime_risk_off"] == "passthrough"
+    assert policies["feature_z_style_spread_composite_20d"] == "cross_sectional"
+    assert policies["feature_interaction_z_style_spread_composite_20d_x_regime_risk_off"] == "cross_sectional"
+
+
 def test_resolve_feature_columns_rejects_legacy_feature_columns_for_lgbm():
     raw = _mixed_panel()
     feature_view = AX1FeatureViewBuilder().build(raw, universe_metadata=_metadata(raw))
